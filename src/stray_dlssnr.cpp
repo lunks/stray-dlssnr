@@ -2822,6 +2822,17 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 		// Negative means "inherit LocalStructureStrength". 0.0 is NOT neutral.
 		ngx::set_f32(p, ngx::kParamSkinStructureStrength,  g_cfg.skin_structure_strength);
 		ngx::set_u32(p, ngx::kParamStyle,                  g_cfg.style);
+		// ---- BEGIN overlay_ui hook ----
+		// The overlay's "NR UI Correction" checkbox. Per-evaluate, exactly like Style, and NOT
+		// baked at create time - and st->params is the SAME parameter block nr_ensure_feature
+		// writes into, so a later CreateFeature sees it as well. DLSSNR.UICorrection is a real
+		// parameter of THIS snippet build: exactly one exact-line match in nvngx_dlssnr.dll's
+		// string table, against ZERO for DLSSNR.Upscaling. Without this write the checkbox would
+		// be a control that does nothing - the user would A/B it, see no change, and record a
+		// false negative. Default 0, which is also the snippet's own fallback, so an untouched
+		// install is bit-identical to one without this line.
+		ngx::set_u32(p, ngx::kParamUICorrection,           g_cfg.ui_correction);
+		// ---- END overlay_ui hook ----
 
 		const ngx::Result r = g_snippet.evaluate_feature(d3d12_cmd, st->feature, p, nullptr);
 
@@ -3540,19 +3551,25 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 		// dispatch with 'dropped' flat is the success signature; 'dropped' climbing means the
 		// resource we denoised is NOT turning up as a colour SRV at the next dispatch, i.e. the
 		// UE 4.27 history model does not hold for this build and the loop is NOT broken.
-		if (nst != nullptr && (nr_hist_applied != 0 || nr_hist_dropped != 0 || g_cfg.history_restore))
+		// ---- BEGIN overlay_ui hook ----
+		// history_restore and copy_back are LIVE now, and the value in g_cfg is written by the
+		// overlay's snapshot on a RECORDING thread; on_present runs on the main thread. So the
+		// GATE and the values it prints both read the overlay's atomics - the gate included,
+		// because a racy gate is the same data race as a racy argument AND can additionally admit
+		// a line that then reports the opposite state. This is the only place outside nr_try_run
+		// that would otherwise read a snapshot-written field.
+		//
+		// Three tokens differ from the original statement, which read:
+		//     ... || g_cfg.history_restore))            in the condition
+		//     (int)g_cfg.history_restore, (int)g_cfg.copy_back,   in the argument list
+		if (nst != nullptr && (nr_hist_applied != 0 || nr_hist_dropped != 0 || overlay_ui::live_history_restore()))
 			LOGI("--- DLSS-NR history restore @ frame %llu: applied=%llu dropped=%llu "
 			     "(history_restore=%d copy_back=%d hdr_codec_running=%d pristine=%s)",
 			     (unsigned long long)g.frame,
 			     (unsigned long long)nr_hist_applied, (unsigned long long)nr_hist_dropped,
-			     // ---- BEGIN overlay_ui hook ----
-			     // These two are LIVE now, and the value in g_cfg is written by the overlay snapshot on a
-			     // RECORDING thread. This is the only place outside nr_try_run that reads a
-			     // snapshot-written field, so it reads the atomic instead - which removes the add-on's
-			     // last data race rather than leaving one behind for the sake of a log line.
 			     (int)overlay_ui::live_history_restore(), (int)overlay_ui::live_copy_back(),
-			     // ---- END overlay_ui hook ----
 			     (int)nr_codec_on, nr_orig_on ? "allocated" : "MISSING");
+		// ---- END overlay_ui hook ----
 
 		LOGI("--- probe census @ frame %llu: shaders=%llu (not_dxbc=%llu dxil=%llu) | "
 		     "census fail=%llu pass=%llu | vel_const fail=%llu pass=%llu | "

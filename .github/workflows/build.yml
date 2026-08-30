@@ -408,9 +408,9 @@ jobs:
 
       # -----------------------------------------------------------------------------------------
       # The overlay runs on the PRESENT thread. nr_try_run takes st->mutex and then g.mutex
-      # (stray_dlssnr.cpp:2193, :2198), and on_present already reads the DLSS-NR counters as
+      # (stray_dlssnr.cpp:2201, :2225), and on_present already reads the DLSS-NR counters as
       # atomics rather than locking, specifically to avoid inverting that order - the AB/BA
-      # deadlock is spelled out at :1505-1508. A lock anywhere in the overlay would join that
+      # deadlock is spelled out at :1513-1516. A lock anywhere in the overlay would join that
       # ordering graph, and it would also block Present behind CreateFeature's network-weight
       # upload. Separately, ngx::store mutates a std::unordered_map the SNIPPET also calls into,
       # so pushing a slider value straight at NGX from this thread is heap corruption.
@@ -423,7 +423,7 @@ jobs:
         run: |
           $banned = @(
             @{ p = 'std::mutex';        why = 'the overlay must hold no lock: it runs on the present thread and nr_try_run takes st->mutex then g.mutex' },
-            @{ p = 'std::lock_guard';   why = 'same - see the AB/BA deadlock note at stray_dlssnr.cpp:1505-1508' },
+            @{ p = 'std::lock_guard';   why = 'same - see the AB/BA deadlock note at stray_dlssnr.cpp:1513-1516' },
             @{ p = 'std::unique_lock';  why = 'same' },
             @{ p = 'std::scoped_lock';  why = 'same' },
             @{ p = 'ngx::set_';         why = 'NGX parameters are written only on the render thread; ngx::store mutates a map the snippet also calls into' },
@@ -446,6 +446,63 @@ jobs:
             throw "overlay concurrency invariant violated"
           }
           Write-Host "  OK  the overlay takes no lock, touches no nr_state and writes no NGX parameter"
+
+      # -----------------------------------------------------------------------------------------
+      # THE GATE THAT WOULD HAVE CAUGHT "NR UI CORRECTION".
+      #
+      # A control was added to the overlay, an ini key was added for it, addon_config parsed it,
+      # begin_pass snapshotted it into g_cfg, the ini writer round-tripped it, and an
+      # ngx::kParam* constant was declared for it - and NOTHING EVER WROTE IT TO THE PARAMETER
+      # BLOCK. Every layer looked right in isolation; the value simply reached the snippet as
+      # nothing at all while the tooltip said "Live". Nobody would have A/B'd their way to that
+      # conclusion; they would have concluded the parameter does nothing on STRAY, which is a
+      # false negative recorded as a measurement in a project whose entire method is measurement.
+      #
+      # A declared parameter NAME with no write site is exactly that shape, it is invisible to the
+      # compiler (the constant is used - by its own definition), and it is one grep to notice.
+      # Note the interaction with the step above: overlay_ui.hpp is BANNED from calling ngx::set_*,
+      # so the render path in src/ is the only place such a write can legitimately live - which is
+      # precisely why the one place the omission could have been spotted was structurally excluded.
+      #
+      # If a parameter is ever declared deliberately without a write site, give it a use anyway or
+      # delete it. "Declared but never sent" is not a state this add-on has a use for.
+      # -----------------------------------------------------------------------------------------
+      - name: Every declared NGX parameter name must actually be written somewhere
+        shell: pwsh
+        run: |
+          $decls = @{}
+          $n = 0
+          foreach ($line in Get-Content src/ngx_interop.hpp) {
+            $n++
+            if ($line -match '^\s*//') { continue }
+            if ($line -match 'const\s+char\s*\*\s*(kParam\w+)\s*=') { $decls[$Matches[1]] = $n }
+          }
+          if ($decls.Count -eq 0) {
+            Write-Host "::error::found no kParam* declarations in src/ngx_interop.hpp - this gate has stopped testing anything"
+            throw "kParam declaration scan found nothing"
+          }
+          $lines = @()
+          foreach ($f in Get-ChildItem -Recurse -Include *.cpp,*.hpp -Path src) {
+            $lines += @(Get-Content $f.FullName)
+          }
+          # Comments do not count as a use - a kParam named only in prose is still never sent -
+          # and neither does the declaration itself, which would make every constant self-using.
+          $body = $lines | Where-Object {
+            $_ -notmatch '^\s*//' -and $_ -notmatch 'const\s+char\s*\*\s*kParam\w+\s*='
+          }
+          $joined = $body -join "`n"
+          $dead = @()
+          foreach ($k in $decls.Keys) {
+            if ($joined -notmatch ("\b" + [regex]::Escape($k) + "\b")) {
+              $dead += ("  src/ngx_interop.hpp:" + $decls[$k] + ": " + $k + " is declared and never used")
+            }
+          }
+          if ($dead.Count) {
+            Write-Host "::error::An NGX parameter name is declared but never written to a parameter block. Any overlay control or ini key bound to it is a control that does nothing: the user changes it, nothing reaches the snippet, and they record a false negative. Add the ngx::set_* call on the render path, or delete the constant, the ini key and the control together."
+            $dead | ForEach-Object { Write-Host $_ }
+            throw "declared-but-never-written NGX parameter"
+          }
+          Write-Host ("  OK  all " + $decls.Count + " declared NGX parameter names have a write site")
 
       # -----------------------------------------------------------------------------------------
       # The gate that actually protects the shipped binary. The probe above proves WHICH calls are

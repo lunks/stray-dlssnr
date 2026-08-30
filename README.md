@@ -137,8 +137,9 @@ silently taking a default.
 | `mvec_scale_x` / `mvec_scale_y` | `0` / `0` | `0` = derive from extents |
 | `intensity`, `local_tone_strength`, `local_structure_strength` | `1.0` | the snippet's own fallbacks |
 | `skin_structure_strength` | `-1.0` | negative = inherit local structure strength; `0.0` is **not** neutral |
-| `style` | `0` | uint |
+| `style` | `0` | uint. **Only `0` is known to exist in this snippet build** — `1`/`2` carry the reference add-on's names (Natural/Cinematic) and are unmeasured here |
 | `use_auto_mask` | `1` | gates both structure strengths |
+| `ui_correction` | `0` | `DLSSNR.UICorrection`. A real parameter of this build (one exact-line match in `nvngx_dlssnr.dll`'s string table; read with a `0xbad00000` guard, fallback `0`). Written per evaluate. **Its visual effect on STRAY is unverified** — a diagnostic knob, not a tuning one |
 
 The five tuning knobs default to the snippet's **own internal fallbacks**, recovered from its
 disassembly. `1.0` is a fallback, **not a calibrated neutral midpoint**, and the scale these

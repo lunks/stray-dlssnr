@@ -20,9 +20,9 @@
 // THE THREE RULES THIS FILE OBEYS
 //
 // 1. THE OVERLAY TAKES NO MUTEX. Not nr_state::mutex, not the probe's g.mutex.
-//    stray_dlssnr.cpp:2193 takes st->mutex and then g.mutex at :2198, and on_present reads the
+//    stray_dlssnr.cpp:2201 takes st->mutex and then g.mutex at :2225, and on_present reads the
 //    DLSS-NR counters as ATOMICS specifically to avoid inverting that order (the comment at
-//    :1505-1508 spells out the AB/BA deadlock). The overlay callback runs on the present thread.
+//    :1513-1516 spells out the AB/BA deadlock). The overlay callback runs on the present thread.
 //    A lock here would join that ordering graph and the whole argument would have to be
 //    re-derived. Worse, nr_try_run holds st->mutex across CreateFeature (which uploads the
 //    network weights) and EvaluateFeature, so blocking Present behind it is a visible hitch.
@@ -30,7 +30,7 @@
 //
 // 2. THE OVERLAY NEVER TOUCHES nr_state, AND NEVER CALLS ngx::set_*.
 //    ngx::store mutates a std::unordered_map with a mutex the snippet also calls into
-//    (ngx_interop.hpp:235,:258); pushing a slider value straight at NGX from the present thread
+//    (ngx_interop.hpp:243,:266); pushing a slider value straight at NGX from the present thread
 //    is heap corruption. All parameter writes stay where they are, on the render thread.
 //    Instead the overlay writes ATOMICS, and ONE hook - begin_pass() - copies them into g_cfg
 //    once per pass, on the render thread, under the lock that pass already holds.
@@ -38,7 +38,7 @@
 // 3. ONE SNAPSHOT PER PASS, WHICH IS A CORRECTNESS REQUIREMENT AND NOT TIDINESS.
 //    Several settings are read MORE THAN ONCE inside a single pass, and the two reads must agree:
 //
-//      restore_graphics_root   :2306 (capture_state) and :2980 (restore_state). A true->false
+//      restore_graphics_root   :2333 (capture_state) and :3033 (restore_state). A true->false
 //                              tear between them is CORRUPTING: d3d12_state.hpp:429-435 absorbs
 //                              the graphics heap only if(restore_graphics), :569-576 re-binds the
 //                              heaps UNCONDITIONALLY, replay_pipe_compute issues
@@ -47,13 +47,13 @@
 //                              then skips the graphics replay. That is precisely the corruption
 //                              this knob's default-ON exists to prevent. (false->true is benign:
 //                              plan.gfx.root_signature is null and :534-535 early-returns.)
-//      paper_white_scale       read TWICE inside one expression at :2619, feeding ea.proxy_scale
-//                              (:2720) AND da.proxy_scale (:2914). :2611-2613 calls a mismatch
+//      paper_white_scale       read TWICE inside one expression at :2646, feeding ea.proxy_scale
+//                              (:2747) AND da.proxy_scale (:2967). :2638-2640 calls a mismatch
 //                              between them "a correctness failure, not a tuning difference".
-//      transfer/color_strength read up to 3x each in their clamp expressions, :2620-2623.
-//      mvec_scale_x/y          read twice each, :2778-2781 (a !=0.0f test, then the value).
-//      copy_back               SIX sites in one pass: :1655 :2472 :2609 :2997 :3016 :3074.
-//      history_restore         :1655 :2472 :2609 :3040 :3074.
+//      transfer/color_strength read up to 3x each in their clamp expressions, :2647-2650.
+//      mvec_scale_x/y          read twice each, :2805-2808 (a !=0.0f test, then the value).
+//      copy_back               SIX sites in one pass: :1663 :2499 :2636 :3050 :3069 :3127.
+//      history_restore         :1663 :2499 :2636 :3093 :3127.
 //
 //    Be precise about WHY rather than overclaiming: on x86-64 an aligned 4-byte load is atomic in
 //    hardware, so a physically torn float is not reachable. The two real problems are (i) a
@@ -69,55 +69,55 @@
 //   LIVE, FREE            intensity, local_tone_strength, local_structure_strength,
 //                         skin_structure_strength, style, use_auto_mask, ui_correction.
 //                         nr_try_run writes every NGX tuning parameter from g_cfg on EVERY
-//                         accepted dispatch (:2783-2797), and nr_ensure_feature - the
+//                         accepted dispatch (:2810-2834), and nr_ensure_feature - the
 //                         CreateFeature site - writes only Width/Height/InputWidth/InputHeight/
 //                         Enabled/RenderPreset/ScalingRatio/node-masks/FreeMemOnRelease
-//                         (:1891-1910). Not one tuning knob is baked at create time, so these
+//                         (:1899-1918). Not one tuning knob is baked at create time, so these
 //                         sliders are honest with no extra machinery.
 //   LIVE + SNAPSHOT       paper_white_scale, transfer_strength, color_strength,
 //                         restore_graphics_root (see rule 3).
 //   LIVE + ONE RESET      depth_inverted, mvec_scale_x, mvec_scale_y. Changing the depth
 //                         convention or the motion-vector grid invalidates the accumulated
-//                         temporal history; :2767-2773 already forces a reset frame when the
+//                         temporal history; :2794-2800 already forces a reset frame when the
 //                         guide GRID moves, for the same reason.
 //   LIVE + CLEAR pending_res
 //                         copy_back, history_restore, and the overlay's own master bypass.
 //                         st->pending_res is a RAW ID3D12Resource address held across a frame,
-//                         and :2504-2507 warns that UE 4.27's render-target pool can free that
+//                         and :2531-2534 warns that UE 4.27's render-target pool can free that
 //                         element and hand the address back for a differently sized colour
 //                         texture. A stale arm surviving a toggle could write a seconds-old frame
 //                         over a recycled resource that passes the shape check.
 //   LOAD-ONLY, SHOWN GREYED, WITH THE REASON
-//                         enabled ...... read once at :3119; nothing on the render path reads it.
+//                         enabled ...... read once at :3179; nothing on the render path reads it.
 //                                        A checkbox bound to it would do nothing until relaunch,
 //                                        so the overlay's master switch is a SEPARATE per-dispatch
 //                                        bypass and the ini key is displayed read-only.
 //                         hdr_codec .... cannot be flipped in place IN EITHER DIRECTION. OFF->ON
 //                                        is impossible: hdr_codec=0 at load sets
-//                                        st->codec_failed (:3252-3254) and
+//                                        st->codec_failed (:3312-3314) and
 //                                        nr_release_feature_and_output deliberately never clears
-//                                        it (:1617-1621). ON->OFF in place silently kills the
+//                                        it (:1625-1629). ON->OFF in place silently kills the
 //                                        copy-back: out_tex was forced to r16g16b16a16_float for
-//                                        its lifetime (:1836-1837), so src_fmt (:2995) would
-//                                        mismatch an r11g11b10_float TAA output and :2997-3014
+//                                        its lifetime (:1844-1845), so src_fmt (:3048) would
+//                                        mismatch an r11g11b10_float TAA output and :3050-3067
 //                                        fires. Doing it properly needs a deferred teardown plus
 //                                        a one-shot pipeline build, which is a change to
 //                                        stray_dlssnr.cpp far larger than this overlay is allowed
 //                                        to make.
 //                         shader_hash .. MEMOIZED PER-PSO: the lookup is guarded by
-//                                        `cs->nr_checked != cs->pso` (:2157) and cached in
-//                                        cs->nr_is_target (:2174-2175). A live change would take
+//                                        `cs->nr_checked != cs->pso` (:2165) and cached in
+//                                        cs->nr_is_target (:2182-2183). A live change would take
 //                                        effect on some command lists and not others.
 //                         srv_* / uav_output
 //                                        identification pins, and srv_colour is ALSO the
-//                                        history-restore refusal test (:2492, :2558). Changing it
-//                                        between the arm (:3086) and the consume (:2472) can land
+//                                        history-restore refusal test (:2519, :2585). Changing it
+//                                        between the arm (:3139) and the consume (:2499) can land
 //                                        last frame's image on this frame's scene-colour input.
-//                         diagnostics .. read on the draw/dispatch path (:3432 :3437 :3456) from
+//                         diagnostics .. read on the draw/dispatch path (:3492 :3497 :3516) from
 //                                        threads this overlay must not race with for the sake of
 //                                        a log knob.
 //                         populate_parameters / require_trampoline / app_id
-//                                        consumed once each at :3260 / :3135 / :3188.
+//                                        consumed once each at :3320 / :3195 / :3248.
 //
 // =============================================================================================
 // FOUR renodx CONTROLS ARE DELIBERATELY ABSENT. "Never add a control that does nothing."
@@ -129,7 +129,7 @@
 //                       stray_dlssnr.cpp:1902-1903 both record that three sites read it and then
 //                       unconditionally store 1.0f over the result. This add-on does not upscale.
 //   NR Preset           SHOWN, DISABLED. It maps to DLSSNR.Hint.Render.Preset, which is written
-//                       at CreateFeature (:1901), and :1899-1900 records that only preset 1
+//                       at CreateFeature (:1909), and :1907-1908 records that only preset 1
 //                       exists in this snippet build - anything else logs "preset %d is not
 //                       available in this DLL build" and loads the same weights anyway. It is a
 //                       DIFFERENT parameter from `style`, which IS live and real; renodx lists
@@ -144,9 +144,17 @@
 //                       a backend NAME substituted into a status line ("NGX core" vs "signed
 //                       runtime"). Our status block reports the equivalent facts directly.
 //   NR UI Correction    PRESENT, because unlike the other three it is real: `DLSSNR.UICorrection`
-//                       IS in this snippet's string table (measured), and it is read as
-//                       Get(const char*, int*) with a proper 0xbad00000 guard and a fallback of
-//                       0. Its visual effect on STRAY's content is UNVERIFIED, and the UI says so.
+//                       IS in this snippet's string table (measured: exactly one exact-line match
+//                       in nvngx_dlssnr.dll, against ZERO for `DLSSNR.Upscaling`), and it is read
+//                       as Get(const char*, int*) with a proper 0xbad00000 guard and a fallback
+//                       of 0. AND IT IS ACTUALLY SENT: stray_dlssnr.cpp:2834 writes it into the
+//                       parameter block on every evaluate, in its own overlay_ui hook next to
+//                       DLSSNR.Style. That write is the difference between this control and a
+//                       control that does nothing, and it is the one thing that was missing when
+//                       this checkbox first shipped - every other layer (ini key, parser, live
+//                       atomic, snapshot, ini writer) was in place, so nothing looked wrong. A CI
+//                       step now fails the build if any declared kParam* has no write site.
+//                       Its visual effect on STRAY's content is UNVERIFIED, and the UI says so.
 //
 // =============================================================================================
 // EVERY ImGui CALL BELOW IS ON THE CI-VERIFIED SAFE LIST
@@ -274,8 +282,8 @@ inline live_block &live()
 
 // ---------------------------------------------------------------------------------------------
 // THE STATUS BLOCK. Flows the other way and ONLY the other way: written by the render thread,
-// read by the overlay, exactly as st->hist_restored / census_codec_on already do (:1509-1514) for
-// the reason given at :1505-1508. Relaxed everywhere; nothing here is used to order anything.
+// read by the overlay, exactly as st->hist_restored / census_codec_on already do (:1517-1522) for
+// the reason given at :1513-1516. Relaxed everywhere; nothing here is used to order anything.
 //
 // Every pointer stored here is a STRING LITERAL from a switch (probe::format_name,
 // ngx::result_to_string), so it outlives any read.
@@ -425,12 +433,12 @@ inline void seed_from_config(const cfg::config &c, const std::wstring &directory
 // THE ONE RENDER-THREAD HOOK.
 //
 // Called from nr_try_run immediately after `std::lock_guard<std::mutex> lock(st->mutex)`
-// (stray_dlssnr.cpp:2193) - so it runs on the recording thread, under the lock that pass already
+// (stray_dlssnr.cpp:2201) - so it runs on the recording thread, under the lock that pass already
 // holds, with nothing else able to observe g_cfg mid-write on that device.
 //
 // Returns FALSE to skip the pass. Every early return in nr_try_run leaves 'issued' false, which
-// leaves ReShade to issue the game's own Dispatch - i.e. a strict no-op (:2127-2128). The caller
-// must use a plain `return`, NOT NR_BAIL: NR_BAIL's one-shot latch (:1368-1372) would burn itself
+// leaves ReShade to issue the game's own Dispatch - i.e. a strict no-op (:2135-2136). The caller
+// must use a plain `return`, NOT NR_BAIL: NR_BAIL's one-shot latch (:1376-1380) would burn itself
 // on the first toggle and never speak again.
 //
 // WHY WRITING g_cfg IS THE RIGHT SHAPE HERE. The alternative - replacing ~30 g_cfg reads across
@@ -487,8 +495,8 @@ inline bool begin_pass(cfg::config &c,
 
 	// ---- the Reset NR feature button ---------------------------------------------------------
 	// Deferred, exactly like a resolution change: pending_teardown is serviced from on_present ->
-	// nr_service_pending_teardown (:3368-3404), which takes st->mutex on the MAIN thread, idles
-	// the queue (:1578-1580) and releases the feature, every view and every texture (:1598-1607).
+	// nr_service_pending_teardown (:3428-3464), which takes st->mutex on the MAIN thread, idles
+	// the queue (:1586-1588) and releases the feature, every view and every texture (:1606-1615).
 	// A recording thread must not do any of that itself. feature_failed is cleared here because a
 	// latched failure is the main reason to press the button at all.
 	if (tear_e != s_seen_tear)
@@ -533,7 +541,7 @@ inline bool begin_pass(cfg::config &c,
 		s_seen_flush = flush_e;
 		s_seen_reset = reset_e;
 		// See the header: pending_res is a raw resource ADDRESS held across a frame, and
-		// :2504-2507 documents that UE 4.27 can recycle it. Never let one survive a toggle of the
+		// :2531-2534 documents that UE 4.27 can recycle it. Never let one survive a toggle of the
 		// thing that armed it.
 		pending_res = 0;
 		need_reset  = true;
@@ -583,13 +591,20 @@ inline void publish_evaluate(uint32_t ngx_result, const char *ngx_result_name, b
 	s.hist_dropped.store(hist_dropped, std::memory_order_relaxed);
 	if (ok)
 	{
-		s.evaluates.fetch_add(1, std::memory_order_relaxed);
 		// THE ONE FIELD THE renodx STATUS BLOCK HAS NO EQUIVALENT OF. Its "ACTIVE" means "a
 		// feature object currently exists" and its frame counter only ever increments, so an
 		// add-on that stopped evaluating ten minutes ago still reads ACTIVE with a large count.
 		// A timestamp is what turns that into an answerable question.
+		//
+		// STAMPED BEFORE THE COUNTER IS INCREMENTED, and the order is load-bearing. The overlay
+		// treats a nonzero count as "eval_ms is meaningful": on the other order, a draw landing
+		// between the two stores reads evaluates==1 with eval_ms==0, skips the evals==0 rung and
+		// prints "last evaluate -1.0 s ago". This way the only visible intermediate is
+		// eval_ms set with evaluates still 0, which shows the evals==0 rung for one frame at the
+		// very first successful evaluate - a true statement one frame late, not a false one.
 		s.eval_ms.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_relaxed);
 		s.teardown_ms.store(0, std::memory_order_relaxed);
+		s.evaluates.fetch_add(1, std::memory_order_relaxed);
 	}
 	else
 	{
@@ -617,7 +632,7 @@ inline bool live_history_restore() { return live().history_restore.load(std::mem
 //      yields a default with no diagnostic. Here every parse is reported."
 //   3. ReShade rewrites ReShade.ini itself - that is how DisabledAddons got written in the first
 //      place. Two writers, one file.
-//   4. It would split the source of truth: the ini beside the add-on is still read at :3116.
+//   4. It would split the source of truth: the ini beside the add-on is still read at :3169.
 //
 // WRITE POLICY
 //   * Only on the explicit Save button. Never per-frame, never on a drag.
@@ -920,11 +935,26 @@ inline bool dirty()
 //     writes the DisabledAddons entry immediately while the add-on keeps running to the end of
 //     the session, so polling the value once a second lets us shout before the damage is done.
 //
-// [ASSUMED] the section/key spelling "ADDON" / "DisabledAddons". It could not be verified from
-// this tree - no ReShade source is vendored and neither string appears in include/ - so the
-// failure mode was chosen to be safe: an unknown section or key returns false and the banner
-// simply never draws. Two candidate sections are tried. A reviewer with the game running should
-// untick the add-on once and confirm the banner appears.
+// [WEB] crosire/reshade source/addon_manager.cpp:155 and :505 both read the list as
+// `config.get("ADDON", "DisabledAddons", disabled_addons)` off global_config(), so the section
+// and key are confirmed and the FIRST probe below (runtime == nullptr, which selects
+// global_config in ReShadeGetConfigValue) is the one that matches ReShade's own read. The other
+// two probes are kept as harmless fallbacks; an unknown section returns false and the banner
+// simply never draws.
+//
+// [WEB] AND THE VALUE IS NUL-SEPARATED, NOT COMMA-SEPARATED. source/addon.cpp:52-56 builds the
+// returned buffer as `for (element : elements) { value_string += element; value_string += '\0'; }`.
+// With two disabled add-ons the buffer is "Generic Depth@generic_depth.addon64\0STRAY
+// DLSS-NR@stray_dlssnr.addon64\0". config_string() below keeps those embedded NULs (it strips
+// only the TRAILING ones), which is what makes the find() correct at any position - but it also
+// means the string must be flattened before it is ever handed to a %s, or the text stops at the
+// first entry and the message names somebody else's add-on.
+//
+// [WEB] One honest limit on the detection: ReShade matches PER ELEMENT and, when an element
+// contains '@', it requires the file to match too (addon_manager.cpp:505-512). A substring find
+// cannot express that, so this can in principle warn on `STRAY DLSS-NR@something-else.addon64`,
+// which ReShade would not treat as disabling us. That direction is the safe one for a warning,
+// and it is the only direction it errs in.
 // =============================================================================================
 inline bool config_string(reshade::api::effect_runtime *rt, const char *section, const char *key, std::string &out)
 {
@@ -980,11 +1010,23 @@ inline bool listed_as_disabled(reshade::api::effect_runtime *rt, const char *add
 
 	s_answer = value.find(addon_name) != std::string::npos;
 	if (s_answer)
+	{
+		// The value is a NUL-SEPARATED element list (see the header note). Printing it through a
+		// %s as-is stops at the first entry, so with `Generic Depth@...` disabled first the one
+		// warning this add-on ever prints about its own disablement would quote a DIFFERENT
+		// add-on's name next to the words "this add-on" - and OVERLAY_LOG_ONCE latches, so the
+		// corrected text never gets a second chance. Flatten first, and name ourselves outright.
+		std::string shown = value;
+		for (char &c : shown)
+			if (c == '\0')
+				c = ',';
 		OVERLAY_LOG_ONCE(reshade::log::level::warning,
-			"DLSS-NR overlay: ReShade's config lists this add-on in DisabledAddons (\"%s\"). It is "
-			"still running for the REST OF THIS SESSION, but it will NOT load next launch and the "
-			"game will run with no denoise and no warning. Re-tick it in the Add-ons tab, or "
-			"remove the entry from ReShade.ini. This message is printed once.", value.c_str());
+			"DLSS-NR overlay: ReShade's config lists this add-on (\"%s\") in DisabledAddons. The "
+			"full list is \"%s\". It is still running for the REST OF THIS SESSION, but it will NOT "
+			"load next launch and the game will run with no denoise and no warning. Re-tick it in "
+			"the Add-ons tab, or remove the entry from ReShade.ini. This message is printed once.",
+			addon_name, shown.c_str());
+	}
 	return s_answer;
 }
 
@@ -993,6 +1035,21 @@ inline bool listed_as_disabled(reshade::api::effect_runtime *rt, const char *add
 // =============================================================================================
 
 // Reset kinds for bump().
+//
+// k_reset IS NOT FREE, AND IT IS NOT THE SAFE DEFAULT. slider_f bumps on every frame
+// ImGui::SliderFloat returns true, i.e. every frame of a drag - so a k_reset slider sends
+// DLSSNR.Reset=1 at ~60 Hz for the whole drag and the denoiser throws its temporal accumulation
+// away on every one of those frames. The user is then tuning against an image that never occurs
+// in normal play: the un-accumulated first frame. Whatever value looks right there is the wrong
+// value, and it changes again the instant they let go of the mouse.
+//
+// So k_reset is reserved for the settings whose change actually INVALIDATES the accumulated
+// history - the depth convention and the motion-vector grid, where the history really was built
+// under the other geometry, and where a reset per drag frame is not a distortion but the truth.
+// Every plain per-evaluate scalar (intensity, the three strengths, style, use_auto_mask,
+// ui_correction) is k_plain: nr_try_run rewrites all of them from g_cfg on EVERY accepted
+// dispatch, so they need no machinery at all. That is exactly the split this file's header
+// comment describes under "LIVE, FREE" and "LIVE + ONE RESET", and the code now matches it.
 enum : uint32_t { k_plain = 0, k_reset = 1, k_flush = 2 };
 
 inline void bump(uint32_t kind)
@@ -1120,7 +1177,20 @@ inline void draw_status(reshade::api::effect_runtime *rt, const host_facts &f)
 	const uint64_t evals    = s.evaluates.load(std::memory_order_relaxed);
 	const uint64_t fails    = s.eval_failures.load(std::memory_order_relaxed);
 	const uint64_t tear_ms  = s.teardown_ms.load(std::memory_order_relaxed);
-	const double   eval_age = (eval_ms == 0) ? -1.0 : (double)(now - eval_ms) / 1000.0;
+
+	// EVERY age below goes through this, and the clamp is not defensive tidiness. `now` is
+	// sampled above; the render thread stamps eval_ms / pass_seen_ms with its OWN GetTickCount64
+	// and can do so AFTER that sample. One 15.6 ms tick landing in that window makes the stamp
+	// LARGER than `now`, the uint64 subtraction wraps, and an age of 1.8e16 seconds falls out of
+	// the bottom of the status ladder as "NOT EVALUATING RIGHT NOW - last evaluate
+	// 18446744073709551.6 s ago" while the denoiser is in fact evaluating every frame. That is
+	// the precise opposite of what this panel exists to say, so it is clamped at the source
+	// rather than at each of the four call sites.
+	const auto age_s = [now](uint64_t stamp) -> double {
+		return (stamp == 0 || now <= stamp) ? 0.0 : (double)(now - stamp) / 1000.0;
+	};
+	// -1.0 keeps its meaning: "no evaluate has ever been stamped". Only the wrap is removed.
+	const double   eval_age = (eval_ms == 0) ? -1.0 : age_s(eval_ms);
 
 	if (listed_as_disabled(rt, f.addon_name))
 	{
@@ -1181,7 +1251,7 @@ inline void draw_status(reshade::api::effect_runtime *rt, const host_facts &f)
 		ImGui::TextWrapped("The TAA pass is still being identified and the game's own dispatch is "
 		                   "issued untouched. Nothing is denoised and nothing is written back.");
 	}
-	else if (tear_ms != 0 && (now - tear_ms) < 3000u)
+	else if (tear_ms != 0 && age_s(tear_ms) < 3.0)
 	{
 		overlay_imgui::textf_colored(col::amber, "REBUILDING - the NGX feature is being released and recreated");
 	}
@@ -1223,7 +1293,7 @@ inline void draw_status(reshade::api::effect_runtime *rt, const host_facts &f)
 
 	overlay_imgui::textf("evaluates %llu   failed %llu   last TAA dispatch %.1f s ago",
 		(unsigned long long)evals, (unsigned long long)fails,
-		pass_ms == 0 ? 0.0 : (double)(now - pass_ms) / 1000.0);
+		age_s(pass_ms));
 
 	if (s.have_result.load(std::memory_order_relaxed))
 		overlay_imgui::textf("last NGX result  0x%08X  %s",
@@ -1240,7 +1310,7 @@ inline void draw_status(reshade::api::effect_runtime *rt, const host_facts &f)
 	const bool codec_failed  = s.codec_failed.load(std::memory_order_relaxed);
 	// This flag is refreshed only when an evaluate happens, so once the pass stops it would keep
 	// claiming RUNNING underneath a NOT EVALUATING headline. Say so instead of contradicting it.
-	const bool codec_fresh   = (eval_ms != 0) && (now - eval_ms) <= 250u;
+	const bool codec_fresh   = (eval_ms != 0) && age_s(eval_ms) <= 0.25;
 	if (!f.hdr_codec_at_load)
 		overlay_imgui::textf_colored(col::amber, "HDR codec  OFF (hdr_codec=0) - the network is fed the RAW linear TAA output (README gap 1: the darkening)");
 	else if (codec_running)
@@ -1289,12 +1359,12 @@ inline void draw_controls(const host_facts &f)
 			l.bypass.store(!on, std::memory_order_relaxed);
 			// k_flush, both directions: the toggle must not leave a pending pristine copy armed.
 			// st->pending_res is a raw resource address held across a frame and UE 4.27 can
-			// recycle it (stray_dlssnr.cpp:2504-2507).
+			// recycle it (stray_dlssnr.cpp:2531-2534).
 			bump(k_flush);
 		}
 		ImGui::SetItemTooltip(
 			"Live, per dispatch. This is NOT the ini's `enabled` key - that one is read once at load "
-			"(stray_dlssnr.cpp:3119) and a checkbox bound to it would silently do nothing until the "
+			"(stray_dlssnr.cpp:3179) and a checkbox bound to it would silently do nothing until the "
 			"game was restarted. Off means the add-on identifies the TAA pass and then lets ReShade "
 			"issue the game's own dispatch untouched: a strict no-op, reversible in one click.");
 	}
@@ -1322,25 +1392,40 @@ inline void draw_controls(const host_facts &f)
 	ImGui::SeparatorText("Network");
 
 	{
-		static const char *const style_items[] = { "Default", "Natural", "Cinematic" };
-		combo_u32("NR Style", l.style, style_items, 3, k_reset,
-			"Live: DLSSNR.Style is written on every evaluate (stray_dlssnr.cpp:2797) and is NOT baked "
-			"at CreateFeature. The names are the reference add-on's; only the INDEX reaches the "
-			"snippet, which clamps it to the range the network actually exposes, so a value beyond "
-			"that aliases onto the last real style rather than failing.");
+		// The three NAMES are genuinely the reference add-on's - all three are in
+		// renodx-reference.addon64's string table. What is NOT established is that styles 1 and 2
+		// exist in THIS snippet build: stray_dlssnr.ini and README.md both record "only 0 is known
+		// to exist", and nothing in this tree has ever measured 1 or 2. So the labels carry that
+		// on their face. They are not hidden, because DLSSNR.Style itself is real, live and
+		// written every evaluate - the INDEX is what is unverified, not the parameter - but a user
+		// who picks one and sees nothing must be able to tell "this build has no such style" from
+		// "the add-on is broken", and only the label can tell them that at the moment they click.
+		static const char *const style_items[] = {
+			"0 - Default",
+			"1 - Natural (UNVERIFIED in this snippet build)",
+			"2 - Cinematic (UNVERIFIED in this snippet build)",
+		};
+		combo_u32("NR Style", l.style, style_items, 3, k_plain,
+			"Live: DLSSNR.Style is written on every evaluate and is NOT baked at CreateFeature, so "
+			"the parameter itself is real. Only the INDEX reaches the snippet. ONLY STYLE 0 IS KNOWN "
+			"TO EXIST IN THIS SNIPPET BUILD - that is what stray_dlssnr.ini and README.md both say, "
+			"and nobody here has measured 1 or 2. What the snippet does with an index it does not "
+			"have is UNKNOWN and is deliberately not guessed at here: it may clamp, it may alias, or "
+			"the Get may simply fail its guard and fall back. None of those can crash, so trying one "
+			"is safe - just do not read \"no visible change\" as a measurement of that style.");
 	}
 
-	slider_f("NR Intensity", l.intensity, 0.0f, 2.0f, "%.2f", k_reset,
+	slider_f("NR Intensity", l.intensity, 0.0f, 2.0f, "%.2f", k_plain,
 		"Live. 1.0 is the snippet's OWN fallback recovered from its disassembly, not a calibrated "
 		"neutral midpoint, and the scale these values sit on is not known.");
 
-	slider_f("Local Tone Strength", l.local_tone_strength, 0.0f, 2.0f, "%.2f", k_reset,
+	slider_f("Local Tone Strength", l.local_tone_strength, 0.0f, 2.0f, "%.2f", k_plain,
 		"Live. Same caveat as Intensity: 1.0 is the snippet's fallback, not a measured neutral.");
 
 	const bool mask_on = l.use_auto_mask.load(std::memory_order_relaxed);
 
 	ImGui::BeginDisabled(!mask_on);
-	slider_f("Local Structure Strength", l.local_structure_strength, 0.0f, 2.0f, "%.2f", k_reset,
+	slider_f("Local Structure Strength", l.local_structure_strength, 0.0f, 2.0f, "%.2f", k_plain,
 		"Live. Requires Automatic Mask: with the mask off the snippet internally forces BOTH "
 		"structure strengths to -1 and neither does anything.");
 
@@ -1349,7 +1434,7 @@ inline void draw_controls(const host_facts &f)
 		if (ImGui::Checkbox("Skin Structure: inherit Local Structure", &inherit))
 		{
 			l.skin_structure_strength.store(inherit ? -1.0f : 1.0f, std::memory_order_relaxed);
-			bump(k_reset);
+			bump(k_plain);
 		}
 		ImGui::SetItemTooltip(
 			"A NEGATIVE skin structure strength means \"use the local structure strength\": the "
@@ -1359,13 +1444,13 @@ inline void draw_controls(const host_facts &f)
 			"drag from the left edge.");
 
 		ImGui::BeginDisabled(inherit);
-		slider_f("Skin Structure Strength", l.skin_structure_strength, 0.0f, 2.0f, "%.2f", k_reset,
+		slider_f("Skin Structure Strength", l.skin_structure_strength, 0.0f, 2.0f, "%.2f", k_plain,
 			"Live. 0.0 flattens skin structure; it is not a bypass. Untick \"inherit\" to reach it.");
 		ImGui::EndDisabled();
 	}
 	ImGui::EndDisabled();
 
-	checkbox_b("Automatic Mask", l.use_auto_mask, k_reset,
+	checkbox_b("Automatic Mask", l.use_auto_mask, k_plain,
 		"Live. Gates BOTH structure strengths - with this off the snippet forces both to -1 "
 		"internally, which is why those two sliders grey out. This add-on binds no ControlMask, so "
 		"the snippet's other route to forcing the mask off never fires here.");
@@ -1374,22 +1459,27 @@ inline void draw_controls(const host_facts &f)
 	{
 		// PRESENT, and unlike the other three renodx extras this one is real. `DLSSNR.UICorrection`
 		// IS in this snippet's string table (measured with an exact-line strings match against
-		// nvngx_dlssnr.dll), and it is read as Get(const char*, int*) with a proper 0xbad00000
-		// guard and a fallback of 0. Its VISUAL EFFECT on STRAY's content is unverified - hence the
-		// wording of the tooltip. Stored as a u32 because the parameter block converts between the
-		// numeric Set/Get overloads (ngx_interop.hpp), so a u32 Set is readable by the snippet's
-		// int Get.
+		// nvngx_dlssnr.dll: one hit, against zero for `DLSSNR.Upscaling`), and it is read as
+		// Get(const char*, int*) with a proper 0xbad00000 guard and a fallback of 0. Its VISUAL
+		// EFFECT on STRAY's content is unverified - hence the wording of the tooltip. Stored as a
+		// u32 because the parameter block converts between the numeric Set/Get overloads
+		// (ngx_interop.hpp), so a u32 Set is readable by the snippet's int Get.
+		//
+		// THE WRITE SITE IS stray_dlssnr.cpp:2834. Do not delete it: without it this checkbox is a
+		// control that does nothing, which is the failure this whole panel is built to avoid.
 		bool on = l.ui_correction.load(std::memory_order_relaxed) != 0u;
 		if (ImGui::Checkbox("NR UI Correction", &on))
 		{
 			l.ui_correction.store(on ? 1u : 0u, std::memory_order_relaxed);
-			bump(k_reset);
+			bump(k_plain);
 		}
 		ImGui::SetItemTooltip(
-			"Live. DLSSNR.UICorrection is a genuine parameter of THIS snippet build - it is in its "
-			"string table and it is read with a failure guard, defaulting to 0. What it looks like on "
-			"STRAY has NOT been verified, so treat it as a diagnostic knob rather than a tuning one. "
-			"It is nothing to do with this settings panel, despite the name.");
+			"Live: written into the parameter block on every evaluate, alongside Style. "
+			"DLSSNR.UICorrection is a genuine parameter of THIS snippet build - it is in its string "
+			"table and it is read with a failure guard, defaulting to 0. What it looks like on STRAY "
+			"has NOT been verified, so treat it as a diagnostic knob rather than a tuning one - but "
+			"it does reach the network, so what you see IS the answer. It is nothing to do with this "
+			"settings panel, despite the name.");
 	}
 
 	// ---- colour transfer ---------------------------------------------------------------------
