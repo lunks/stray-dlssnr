@@ -225,6 +225,11 @@ DLSS-SR: sr_suppress_taa=1. The game's TAA Dispatch is NOT being issued - DLSS r
 *safe* (the game's TAAU runs and writes every pixel of the output view rect) but means something is
 failing intermittently. The one-shot error lines say what.
 
+**`sr_suppress_taa = 1` with `sr_direct_output = 0` AND `sr_copy_back = 0` is refused**, not
+obeyed — that combination would stop the game's TAA while DLSS wrote into a texture nothing reads,
+leaving the frame holding whatever was last in `u0`. The add-on logs it once and keeps issuing the
+game's dispatch.
+
 **What this rung really tests** is the ownership contract. Under suppression the add-on reports
 "already issued" to ReShade **only after** `EvaluateFeature` returned `Success` **and** after
 `probe::restore_state` has run — so any bail, any NGX failure and any exception leaves ReShade to

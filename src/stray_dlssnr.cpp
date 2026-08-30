@@ -2819,6 +2819,22 @@ static void sr_try_run(command_list *cmd, device *dev, probe::device_shadow &sh,
                        uint32_t gx, uint32_t gy, uint32_t gz,
                        uint32_t want_out_w, uint32_t want_out_h, bool &issued)
 {
+	// SUPPRESSING WITHOUT WRITING IS THE ONE COMBINATION THAT PRODUCES A GARBAGE FRAME, and it is
+	// reachable from the ini: sr_suppress_taa=1 with sr_direct_output=0 and sr_copy_back=0 would
+	// stop the game's TAA from running while DLSS wrote into a texture nothing reads, leaving u0
+	// holding whatever was last in it. That is not a rung on any ladder, so it is REFUSED rather
+	// than obeyed - suppression is dropped and the game's TAAU keeps running.
+	const bool suppress = g_cfg.sr_suppress_taa && (g_cfg.sr_direct_output || g_cfg.sr_copy_back);
+	if (g_cfg.sr_suppress_taa && !suppress && !st.logged_sr_suppress)
+	{
+		st.logged_sr_suppress = true;
+		LOGE("DLSS-SR: sr_suppress_taa=1 is being IGNORED because nothing would write the output - "
+		     "sr_direct_output=0 and sr_copy_back=0 together mean DLSS evaluates into a texture "
+		     "nothing reads. Suppressing the game's TAA on top of that would leave the frame "
+		     "holding whatever was last in u0. The game's TAA is still being issued. Set "
+		     "sr_copy_back=1 (or sr_direct_output=1) first - see STAGING-sr.md rungs 3 and 4.");
+	}
+
 	if (!g_sr_armed.load(std::memory_order_relaxed))
 		SR_BAIL("not armed - the SR snippet did not load, or its Init_Ext failed");
 	if (st.sr_latched_off)
@@ -2918,9 +2934,20 @@ static void sr_try_run(command_list *cmd, device *dev, probe::device_shadow &sh,
 	// output extent, so any movement means a rebuild - and a rebuild needs the GPU idle, which a
 	// recording thread cannot do. Route it through the existing pending_teardown, serviced on the
 	// next present on the main thread.
-	if (st.sr_feat.handle != nullptr &&
-	    (st.sr_render_w != render_w || st.sr_render_h != render_h ||
-	     st.sr_out_w != want_out_w || st.sr_out_h != want_out_h))
+	const bool geometry_moved =
+		(st.sr_feat.handle != nullptr &&
+		 (st.sr_render_w != render_w || st.sr_render_h != render_h ||
+		  st.sr_out_w != want_out_w || st.sr_out_h != want_out_h)) ||
+		// The TEXTURES too, and this is the one that bites without the feature ever existing: a
+		// CreateFeature that failed at extent A leaves out_tex allocated at A, and ensure_output
+		// then refuses at extent B forever with no way back. Both are per-geometry and both are
+		// released together by nr_release_feature_and_output.
+		(st.sr_res.out_tex.handle != 0 &&
+		 (st.sr_res.out_w != want_out_w || st.sr_res.out_h != want_out_h ||
+		  st.sr_res.out_fmt != taa_out.fmt)) ||
+		(st.sr_res.mvec_tex.handle != 0 &&
+		 (st.sr_res.mvec_w != colour.w || st.sr_res.mvec_h != colour.h));
+	if (geometry_moved)
 	{
 		LOGI("DLSS-SR: the geometry moved (render %ux%u -> %ux%u, output %ux%u -> %ux%u). The "
 		     "feature is queued for release on the next present; this frame runs the game's own "
@@ -2987,11 +3014,11 @@ static void sr_try_run(command_list *cmd, device *dev, probe::device_shadow &sh,
 	}
 
 	// ================================================================ FROM HERE WE MAY OWN THE DISPATCH
-	if (!g_cfg.sr_suppress_taa)
+	if (!suppress)
 	{
 		// The DLSS-NR contract, byte for byte: issue the game's dispatch exactly where it would
 		// have run, and take ownership on the VERY NEXT LINE, before anything that can throw.
-		SR_STAGE("about to issue the game dispatch (sr_suppress_taa=0)");
+		SR_STAGE("about to issue the game dispatch (not suppressing)");
 		cmd->dispatch(gx, gy, gz);
 		issued = true;
 
@@ -3139,7 +3166,7 @@ static void sr_try_run(command_list *cmd, device *dev, probe::device_shadow &sh,
 				     (unsigned)eval_result, ngx::result_to_string(eval_result),
 				     dlss_sr::explain_result(eval_result));
 				LOGE("DLSS-SR: the frame is still correct - %s. This message is printed once.",
-				     g_cfg.sr_suppress_taa
+				     suppress
 				        ? "ownership was never reported, so ReShade issues the game's own TAAU and "
 				          "that shader writes every pixel of the output view rect"
 				        : "the game's TAA already ran and only the upscale was skipped");
@@ -3207,7 +3234,7 @@ static void sr_try_run(command_list *cmd, device *dev, probe::device_shadow &sh,
 				     (g_cfg.sr_jitter_scale_x != 1.0f || g_cfg.sr_jitter_scale_y != 1.0f)
 				        ? " (sr_jitter_scale_* APPLIED)" : "",
 				     (int)ed.reset, (double)ed.mv_scale_x, (double)ed.mv_scale_y,
-				     (int)g_cfg.sr_suppress_taa, (int)direct, (int)g_cfg.sr_copy_back);
+				     (int)suppress, (int)direct, (int)g_cfg.sr_copy_back);
 			}
 		}
 	}
@@ -3294,7 +3321,7 @@ static void sr_try_run(command_list *cmd, device *dev, probe::device_shadow &sh,
 	// Everything that can fail has run. `evaluated` is true only on the line after EvaluateFeature
 	// returned Success, and restore_state has completed. Anything short of that leaves `issued`
 	// false and ReShade issues the game's own TAAU over the top - a correct frame.
-	if (g_cfg.sr_suppress_taa && evaluated)
+	if (suppress && evaluated)
 	{
 		issued = true;
 		st.sr_suppressed.fetch_add(1, std::memory_order_relaxed);

@@ -811,6 +811,16 @@ inline bool update_jitter(jitter_source &js, ID3D12Resource *pool, uint64_t offs
 	}
 
 	// ---- the per-frame path: five 16-byte reads straight out of the pool ----------------------
+	//
+	// FIVE Map/Unmap pairs, not one, and that is deliberate. ue4_jitter offers a mapped_row_reader
+	// that would need only one - but it is fed by pool_map_cache, which caches a raw
+	// ID3D12Resource* and therefore OBLIGES the caller to register addon_event::destroy_resource
+	// and call forget() there, or a destroyed-and-reallocated pool at the same address is a
+	// use-after-free with no diagnostic. This add-on registers no such event, so it pays five
+	// pointer hand-backs a frame (on vkd3d-proton UPLOAD memory is unconditionally HOST_COHERENT,
+	// so Map reduces to returning the persistent cpu_address - no vkMapMemory, no refcount) and
+	// the whole hazard class simply does not exist. Same trade, same reasoning, as
+	// nr_update_clip_to_prev_clip's per-frame 64-byte read.
 	uint8_t row_buf[ue4jitter::kBytesPerRow];
 	bool    read_failed = false;
 	auto reader = [&](int32_t row, float out[4]) -> bool {
