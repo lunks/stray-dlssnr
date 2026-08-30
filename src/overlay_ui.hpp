@@ -1,8 +1,16 @@
 // overlay_ui.hpp - the ReShade overlay for the STRAY DLSS-NR add-on.
 //
 // SELF-CONTAINED BY DESIGN. src/stray_dlssnr.cpp is being edited concurrently, so everything that
-// can live here does. What is left there is six small hooks, each wrapped in
-// `// ---- BEGIN overlay_ui hook ----` / `// ---- END overlay_ui hook ----`.
+// can live here does. What is left there is SEVEN small hooks, each wrapped in
+// `// ---- BEGIN overlay_ui hook ----` / `// ---- END overlay_ui hook ----`:
+//   :45    the #include
+//   :2203  begin_pass - the one place the overlay reaches the render path
+//   :2825  the DLSSNR.UICorrection write (see "NR UI Correction" below)
+//   :2839  publish_evaluate - the status block
+//   :3170  seed_from_config - the live half of the parsed ini into the overlay atomics
+//   :3554  the census line's gate and its two live values
+//   :3681  DllMain: install the status hook and the load-only host_facts snapshot
+// Two more live in src/addon_config.hpp (:163, :308) and one in src/ngx_interop.hpp (:192).
 //
 // =============================================================================================
 // WHAT THIS FILE IS FOR, IN ONE PARAGRAPH
