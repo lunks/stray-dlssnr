@@ -60,6 +60,7 @@
 // no diff inside it. Only the View-uniform-buffer discovery, its validation and read_view_cb are
 // used here; the jitter half is DLSS-SR's and is untouched.
 #include "ue4_jitter.hpp"
+#include "rt_census.hpp"
 
 #include <d3d12.h>
 
@@ -120,6 +121,18 @@ static void logf(reshade::log::level level, const char *fmt, ...)
 #define LOGI(...) logf(reshade::log::level::info,    __VA_ARGS__)
 #define LOGW(...) logf(reshade::log::level::warning, __VA_ARGS__)
 #define LOGE(...) logf(reshade::log::level::error,   __VA_ARGS__)
+
+// The functor rt_census.hpp logs through. A free function, not a lambda, so every call site can
+// pass the same one without capturing anything. Levels are rt_census::log_{info,warn,error}.
+static void rt_census_log(int level, const char *msg)
+{
+	switch (level)
+	{
+	case rt_census::log_warn:  LOGW("%s", msg); break;
+	case rt_census::log_error: LOGE("%s", msg); break;
+	default:                   LOGI("%s", msg); break;
+	}
+}
 
 // Nothing may escape a callback into ReShade.
 // Variadic on purpose: a body containing a top-level comma (e.g. "bool a = false, b = false;")
@@ -372,6 +385,10 @@ static void on_destroy_device(device *dev)
 				(unsigned long long)sh->dropped_heap_growth.load(std::memory_order_relaxed),
 				(unsigned long long)sh->copies_missing_src.load(std::memory_order_relaxed));
 		}
+		// The last chance to report: DLL_PROCESS_DETACH runs under the loader lock and is no
+		// place to take two mutexes and write dozens of log lines. A hard kill loses this block,
+		// which is exactly why the periodic summary exists as well.
+		rt_census::report(true, &rt_census_log);
 		nr_destroy_device(dev);
 		probe::pd_destroy<probe::device_shadow>(dev, probe::kDeviceShadowGuid);
 	})
@@ -710,6 +727,19 @@ static void on_init_pipeline(device *dev, pipeline_layout layout, uint32_t subob
 		if (pso.handle == 0 || subobjects == nullptr)
 			return;
 
+		// DXR FIRST, AND BEFORE THE PS/CS FILTER BELOW.
+		//
+		// The loop that follows skips every sub-object that is not a pixel or compute shader, so
+		// raygen_shader / miss_shader / closest_hit_shader / any_hit_shader / intersection_shader /
+		// callable_shader / libraries / shader_groups all fall through it and NOTHING about ray
+		// tracing ever reaches g.n_dxil. That is why the census's `dxil=` counter has never been
+		// evidence about DXR in either direction: it counts PS and CS only, and a DXIL ray tracing
+		// library is not either of those. rt_census::note_pipeline is the fix; the census line in
+		// on_present now says so out loud rather than leaving `dxil=0` to be misread as "no RT".
+		//
+		// A strict no-op when rt_census=0: one relaxed atomic load, then return.
+		rt_census::note_pipeline(subobject_count, subobjects, pso, &rt_census_log);
+
 		pipeline_record rec;
 		rec.layout = layout;
 
@@ -858,6 +888,10 @@ static void on_bind_pipeline(command_list *cmd, pipeline_stage stages, pipeline 
 		{
 			cs->state_object = pso;
 			cs->pso = pipeline{ 0 };
+			// Tier 0 of the census: SetPipelineState1 is only ever used for ray tracing state
+			// objects, so this is a free count of "RT pipelines were bound". Strict no-op when
+			// rt_census=0 - one relaxed atomic load.
+			rt_census::note_state_object_bind(pso);
 		}
 		else
 		{
@@ -3912,6 +3946,12 @@ static void nr_init_device(device *dev)
 		s_config_loaded = true;
 		LOGI("DLSS-NR: reading configuration from %sstray_dlssnr.ini", ngx::narrow(dir).c_str());
 		cfg::load(g_cfg, dir, [](const char *line) { LOGI("%s", line); });
+
+		// Armed HERE, above the `enabled` check below, and deliberately so: the RT census is
+		// read-only instrumentation with no render-path effect, and measuring what ray tracing
+		// the title runs is useful whether or not the DLSS-NR pass itself is turned on. It is
+		// gated only by its own key.
+		rt_census::arm(g_cfg.rt_census, g_cfg.rt_census_frames, &rt_census_log);
 	}
 
 	if (!g_cfg.enabled)
@@ -4353,6 +4393,50 @@ static bool on_dispatch(command_list *cmd, uint32_t group_count_x, uint32_t grou
 }
 
 // =============================================================================================
+// DXR. Read-only, and the ONLY handler in this file that can never do anything but observe.
+// =============================================================================================
+//
+// MUST RETURN FALSE, ALWAYS. Returning true SUPPRESSES the game's DispatchRays - ReShade's hook
+// reads `if (invoke_addon_event<dispatch_rays>(...)) return;` (d3d12_command_list.cpp:1147) and
+// then never calls the original. A census that deleted the frame's ray tracing would be a
+// spectacular way to answer "does ray tracing run".
+//
+// On D3D12 all four resource handles arrive ZERO and the shader binding tables are identified
+// only by their GPU virtual addresses in the *_offset arguments. rt_census keys its buckets on
+// (raygen_offset - miss_offset), which is address-independent; see rt_census.hpp.
+//
+// The bound state object comes from the command-list shadow: UE emits SetPipelineState1 and
+// DispatchRays back to back (D3D12RayTracing.cpp:3936-3937), so cs->state_object is this
+// dispatch's RTPSO.
+static bool on_dispatch_rays(command_list *cmd,
+                             resource /*raygen*/, uint64_t raygen_offset, uint64_t raygen_size,
+                             resource /*miss*/, uint64_t miss_offset, uint64_t miss_size, uint64_t miss_stride,
+                             resource /*hit_group*/, uint64_t hit_offset, uint64_t hit_size, uint64_t hit_stride,
+                             resource /*callable*/, uint64_t callable_offset, uint64_t callable_size, uint64_t callable_stride,
+                             uint32_t width, uint32_t height, uint32_t depth)
+{
+	PROBE_GUARD_FALSE({
+		// Strict no-op when rt_census=0: note_dispatch's first statement is a relaxed atomic load
+		// followed by a return, and this function then returns false, so ReShade issues the
+		// game's DispatchRays exactly as it would with no add-on present.
+		uint64_t state_object = 0;
+		if (rt_census::on())
+		{
+			auto *cs = probe::pd_get<probe::cmd_shadow>(cmd, probe::kCmdShadowGuid);
+			if (cs != nullptr)
+				state_object = cs->state_object.handle;
+		}
+
+		rt_census::note_dispatch(state_object,
+			raygen_offset, raygen_size,
+			miss_offset, miss_size, miss_stride,
+			hit_offset, hit_size, hit_stride,
+			callable_offset, callable_size, callable_stride,
+			width, height, depth, &rt_census_log);
+	})
+}
+
+// =============================================================================================
 // Frame boundary: periodic census so nothing is invisible even when detail lines are budgeted
 // =============================================================================================
 static void on_present(command_queue *, swapchain *sc, const rect *, const rect *, uint32_t, const rect *)
@@ -4374,6 +4458,11 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 		const uint64_t nr_mvec_frames  = (nst != nullptr) ? nst->mvec_frames.load(std::memory_order_relaxed) : 0;
 		const uint64_t nr_mvec_reuse   = (nst != nullptr) ? nst->mvec_cb_reuse.load(std::memory_order_relaxed) : 0;
 		const uint32_t nr_mvec_mode    = (nst != nullptr) ? nst->census_mvec_mode.load(std::memory_order_relaxed) : 0;
+
+		// The RT census keeps its own frame counter and its own reporting interval, and takes its
+		// own two mutexes - never g.mutex - so it cannot deadlock against nr_try_run. Strict
+		// no-op when rt_census=0: one relaxed atomic load.
+		rt_census::on_frame(&rt_census_log);
 
 		std::lock_guard<std::mutex> lock(g.mutex);
 		g.frame++;
@@ -4410,15 +4499,20 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 			                       : "RAW (the game's encoded velocity - pre-decode behaviour)",
 			     (int)g_cfg.mvec_decode, (int)g_cfg.mvec_reconstruct);
 
-		LOGI("--- probe census @ frame %llu: shaders=%llu (not_dxbc=%llu dxil=%llu) | "
-		     "census fail=%llu pass=%llu | vel_const fail=%llu pass=%llu | "
-		     "loops_rej=%llu conf_rej=%llu | PASSED_ALL=%llu | srv_dumps=%u/%u",
+		// `dxil=` COUNTS PIXEL AND COMPUTE SHADERS ONLY. on_init_pipeline's loop skips every
+		// sub-object that is not a PS or a CS, so a DXIL ray tracing library can never reach it
+		// and dxil=0 has never meant "no ray tracing". The rt= field says which it is, so the
+		// number can no longer be misread.
+		LOGI("--- probe census @ frame %llu: shaders=%llu (not_dxbc=%llu dxil=%llu, PS/CS ONLY - "
+		     "says NOTHING about DXR) | census fail=%llu pass=%llu | vel_const fail=%llu pass=%llu | "
+		     "loops_rej=%llu conf_rej=%llu | PASSED_ALL=%llu | srv_dumps=%u/%u | rt=%s",
 			(unsigned long long)g.frame,
 			(unsigned long long)g.n_shaders_seen, (unsigned long long)g.n_not_dxbc, (unsigned long long)g.n_dxil,
 			(unsigned long long)g.n_fail_census, (unsigned long long)g.n_pass_census,
 			(unsigned long long)g.n_fail_velocity_const, (unsigned long long)g.n_pass_velocity_const,
 			(unsigned long long)g.n_fail_loops, (unsigned long long)g.n_fail_confidence,
-			(unsigned long long)g.n_pass_all, g.srv_dumps, kMaxSrvDumps);
+			(unsigned long long)g.n_pass_all, g.srv_dumps, kMaxSrvDumps,
+			rt_census::on() ? "MEASURED - see the RT CENSUS block" : "NOT MEASURED (set rt_census=1)");
 
 		if (first && g.n_shaders_seen == 0)
 			LOGW("no PS/CS seen by the first present. If this persists, init_pipeline is not "
@@ -4503,6 +4597,17 @@ static void register_events()
 	register_event<addon_event::draw>(&on_draw);
 	register_event<addon_event::draw_indexed>(&on_draw_indexed);
 	register_event<addon_event::dispatch>(&on_dispatch);
+	// DXR. Registered UNCONDITIONALLY even though rt_census defaults to 0, because the config is
+	// not read until the first init_device and ReShade's DispatchRays hook calls
+	// invoke_addon_event<dispatch_rays> with no has_addon_event() guard - a late
+	// ReShadeRegisterEvent would push_back into addon_event_list[90] while a recording thread is
+	// iterating it. The handler's cost with the census off is one relaxed atomic load and
+	// `return false`. See the gate section at the top of src/rt_census.hpp.
+	//
+	// build_acceleration_structure is deliberately NOT registered: ReShade allocates a
+	// std::vector and converts every geometry desc on EVERY AS build as soon as that event has
+	// any listener at all (d3d12_command_list.cpp:1053-1077), empty handler or not.
+	register_event<addon_event::dispatch_rays>(&on_dispatch_rays);
 
 	register_event<addon_event::present>(&on_present);
 }
