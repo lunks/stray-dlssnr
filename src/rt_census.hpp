@@ -264,6 +264,12 @@ struct state
 	// THE GATE. Every entry point loads this first and returns when it is false.
 	std::atomic<bool>     enabled{ false };
 	std::atomic<uint32_t> report_every{ 600 };
+	// Set when set_live turned the census ON after launch (the reconfigure ladder's flagship
+	// case). While the gate was off, note_pipeline returned immediately - so every RT state
+	// object compiled before that moment (UE 4.27 compiles them at startup/level load) is
+	// invisible to the compiled set, and the EMPTY summary must name that as a cause instead of
+	// steering the reader to a wrong diagnosis of their ReShade build.
+	std::atomic<bool>     armed_mid_session{ false };
 
 	// FRAME NUMBERING IS 1-BASED, AND THAT IS LOAD-BEARING. Ray tracing is recorded BEFORE the
 	// present that ends the frame, so the first frame's dispatches arrive while this counter is
@@ -363,7 +369,12 @@ inline void set_live(bool enable, uint32_t report_every_frames)
 {
 	state &s = get();
 	s.report_every.store(report_every_frames != 0 ? report_every_frames : 600, std::memory_order_relaxed);
-	s.enabled.store(enable, std::memory_order_relaxed);
+	const bool was = s.enabled.exchange(enable, std::memory_order_relaxed);
+	// An OFF -> ON transition here is by definition mid-session (arm() is the launch path), and
+	// it means pipelines compiled while the gate was off were never counted. Never cleared:
+	// "some pipelines may predate the census" stays true for the rest of the run.
+	if (enable && !was)
+		s.armed_mid_session.store(true, std::memory_order_relaxed);
 }
 
 // =============================================================================================
@@ -741,13 +752,24 @@ inline void report(bool final_report, LogFn log)
 
 		if (s.n_rt_pipelines == 0)
 		{
-			log(log_warn,
-				"  COMPILED SET: EMPTY. No ray tracing sub-object has reached init_pipeline. "
-				"Either the title built no RT state object at all, or this ReShade is a "
-				"RESHADE_ADDON==1 build (CreateStateObject's event is behind #if RESHADE_ADDON >= 2 "
-				"while DispatchRays is not), or every DXIL library lacked an RDAT part - ReShade "
-				"skips the whole event in that case. Check the dispatch count below to tell the "
-				"first case from the other two.");
+			if (s.armed_mid_session.load(std::memory_order_relaxed))
+				log(log_warn,
+					"  COMPILED SET: EMPTY - AND THE CENSUS WAS ARMED MID-SESSION, which is the "
+					"first candidate cause: pipelines compiled before rt_census was ticked (UE "
+					"4.27 compiles RT state objects at startup and level load) are invisible to "
+					"init_pipeline counting. If the dispatch count below is non-zero, RT is live "
+					"and the set is empty only because the census arrived late; reload a level or "
+					"relaunch with rt_census=1 saved to census the compiled set. The other causes "
+					"- no RT built at all, a RESHADE_ADDON==1 build, or RDAT-stripped DXIL "
+					"libraries - only apply if it stays empty after that.");
+			else
+				log(log_warn,
+					"  COMPILED SET: EMPTY. No ray tracing sub-object has reached init_pipeline. "
+					"Either the title built no RT state object at all, or this ReShade is a "
+					"RESHADE_ADDON==1 build (CreateStateObject's event is behind #if RESHADE_ADDON >= 2 "
+					"while DispatchRays is not), or every DXIL library lacked an RDAT part - ReShade "
+					"skips the whole event in that case. Check the dispatch count below to tell the "
+					"first case from the other two.");
 		}
 		else
 		{

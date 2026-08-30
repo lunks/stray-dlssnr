@@ -180,12 +180,12 @@ static constexpr uint32_t kFlagForceDecode   = 1u << 3;   // debug: never recons
 // =============================================================================================
 //
 // t0/t1 are THE GAME'S OWN SRVs, pushed straight back through push_descriptors. Nothing is
-// created on a game resource, which is the standing rule (stray_dlssnr.cpp:1639-1643) - that rule
+// created on a game resource, which is the standing rule (nr_ensure_aux's header comment in stray_dlssnr.cpp) - that rule
 // is about CACHING a descriptor across frames, and these are consumed inside the very event in
 // which the game bound them. It also means NO BARRIER is needed or issued on either: they are
 // bound as SRVs to the compute shader that just executed, so they already carry
 // NON_PIXEL_SHADER_RESOURCE, and a transition whose StateBefore cannot be derived exactly is a
-// worse hazard than none (the same reasoning as stray_dlssnr.cpp:2594-2596).
+// worse hazard than none (the same reasoning as the untransitioned SRVs in nr_try_run).
 static const char *const kDecodeSource = R"HLSL(
 Texture2D<float4>   InVelocity : register(t0);   // the GAME's GBufferVelocityTexture, encoded
 Texture2D<float4>   InDepth    : register(t1);   // the GAME's scene depth; .x is raw DeviceZ
