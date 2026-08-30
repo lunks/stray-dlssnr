@@ -275,6 +275,15 @@ struct cmd_shadow
 	// NR path must keep firing forever.
 	pipeline      nr_checked      = { 0 };
 	bool          nr_is_target    = false;
+	// The overlay's IDENTIFICATION EPOCH at the moment that answer was cached. shader_hash is a
+	// live setting now, and the memo above is per-command-list: clearing it on the next
+	// SetPipelineState would take effect on some command lists and not others, which is
+	// non-deterministic and therefore worse than not being editable at all. An epoch is a single
+	// atomic that EVERY concurrently recording thread reads for itself, so one bump invalidates
+	// every cached answer in the process at once. Zero means "cached before any epoch was read",
+	// which never matches a live epoch that starts at zero only until the first bump - and a
+	// spurious re-check costs one map lookup, so the conservative direction is the cheap one.
+	uint32_t      nr_epoch        = 0;
 
 	// Render targets recorded at OMSetRenderTargets, so a draw can report them.
 	resource_view rtvs[8] = {};
@@ -291,6 +300,7 @@ struct cmd_shadow
 		pso_interesting = false;
 		nr_checked = { 0 };
 		nr_is_target = false;
+		nr_epoch = 0;
 		for (auto &rtv : rtvs) rtv = { 0 };
 		rtv_count = 0;
 		dsv = { 0 };

@@ -9,6 +9,10 @@ game — and extended with UAV resolution, a D3D12 state save/restore, and the N
 
 ## What changed in this revision
 
+**Newest: chain mode** (`dlss_chain`, default `0`) — DLSS-NR **and** DLSS-SR on one accepted TAA
+dispatch, denoise first and upscale second, instead of the two features being mutually exclusive.
+See **§6c**. With the key at `0` the build behaves exactly as it did before it existed.
+
 The pass itself — identification, SRV/UAV resolution, RS 1.1 handling, `capture_state` /
 `restore_state`, the re-issued game dispatch — is **untouched**. Two targeted additions sit on top
 of it, and each has its own ini switch so it can be A/B'd on hardware.
@@ -33,6 +37,16 @@ reconstructed, and it has exactly one division — by a scale clamped to `[1e-6,
 and the decode all still run — so that run must be pixel-identical to `copy_back = 0`. It is *not*
 identical to `hdr_codec = 0`, which is a different image entirely (see §6 gap 1). That comparison
 is the cheapest on-hardware check that the whole path is wired up correctly.
+
+**1b. The graft-back is now selectable** (`hdr_graft`, default **`0` — unchanged behaviour**). The
+reference add-on carries the answer back a different way, and both now ship so they can be A/B'd
+live: `0` is the additive residual above, `1` is its `UpgradeToneMap` — rebuild the pixel from the
+network's answer, hue-locked in OkLab with an AP1 clamp. It is one root constant, so the overlay
+flips it mid-frame with nothing to rebuild. **The difference is chroma, not brightness**: their
+"headroom" term is algebraically our additive residual, both modes deliver the same luminance gain
+at every magnitude, and what actually changes is that mode 1 pulls a clipped highlight toward the
+white point. Mode 0 remains the default and remains bit-exact — 1,080,000 replayed cases say so.
+See §6 gap 1.
 
 **2. The temporal-feedback fix** (`history_restore`, default `1`) — this was §6 gap 5. UE 4.27's
 `AddTemporalAAPass` uses **one** texture as both the pass output and the next frame's history
@@ -147,6 +161,7 @@ silently taking a default.
 | `paper_white_scale` | `1.0` | the codec's scale `s = 1/max(v, 0.01)`. **UNCALIBRATED — see below** |
 | `transfer_strength` | `1.0` | global lerp back to the original; `0.0` is an **exact bypass of the denoise** — identical to `copy_back = 0`, *not* to `hdr_codec = 0` |
 | `color_strength` | `1.0` | `0.0` keeps the original's chromaticity and transfers only luminance |
+| `hdr_graft` | **`0`** | which graft-back the decode uses. `0` = our additive residual (**default, unchanged behaviour, bit-exact identity**), `1` = the reference add-on's `UpgradeToneMap`. Live — a root constant, nothing is rebuilt. See §6 gap 1 |
 | `history_restore` | `1` | break the TAA feedback loop; `0` = the old behaviour. Inert with `copy_back=0` |
 | `restore_graphics_root` | `1` | replay graphics root state too |
 | `require_trampoline` | `1` | refuse to run without `remix_nvngx.dll` |
@@ -158,24 +173,215 @@ silently taking a default.
 | `mvec_clip_row` | `0` | pin the `View.ClipToPrevClip` float4 row. `0` = discover **and** cross-check against this game's own TAA bytecode |
 | `mvec_clip_transpose` | `0` | read `ClipToPrevClip` transposed — the escape hatch for the matrix convention |
 | `mvec_scale_x` / `mvec_scale_y` | `0` / `0` | `0` = derive from extents (forced to `1.0` when `mvec_decode=1`). With the decode on, `-1` is the per-axis **sign A/B** |
-| `intensity`, `local_tone_strength`, `local_structure_strength` | `1.0` | the snippet's own fallbacks. **Range `[0,1]`, clamped on load.** `intensity` is an *attenuation*: the snippet skips its pass entirely unless the value is strictly **below** 1.0, so 1.0 = full NR and you drag **down**. `local_tone_strength` is a blend coefficient the snippet clamps to `[0,1]` itself |
+| `intensity`, `local_tone_strength` | `1.0` | the snippet's own fallbacks. Slider range `[0,1]`; **the ini is NOT clamped**. `intensity` is an *attenuation*: below `1.0` the snippet enables an extra attenuation pass, so `1.0` = **full NR** (not "off") and you drag **down**. `local_tone_strength` is a lerp coefficient the snippet clamps to `[0,1]` itself, so `>= 1.0` is byte-identical to `1.0` |
+| `local_structure_strength` | `1.0` | **conditional — see below.** Consumed only behind two `dynamic_cast` null tests; not clamped anywhere in the snippet |
 | `skin_structure_strength` | `-1.0` | negative = inherit local structure strength; `0.0` is **not** neutral |
 | `style` | `0` | uint. **Only `0` is known to exist in this snippet build** — `1`/`2` carry the reference add-on's names (Natural/Cinematic) and are unmeasured here |
-| `use_auto_mask` | `1` | gates both structure strengths |
+| `use_auto_mask` | `1` | **conditional.** Selects what both structure strengths become (`-1.0f` when off); shares their gate |
 | `ui_correction` | `0` | `DLSSNR.UICorrection`. A real parameter of this build (one exact-line match in `nvngx_dlssnr.dll`'s string table; read with a `0xbad00000` guard, fallback `0`). Written per evaluate. **Its visual effect on STRAY is unverified** — a diagnostic knob, not a tuning one |
 
 The five tuning knobs default to the snippet's **own internal fallbacks**, recovered from its
 disassembly. Change them one at a time.
 
-**The scale is `[0,1]`.** An earlier build offered `0..2` sliders on the grounds that the scale
-was unknown, and that was a real bug: for two of these knobs the entire upper half is provably
-inert, and because the default is `1.0` the only direction a user could drag was into the dead
-half. `intensity` is gated on `comiss 1.0, [rbx+0xe0] / ja` at `0x18001d50a` — the pass is skipped
-unless the value is strictly below `1.0` — and `local_tone_strength` is clamped to `[0,1]` at
-`0x18001d603` before being used as a lerp coefficient. The two structure strengths are *not*
-clamped by the snippet; `[0,1]` is used for them by convention with their proven siblings and with
-the snippet's own `-1.0` disabled-sentinel, which is called out as convention rather than proof in
-both the tooltip and `addon_config.hpp`.
+**Two of the five are range-explained; three are gate-explained, and the gate is not ours.**
+
+`intensity` and `local_tone_strength` genuinely do nothing above `1.0`, and that is now the top of
+their sliders. But note what `intensity >= 1.0` actually does: `fn 0x18001d4d0` is a **mode
+selector** returning `0`, `1` or `3`, and mode `0` means *the optional attenuation pass is not
+enabled* — which at full strength is correct, because there is nothing to attenuate. Its caller's
+`false` is stored to a flag at `0x1800191bd` and the evaluate falls straight through it; **it is
+not an abort and the denoise is unaffected.** An earlier revision of this README and of the
+overlay said `>= 1.0` "skips the pass entirely" and logged the shipped default as `INERT`. That
+was wrong, and it told users their denoiser was off when it was at full strength.
+
+`local_tone_strength` is the one proven range claim: clamped to `[0,1]` at `0x18001d603` before
+being used as the lerp coefficient for 14 network parameters at `[rcx+0x124..0x158]`.
+
+**`local_structure_strength`, `skin_structure_strength` and `use_auto_mask` are gated on the
+loaded model, not on their values.** The effective pair the snippet computes at `+0xf8`/`+0xfc`
+has exactly one reader — an exhaustive scan of every `movss` in `.text` finds three sites per
+displacement and the other two are frame locals in a different function — and that reader sits
+behind two `dynamic_cast` null tests:
+
+| gate | site | test | target type |
+|---|---|---|---|
+| network | `0x180021cc8` | `0x18002253f` `test rcx,rcx / je` | `.?AVCCNetwork@HNetCpp@@` |
+| layer | `0x18003f5e8` | `0x18003f5f3` `test rax,rax / je` | `.?AVCCTinlayoutFusedPreBlockSwin1HLayer@HNetCpp@@` |
+
+If either cast returns null, `call 0x180061710` — the pure setter that stores the pair at
+`cb+0x98`/`cb+0x9c` — never runs, and **all three controls are inert together**. That is exactly
+the pattern reported from hardware. A previous diagnosis called these "proven to reach the network
+raw and unclamped"; it had walked the *call edges* and never looked at the guards on them, so it
+established reachability and reported it as liveness. Whether the shipped model satisfies both
+casts is **not settled from the binary** — it needs a run.
+
+**Nothing is clamped on load.** An earlier build clamped all four knobs in `cfg::load`. For
+`intensity` and `local_tone_strength` that changed no behaviour and only rewrote the user's file;
+for the two structure strengths it removed values the snippet is willing to accept, since
+`0x180061710` stores them raw. The sliders carry the conventional `[0,1]` domain — `-1.0f` is the
+snippet's own disabled sentinel and out-of-range conditioning of a trained network is undefined
+rather than "more" — and the ini is the unclamped escape hatch.
+
+### Every setting is live — what each one costs, and the two that are not
+
+The overlay (`src/overlay_ui.hpp`) can change **every key in the table above except `app_id`**
+without restarting the game. That is a deliberate property, not a convenience: this add-on exists
+because a whole play session once ran with nothing running and nobody knew, and a control that
+looks editable but silently needs a relaunch is the same failure in a smaller box.
+
+The mechanism is one ladder with six rungs, each implying every rung below it. There is exactly
+one deferred-work seam — `nr_state::pending_work`, raised on a recording thread, serviced on the
+next present by `nr_service_reconfigure` on the main thread, where idling the GPU queue and
+destroying a resource are legal. That is the same seam a resolution change has always used; it was
+generalised rather than duplicated.
+
+| Rung | What it does | Cost you can see |
+|---|---|---|
+| **R0** snapshot | `begin_pass` copies the overlay's atomics into `g_cfg` once per pass, on the render thread, under the lock the pass already holds | none |
+| **R1** reset | + one `DLSSNR.Reset` frame, because the accumulated temporal history was built under the other geometry | one un-accumulated frame |
+| **R2** flush | + the armed pristine copy is dropped (it names a raw `ID3D12Resource` address held across a frame, and UE 4.27's pool recycles those) | one frame of temporal feedback |
+| **R3** ident | + the per-PSO identification memo is invalidated on **every** command list at once, and the identification one-shot log lines are re-armed | one frame |
+| **R4** rebuild | + the NGX feature, every view and every texture are released on the next present and rebuilt on the following dispatch | a visible hitch |
+| **R5** rearm | + pipelines built, parameter block replaced, or the snippet loaded, on the present thread | a stalled frame |
+
+Per key:
+
+| Key | Rung | Note |
+|---|---|---|
+| `intensity`, `local_tone_strength`, `local_structure_strength`, `skin_structure_strength`, `style`, `use_auto_mask`, `ui_correction` | R0 | every NGX tuning parameter is written from `g_cfg` on **every** accepted dispatch and none is baked at `CreateFeature`, so these are free |
+| `paper_white_scale`, `transfer_strength`, `color_strength`, `restore_graphics_root` | R0 | read more than once per pass; the snapshot is what makes the reads agree. A `restore_graphics_root` tear between `capture_state` and `restore_state` would be **corrupting**, not a tuning difference |
+| `copy_back`, `history_restore` | R2 | both edges must drop the armed copy |
+| `depth_inverted`, `mvec_scale_x`, `mvec_scale_y`, `mvec_reconstruct`, `mvec_dilate` | R1 | |
+| `mvec_clip_row`, `mvec_clip_transpose` | R1 + latch clear | a bad value latches `view_layout_failed` **permanently** for the resolution; the reconfigure clears it, so the knob stays a knob after the first wrong answer |
+| `shader_hash` | R3 | read *before* `st->mutex` and *before* `begin_pass`, so it cannot ride the snapshot — it goes through a lock-free `read_ident()` at its own site, and a per-command-list epoch invalidates every cached answer at once |
+| `srv_depth`, `srv_velocity`, `srv_colour`, `uav_output` | R3 | these *do* ride the snapshot; they need the arm drop and the latch re-arm, not the memo. `srv_colour` is the only setting in the add-on that tears **across** frames — it is also the history-restore refusal test |
+| `hdr_codec` | R4 (+R5 on) | **both directions.** See below |
+| `mvec_decode` | R4 + R5 on | off→on builds the decode pipeline (runtime `D3DCompile`, hence the present thread) |
+| `enabled` | R4 + R5 on | off→on runs the shipping startup path: `ngx::load_snippet` then `g_nr_pending_init`, which the render thread's existing deferred initialiser consumes. **LoadLibraryW of a 166 MB module — expect one stalled frame** |
+| `populate_parameters` | R4 + R5, **explicit Apply button** | a gated export whose exact signature is unverified against this snippet build; a checkbox that fired on click would be the wrong shape |
+| `diagnostics` | R0, **atomic at its own site** | read on every draw and every dispatch in the process, on arbitrary recording threads, outside any snapshot. It could never go through `g_cfg`; one relaxed load at each of the three sites makes it live at zero risk |
+| `rt_census`, `rt_census_frames` | R0, into the census's own atomics | its counters are **cumulative from the first arm** and are not reset by an off/on cycle — read the deltas between summaries, not the totals |
+| `require_trampoline` | R5 one way only | **1→0 is live**; 0→1 needs a relaunch — see below |
+| `app_id` | **relaunch** | see below |
+| `dlss_sr` | R4 one way + branch R0 | **1→0 is fully live**: the branch into `sr_try_run` is taken after the snapshot, so unticking hands the dispatch back to DLSS-NR on the next frame with the SR feature and both SR textures released. **0→1 needs a relaunch** when `nvngx_dlss.dll` was not loaded at launch — see below |
+| `sr_shader_hash` | R3 | the DLSS-SR re-pin, through the same `read_ident()` + identification epoch `shader_hash` uses. Consulted only while `dlss_sr=1`; `0` means "use `shader_hash`" |
+| `sr_suppress_taa` | R0 + latch re-arm | free per dispatch. The one-shot that reports the refused `suppress=1, direct=0, copy_back=0` combination is re-armed on every reconfigure, or a live toggle would make the second refusal silent |
+| `sr_mvec_decode`, `sr_mvec_reconstruct` | R1 | independent of `mvec_decode` in VALUE, but the decode pipeline is **one** root signature, PSO and DXBC shared by both features and built when either asks. off→on therefore costs the same R5 build `mvec_decode` does when nothing had built it yet |
+| `sr_perf_quality`, `sr_render_preset` | R0 value + **explicit recreate button** | both are latched into the DLSS create-params at `CreateFeature` and have no evaluate-time equivalent, so the value is live but cannot be *re-read* without releasing the feature. "Recreate the SR feature" raises R4 on the same seam a resolution change uses |
+| `dlss_nr` | **relaunch, both directions** | its only two read sites are the 166 MB `LoadLibraryW` in `init_device` and the `Init_Ext` gate on the first dispatch. It is owned, saved and reverted like every other key; it is deliberately **not** in the per-pass snapshot, because writing it into `g_cfg` would put a value in front of a reader that does not exist. To turn the DLSS-NR pass off for *this* session, use `enabled` |
+
+#### `dlss_sr` — live one way, and the UI says which way
+
+The branch is live in both directions. The **arm** is not, and the reason is specific rather than a
+general caution: arming DLSS-SR is a 59 MB `LoadLibraryW` of `nvngx_dlss.dll` claiming the
+trampoline's **slot B**, followed by `NVSDK_NGX_D3D12_Init_Ext` through that slot from a render
+thread with a fully built device. That call is made exactly once per process, inside
+`nr_lazy_ngx_init`, on the first accepted dispatch. Making the ON direction live would mean a
+*second* `Init_Ext` in the session, which is the same unverified action `app_id` is refused for —
+and the only measurement this project has of `Init_Ext`'s fragility is that it **hangs** when called
+at a moment the snippet does not tolerate. A hang is not a failure that degrades.
+
+So with `dlss_sr = 0` in the ini at launch, ticking the box:
+
+* changes the branch immediately — the next accepted dispatch really does go to `sr_try_run`;
+* is refused there on the second line with `DLSS-SR: pass did not run - not armed`, leaving ReShade
+  to issue the game's own TAA, i.e. a correct frame and a strict no-op;
+* is reported by the reconfigure banner as **RELAUNCH REQUIRED**, not APPLIED, and by a permanent
+  amber line beside the checkbox that names *which* of the two unarmed cases applies — the snippet
+  was never loaded, or it loaded and `Init_Ext` through slot B failed. Those have different fixes;
+* is saved by the Save button and takes effect next launch.
+
+#### The DLSS-SR keys that are still ini-only
+
+Nineteen of the keys `main` added have an ini entry and a documented meaning but **no control yet**.
+Every one of them is read inside `sr_try_run`, i.e. downstream of the per-pass snapshot, so each is
+one `live_block` atomic, one `OVERLAY_OWNED_FIELDS` entry, one snapshot line and one widget away
+from being live — the mechanism is already there and none of them needs new machinery:
+
+* **tier 0, free** — `sr_copy_back`, `sr_direct_output`, `sr_mv_scale_x`, `sr_mv_scale_y`,
+  `sr_jitter_scale_x`, `sr_jitter_scale_y`, `sr_jitter_projection_only`
+* **tier 1, needs the SR feature releasing** (all latched into the create-params) — `sr_hdr`,
+  `sr_hw_depth`, `sr_depth_inverted`, `sr_mv_lowres`, `sr_mv_jittered`, `sr_auto_exposure`,
+  `sr_alpha_upscaling`, `sr_out_width`, `sr_out_height`, `sr_group_tile`, `sr_use_view_rect`
+* **arm-time diagnostic, not a render-path setting** — `sr_optimal_settings`
+
+Until they have controls they behave exactly as they did before this branch: read from
+`stray_dlssnr.ini` at load, constant for the session. **They are listed here rather than left to be
+discovered**, because a key the ini can express and the UI silently cannot is the exact failure this
+overlay exists to remove.
+
+#### `hdr_codec`, both directions — the hard one
+
+Two separate things blocked it, one per direction, and neither was a design constraint:
+
+* **off→on was blocked by one line.** `nr_lazy_ngx_init`'s `else` branch read
+  `st->codec_failed = true;   // not a failure, but the same "do not use it" state`. That is the
+  **run-latched shader-build failure** flag, and `nr_release_feature_and_output` deliberately never
+  clears it — because a resolution change cannot undo a failed `D3DCompile`. So `hdr_codec=0` at
+  load latched a permanent failure state to mean "the user configured it off". That assignment is
+  **deleted**, not cleared at reconfigure time: clearing the latch to service a config change would
+  also erase a *real* build failure and make the add-on retry a broken compile every frame.
+  `mvec_decode` carried the identical defect at `st->mvec_failed = true;`, with the same comment;
+  it is deleted too.
+* **on→off was blocked by the format.** `out_tex` is forced to `r16g16b16a16_float` for its
+  lifetime whenever the codec is on. With the codec off it becomes the copy-back source, its format
+  no longer matches an `r11g11b10_float` TAA output, and the copy-back guard **silently skips** —
+  which on screen reads as "no denoise" while every other indicator stays healthy. The fix needed
+  no new code: the teardown destroys `out_tex` and zeroes `out_w`/`out_h`, so the next accepted
+  dispatch re-enters `nr_ensure_output` on the create branch and re-decides the format against the
+  new value.
+
+#### The two that still need a relaunch, and the proof
+
+* **`require_trampoline`, 0→1 only.** Honouring it would mean unloading an already-initialised
+  snippet, and there is no in-process unload path anywhere in this tree — `nr_destroy_device`
+  declines to `FreeLibrary` even at device teardown, on the grounds that "a 166 MB module that may
+  still hold worker threads" buys nothing. The 1→0 direction **is** live, and it is the direction
+  that matters: on that path `ngx::load_snippet` already called `unload()`, so nothing is loaded and
+  re-running it is clean.
+* **`app_id`.** The mechanism exists — `Shutdown1` is resolved, is required at load, and is already
+  called in-process at device teardown, so `Shutdown1` + `Init_Ext` would be one more action on the
+  service. What is **not** proven is that `Init_Ext` survives a second call, and the only
+  measurement this project has of its fragility is that it *hangs* when called at a moment the
+  snippet does not tolerate: the log stops between `loaded nvngx_dlssnr.dll` and the `Init_Ext`
+  result, the process sits at ~2% CPU, and the title never reaches its menu. A hang is not a failure
+  that degrades, and the standing rule for the ladder is that a reconfigure which fails leaves the
+  previous working state. Since `app_id` has **no render-path effect at all** — the snippet resolves
+  its weights from its own embedded `WEIGHTS_HT` resource, so it only names the log file written
+  beside the add-on — shipping an unverified path that can hang the game to rename a log file is the
+  wrong trade. It is stated as exactly that in the UI, not as "load-only".
+
+The same reasoning is why `enabled = 0` **releases the feature and stops the pass** rather than
+tearing NGX down: clearing the armed flag would make the next `enabled = 1` call `Init_Ext` a second
+time in the session. Off gives back the VRAM, which is where the memory actually is; NGX itself
+stays initialised, and turning it back on rebuilds everything with no second `Init_Ext`.
+
+#### What a reconfigure looks like in the log
+
+One line, and it fires only when a rung was actually climbed — the service returns early when there
+is no work, so this is never per-frame noise:
+
+```
+DLSS-NR reconfigure APPLIED: "hdr_codec" -> tier 1 (feature recreate) +ident-epoch +reconcile. codec=built mvec=built feature=released
+```
+
+A failure names itself the same way and leaves the previous state running:
+
+```
+DLSS-NR reconfigure FAILED: "hdr_codec" - the HDR codec's shaders or pipelines could not be built; the denoise still runs, undecoded. The PREVIOUS working state is still running and nothing is half-applied.
+```
+
+The overlay draws that failure in red above every other status rung, because the add-on may well be
+evaluating perfectly happily on the old settings — and "EVALUATING" on its own would then be a true
+headline answering the wrong question.
+
+#### Saving
+
+The overlay's Save button now round-trips every key it can change, which is all of them except
+`app_id`. It still rewrites `stray_dlssnr.ini` **in place** — every comment, blank line, column
+alignment, trailing comment and your own spelling of `colour`/`color` survives — via a temp file and
+`MoveFileExW(REPLACE_EXISTING)`, because a half-written ini is worse than none.
+
 
 ### `rt_census` — the DXR dispatch census
 
@@ -460,6 +666,302 @@ needs a pass on hardware.
 The shaders are compiled at load with `D3DCompile` to `cs_5_0` DXBC (see §8). If that is not
 possible on a given Proton build, the codec latches **off** with the compiler's error blob printed
 verbatim, and the add-on falls back to exactly the pre-codec behaviour.
+
+#### The graft-back is now selectable: `hdr_graft`
+
+The reference add-on (`renodx-dlss5-v2.5`) grafts the network's answer back **differently**, and
+both are now shipped so they can be A/B'd live on hardware. `hdr_graft = 0` is ours and is the
+default; nothing about the shipping image changes unless you move it.
+
+**The encode is the same either way.** Its HLSL is embedded as plaintext in
+`renodx-reference.addon64` (`.rdata` RVA `0x42f90..0x440bd`), and its curve matches
+`src/hdr_codec.hpp` constant for constant: the exact piecewise sRGB (`0.0031308` / `12.92` /
+`1.055` / `1/2.4` / `0.04045`), the soft-clip knee `0.75`, the shoulder `5.770780` and the
+`0.75 + 0.25·(1 − exp(−5.770780·(v − 0.75)))` form. Two shader-level differences remain and neither
+changes the curve: they *divide* by paper white where we multiply by its reciprocal (identical when
+the reciprocal is exact — it is at the `1.0` default — and within 1 ULP otherwise), and they write
+`source.a` into the proxy where we deliberately write `1.0`. So **the network is shown the same
+proxy and returns the same answer in both modes.** Only the graft-back differs. Do not describe the
+two encoders as "byte-identical": the curve is, the shader is not.
+
+| | `hdr_graft = 0` — additive (ours, default) | `hdr_graft = 1` — renodx `UpgradeToneMap` |
+|---|---|---|
+| the transfer | `result = original + (neural − proxy) / s` | `ratio` from the asymmetric branch below, then `HueOkLab(neural · ratio, neural)` |
+| where it works | scene-linear | display-referred, normalised in and out by `s` |
+| what it scales | the **original**, uniformly across RGB | the **network's answer** |
+| hue | cannot drift — RGB is scaled by one number | can drift, so it is locked to the *neural's* hue in OkLab, then AP1-clamped for negatives |
+| `transfer_strength = 0` | **bit-exact no-op at every `paper_white_scale`** | `(original · s) / s` — exact only when `s` is a power of two; otherwise ~`1e-7` relative on 22–36 % of pixels |
+| NaN firewall, FP16 clamp | yes | yes — **ours, kept**; theirs has neither |
+| alpha from the original | yes | yes — and this is **not** a difference: their decode loads `float4 source = OutputOriginal.Load(...)` and writes `source.a` (`renodx-codec-shaders.hlsl:199`, `:222`), and `OutputOriginal` (`t3`) *is* their original. Same behaviour, arrived at independently |
+
+Their branch, reproduced verbatim including its asymmetry:
+
+```hlsl
+if (original_y < proxy_y)  ratio = original_y / proxy_y;
+else { float new_y = neural_y + max(0.0, original_y - proxy_y);
+       ratio = neural_y > 0.0 ? new_y / neural_y : 0.0; }
+```
+
+The `original_y < proxy_y` side is **not** a rare edge — it is the FP16-rounding side of the knee
+and it fires on ~25 % of pixels (49,778 of 200,000 measured). It is continuous at `oy == py`.
+
+##### What the trade actually is — and it is *not* what it looks like
+
+The obvious reading of `max(0, original_y − proxy_y)` is "this recovers luminance the soft clip
+discarded, and the additive residual cannot". **That reading is wrong, and the arithmetic says so.**
+Luminance is linear, so
+
+```
+theirs:  new_y = neural_y + max(0, original_y − proxy_y)   =  Y(orig) + Y(neural) − Y(proxy)
+ours:    Y(original + (neural − proxy))                    =  Y(orig) + Y(neural) − Y(proxy)
+```
+
+Measured over 200,000 pixels through real FP16 surfaces with the same luma weights on both sides:
+**worst relative difference `3.82e-07`**, a few ULP. (Every figure in this section is quoted from the
+CI run, where MSVC and mingw agree to the digit; a different host's `pow` moves the last significant
+figure — macOS/clang gives `4.55e-07` for the same sweep — and none of the conclusions move with it.) The magnitude sweep agrees to four decimals at
+every source level:
+
+| source magnitude | source `Y` | proxy `Y` | gain, mode 0 | gain, mode 1 | chroma distance between them |
+|---|---|---|---|---|---|
+| 0.10 | 0.0758 | 0.0757 | 1.3000 | 1.3000 | 0.0001 |
+| 0.90 | 0.6821 | 0.6811 | 1.2484 | 1.2484 | 0.0017 |
+| 1.60 | 1.2126 | 0.9585 | 1.0267 | 1.0267 | **0.0943** |
+| 3.00 | 2.2736 | 0.9990 | 1.0004 | 1.0004 | **0.1330** |
+| 8.00 | 6.0631 | 1.0000 | 1.0000 | 1.0000 | **0.1340** |
+
+`0.1340` is the *full* rg-chromaticity distance to the white point. So:
+
+* **Both modes deliver the same luminance.** Neither one corrects a bright highlight, and the
+  ceiling is **much lower than the soft clip suggests**, because the proxy is not kept in FP32 — it
+  is written to an `r16g16b16a16_float` texture and read *back out of it* (`proxy_desc` in
+  `src/stray_dlssnr.cpp`; the "why the decode re-reads the proxy" section of `src/hdr_codec.hpp`).
+  A half has ~11 mantissa bits, so `fp16(SrgbEncode(SoftClip(v)))` is **exactly `1.0` at
+  `v ≥ 1.81× paper white`**. `3.47×` is the value at which `SoftClip(v)` itself rounds to `1.0f` in
+  FP32 (`0.25·exp(−5.77·(v − 0.75))` below `2⁻²⁵`) — it is a real number about a value this codec
+  never stores, and quoting it overstated the headroom by nearly a factor of two.
+
+  The transfer is mostly gone well before even `1.81×`, because the soft clip is a curve, not a
+  wall. Of a requested **+30 %** display-referred gain, measured through the real FP16 surfaces:
+
+  | delivered | out to |
+  |---|---|
+  | ≥ 95 % of the request | `0.79×` paper white |
+  | ≥ 50 % | `1.15×` |
+  | ≥ 5 % | `1.86×` |
+
+  **Those figures are ratios *to paper white* and do not move with `paper_white_scale`** — the
+  earlier claim that `paper_white_scale = 4.0` "holds full gain out to ~2.3× paper white" mixed the
+  units, and also compared "where full gain still holds" against "where all signal is lost", which
+  are not the same measurement. What `paper_white_scale` moves is the **scene-linear magnitude**
+  those ratios land at, in proportion: at `4.0`, full gain reaches a source magnitude of `3.17`
+  instead of `0.79`. So if highlights are being lost, **the knee is in the wrong place and
+  `paper_white_scale` is exactly the right knob to raise** — just do not expect the ×-paper-white
+  ceiling to move with it. (Selftest section 8 measures all of this, so the numbers cannot drift
+  from the code.)
+* **The entire difference is chroma, and it runs the other way.** Mode 1 rebuilds the pixel from the
+  network's answer and locks the hue to *that*; where the proxy clipped, the network's answer is
+  neutral white, so a saturated highlight is pulled toward the white point. `[6.0, 5.2, 3.0]` comes
+  back as `[6.0, 5.2, 3.0]` in mode 0 and as roughly `[5.21, 5.21, 5.21]` in mode 1. Over 60,000
+  random pixels at `color_strength = 1` the two differ by up to **83 % of the pixel's magnitude** — the
+worst case is `[10.04, 10.12, 0.94]`, which mode 0 leaves essentially alone and mode 1 returns as
+`[9.45, 9.45, 9.45]`.
+
+**So `hdr_graft = 1` is a colour experiment, not a highlight-recovery fix.** It is a defensible,
+different aesthetic — *trust the network's colour* — and STRAY's neon signage is exactly where you
+will see it. Just do not run it expecting recovered highlights.
+
+##### `color_strength` is the third point of comparison — and it does *not* cancel the graft
+
+`color_strength` already **is** a genuine luminance-ratio mode, not a partial one:
+`luminanceOnly = lerp(transferred, original · luminanceRatio, chromaWeight)` with
+`chromaWeight = saturate(originalLuminance / (0.001/s))`. At `color_strength = 0` and above the
+chroma floor the output is `original · (Y_transferred / Y_original)`: an RGB-uniform, hue-exact
+rescale. Their decode has the *same* construction (`luminance_only = original · ratio`, then
+`lerp(luminance_only, upgraded, ColorStrength)`) and their upgraded luminance equals our
+transferred luminance, so on ordinary pixels the two modes agree there to **under one 8-bit code
+value**.
+
+**But `color_strength = 0` is not a control that cancels the graft — it swaps which half of the
+graft difference you are looking at**, and the earlier text here got that wrong. Mode 0's chroma
+floor is a real term with a real effect: below `Y = 0.001·(1/s)` it crossfades away from the
+hue-exact rescale and hands the pixel to the network's own colour. **Mode 1 has no floor at all** —
+`luminanceOnlyRdx = originalDisplay · ratioY`, faithfully to renodx — so it keeps the original's
+chromaticity all the way down and rescales it by an unbounded ratio. That region is not a curiosity:
+it is where a *denoiser* changes the image most.
+
+Measured over 400,000 dark, strongly chromatic pixels (scene-linear magnitude ≤ `0.01`, network gain
+`0.3×`–`6×` with a `0.6` pull toward the pixel's own mean, `transfer_strength = 1`,
+`color_strength = 0`):
+
+| | worst difference | pixels differing ≥ 2 code values |
+|---|---|---|
+| mode 0 vs mode 1 | **27.6** 8-bit code values | **42.5 %** |
+| mode 0 *with its chroma valve forced open* vs mode 1 | **0.0** | 0 % |
+
+The second row is the point: force mode 0's valve open and the shadow difference vanishes entirely,
+so the valve is the whole cause and nothing else in either graft is moving. The shortest statement
+of it — a dim red shadow the network denoises to a neutral `0.2`, at `color_strength = 0`:
+
+```
+src [1e-5, 0, 0]   mode 0 -> [0.20166, 0.19965, 0.19965]   the valve handed it to the network's grey
+                   mode 1 -> [0.94077, 0.00000, 0.00000]   no valve: the original's red, rescaled
+```
+
+The earlier figure quoted here — "worst 4.74 % of a channel, so the two are nearly the same image at
+`color_strength = 0`" — was an artefact of the selftest's sampler: `random_pixel` draws all three
+channels as `mag·(0.05 + 0.95u)`, which bounds chromaticity at about 20:1 and never approaches
+black, and `network_answer` never departs from the proxy by more than `0.6×`–`1.8×`. Neither could
+reach the region where the modes part company. Section 5 of the selftest now measures both regions
+and asserts the shadow divergence as a *lower* bound, so the sampler cannot be quietly narrowed back.
+
+There is still no fourth mode worth adding: two real graft behaviours, one crossfade that applies to
+both. But **A/B the grafts at `color_strength = 1` for the highlight difference *and* at
+`color_strength = 0` on a dark coloured area for the shadow difference.** Neither setting shows both.
+
+##### Verified on the build host
+
+`tools/hdr_codec_selftest.cpp` replays the decode's arithmetic natively. It carries **two separate
+transcriptions of mode 0** — the decode as it shipped before `hdr_graft` existed, and the decode as
+it is now — so "mode 0 is unchanged" is 1,080,000 bit-pattern comparisons rather than an argument
+about where a brace went.
+
+```sh
+c++ -std=c++17 -O2 -Wall -o /tmp/hdr_codec_selftest tools/hdr_codec_selftest.cpp \
+  && /tmp/hdr_codec_selftest
+```
+
+`tools/hdr_source_variants_test.cpp` is the companion gate for the *survival* build described
+below: it calls the real `full_source_decode()` and proves the graft-free variant differs by
+exactly one byte, that both `#define` markers are where the code thinks they are, and that every
+graft symbol (`float3x3`, `nrRdxToOkLab`, …) has all of its code uses **inside** the `#if` — so
+the preprocessor really removes them and the retry is not theatre. **23 assertions, all passing.**
+It needs `<d3dcompiler.h>`, so it runs on the Windows toolchains only; CI runs it under both MSVC
+and mingw, which agree to the digit.
+
+**37 assertions, all passing:**
+
+| check | result |
+|---|---|
+| identity, mode 0 | `transfer_strength = 0` returns the original **bit for bit** in **1,080,000/1,080,000** cases (12 scales × 9 `color_strength` × 10,000 pixels), worst absolute deviation `0` |
+| alpha | taken from the original in all 1,080,000 |
+| mode 0 vs the **shipping** decode | **1,080,000/1,080,000** identical bits, with the network actively changing the image (6 scales × 6 `transfer_strength` × 5 `color_strength` × 6,000 pixels) |
+| NaN firewall | a broken source passes through untouched, alpha included, in **both** modes |
+| FP16 range | mode 1 never emits a non-finite or out-of-range value, including their `neural_y == 0` cliff |
+| their cliff | reproduced, not smoothed: an exactly-zero network answer forces `lerp(original, 0, ts)` |
+| headroom term ≡ additive residual | worst relative difference `3.82e-07` over 150,250 else-branch samples |
+| their asymmetric branch | fires 49,750 / 200,000 times on FP16 data — real, not an edge case |
+| mode 1 at `transfer_strength = 0` | exact at `paper_white_scale` 1.0 / 2.0 / 0.5; **7144**, **4365**, **7076** of 20,000 non-exact at 1.5 / 2.2 / 0.75, worst `1.08e-07` relative. Mode 0: **0/20,000 at every one** |
+| divergence, `color_strength = 0`, ordinary pixels | **0.7** of an 8-bit code value over 60,000 pixels — they *do* agree here |
+| divergence, `color_strength = 0`, **shadows** | **27.6** code values over 400,000 dark chromatic pixels, **42.5 %** of them ≥ 2 |
+| …and its cause | mode 0 with its chroma valve forced open vs mode 1, same 400,000 pixels: **0.0** code values |
+| divergence, `color_strength = 1` | **83 %** of the pixel's magnitude (140 code values) |
+| the transfer's ceiling | `fp16(SrgbEncode(SoftClip(v))) == 1.0` at `v ≥ 1.8088`; `SoftClip(v) == 1.0f` in FP32 at `v ≥ 3.4740`; the ×-paper-white ceiling is invariant across `paper_white_scale` 1.0 / 2.0 / 4.0 |
+
+CI runs the same replay under **both** MSVC and mingw — and the two agree to the printed digit on
+every figure above — and separately compiles the codec's HLSL — extracted from the string literals
+in `src/hdr_codec.hpp` exactly as `full_source_decode()` assembles it, in **both** of its variants —
+with **`fxc /T cs_5_0 /O3 /Ges /Gis`**, the same *flags* the add-on passes to `D3DCompile` at load.
+A typo in that HLSL has no compile-time symptom in the C++ build and no crash at runtime: the codec
+just latches **off** and the user silently gets the darkened frame back. That gate is the only thing
+in the tree that would notice.
+
+**`fxc` is not the compiler that runs on the play box, and the gate must not be read as if it were.**
+Under Proton, `D3DCompile` resolves to whatever `d3dcompiler_47.dll` is in the prefix, which may be
+Wine's builtin — vkd3d-shader's HLSL front end, whose SM5 compute coverage varies by version. Mode 1
+introduced this tree's first `float3x3` literals, first `mul(matrix, vector)`, first `sign()` and
+first `length()`, and adding `hdr_graft` changed the decode's source hash from
+`0x397c6b5d90cbe29b` to `0x34fc9b8beea4af4e`, so every existing on-disk cache is orphaned and a
+*fresh* compile of the new code is mandatory on first launch. A green CI run does not de-risk that.
+
+**So the decode is compiled twice, and mode 0 survives the experiment failing.** The literal carries
+`#define NR_RDX_GRAFT 1`; everything of renodx's lives behind that `#if`, inside one function, so
+`main()` is byte-identical in both variants and mode 0's expression tree is untouched. If the
+compile with it at `1` fails, `hdr_codec::build` flips that one character to `0` and recompiles.
+Mode 1's body becomes a stub, `blobs::decode_has_graft` comes back false, and the CPU **pins
+`hdr_graft` to 0 for the run** — the log says so, and the overlay shows an amber line and disables
+the combo. The default graft the user plays on every day is unaffected. Losing the shipping path to
+a compiler that cannot build an experiment would have been strictly worse than not shipping the
+experiment.
+
+A **user-supplied `stray_dlssnr_decode.dxbc`** (the documented escape hatch when `D3DCompile` is
+unavailable at all) is preferred over both the cache and a fresh compile, and such a blob may
+predate `g_hdrGraft` and never read it — in which case `hdr_graft` is inert. That cannot be
+detected, so it is *reported*: `blobs::decode_overridden` reaches both the log and an amber line
+above the combo, saying that the control may do nothing while it is in place. To pin the *old*
+decode deliberately, rename `stray_dlssnr_decode.397c6b5d90cbe29b.dxbc` (if you still have it) to
+`stray_dlssnr_decode.dxbc`.
+
+##### The exact A/B to run on hardware
+
+All ini-only, no rebuild; or flip **HDR Graft** in the overlay, which is live. `ReShade.log`
+re-prints its `GRAFT-BACK MODE` line **every time the mode changes**, so the log from a session in
+which you flipped the combo says which graft was running when, rather than asserting whichever one
+happened to be first. Check that line before trusting any A/B you report: it also warns if a
+`.dxbc` override is in place or if the decode was built without mode 1.
+
+| # | config | expectation |
+|---|---|---|
+| 1 | `hdr_graft=0 transfer_strength=0` | pixel-identical to `copy_back=0` and to the add-on unloaded. **The gate.** Run it first; if it fails, nothing below means anything. |
+| 2 | `hdr_graft=0 transfer_strength=1 color_strength=1` | today's image. The control. |
+| 3 | `hdr_graft=1 transfer_strength=1 color_strength=1` | **the comparison.** Same brightness as 2 everywhere; look only at *saturated bright* things — neon signage, wet-street reflections, the bar interiors. Mode 1 washes them toward white; mode 0 keeps their colour. If you cannot see a difference here, you are not looking at a clipped highlight. |
+| 4 | `hdr_graft=1 transfer_strength=0` | should be visually identical to 1. It is *not* bit-identical (see above); if it looks different, something other than the round trip is wrong. |
+| 5 | 2 and 3 with `color_strength=0`, looking at a **bright** area | the two should look **the same as each other** there. This is the control that proves the highlight difference in 2-vs-3 is chroma and nothing else. |
+| 5b | 2 and 3 with `color_strength=0`, looking at a **dark, coloured** area — shadowed alley walls, unlit interiors, anything dim with a hue | they should **not** match, and this is the graft's *other* characteristic behaviour. Mode 0's chroma floor hands a near-black pixel to the network's colour; mode 1 has no floor and keeps the original's chromaticity, rescaled. Up to 27.6 code values, on 42.5 % of such pixels. If you see shadow chroma speckle in mode 1, the graft **is** the cause. |
+| 6 | 2 and 3 at `paper_white_scale=4.0` | moves the soft-clip knee up. Both modes should regain gain on bright things; the *chroma* difference should shrink, because fewer pixels are clipped. This is the test that distinguishes "the graft is wrong" from "the knee is wrong". |
+
+##### The neural target's resolution — settled, and it matters for DLSS-SR
+
+The reference add-on's decode does not `Load` the network's answer; it *bilinearly resamples* a
+`ProxySize` region up to `Size`, with this comment:
+
+> DLSSNR 310.8 writes the neural answer at its active network resolution even when the Output
+> resource is larger (the signed runtime reports success but leaves the remainder untouched).
+
+That is worth checking rather than assuming, because if true it would mean a *larger* output
+resource reads untouched texels.
+
+**It does not bite us, and it cannot.** Three separate facts:
+
+1. `((p + 0.5)·N)/N − 0.5` evaluates to exactly `p` in FP32 for every index of `N` ∈ {720, 900,
+   1080, 1234, 1440, 1600, 1920, 1999, 2160, 2560, 3440, 3840}: `floor(position) == p`, the
+   fractions are exactly `0`, and the bilinear collapses to a plain `Load`. **`SampleNeural` is an
+   exact identity whenever `ProxySize == Size`**, so porting it would buy four texture fetches per
+   pixel to compute the same number.
+2. `ProxySize == Size` here, structurally. Our proxy, our result and the network's target are all
+   created at the same colour extent, and `nr_ensure_output` additionally forces the neural target
+   to `r16g16b16a16_float`. We never upscale.
+3. **The signed runtime cannot upscale at all.** In `nvngx_dlssnr.dll` 310.8 the network resolution
+   is hard-wired to the requested resolution: `CreateFeature` reads `DLSSNR.ScalingRatio` and then
+   *unconditionally* stores `1.0f` over the result (`0x180018006`), with no `0xbad00000` guard —
+   unlike every neighbouring parameter read — and copies the network W/H verbatim from the
+   requested W/H into its own `"CreateFeature begin requested resolution %ux%u (network %ux%u)"`
+   log. `EvaluateFeature` repeats the same unconditional store at `0x18001a96a`.
+   `DLSSNR.Upscaling`, `DLSSNR.InputWidth` and `DLSSNR.OutputWidth` have **zero** occurrences in the
+   DLL. The evaluate also compares the Color rect against the Output rect for equality
+   (`0x1800189de`) and *skips* with `"Skip feature evaluate: Invalid Color/Output rect
+   configuration"` when they differ.
+
+So the reference add-on's "upscaling" is **its own codec resampling, not the runtime's**: it binds
+Color and Output *both* at network resolution — satisfying that equality check — inside larger
+display-resolution resources, the runtime legitimately writes only that top-left region, and
+`SampleNeural` then covers the display target. `SampleNeural` is deliberately **not** ported here,
+and the reason is recorded in `src/hdr_codec.hpp` so a future SR path knows where to find it.
+
+**For a DLSS-SR path (1080p → 4K) this is the whole answer, and it is not the hopeful one.**
+DLSS-NR will not upscale for you, and it will *reject* an evaluate whose Color and Output rects
+differ in size. Two shapes work:
+
+* **run NR at 4K, after the game's SR.** Color = Output = 4K, `ProxySize == Size`, `SampleNeural`
+  stays a no-op, no shader change — but you pay the denoise at 4K.
+* **run NR at 1080p and resample in the decode.** This is exactly what `SampleNeural` plus their
+  `SourceBase` / `SourceSize` / `ProxySize` / `Size` constant buffer exists for, and it also needs
+  their fourth texture: their `Original` (`t0`) is the *encode's* source, read through a subrect,
+  while `OutputOriginal` (`t3`) is the *decode's* display-resolution graft target. Ours collapses
+  the two — our decode's `InOriginal` **is** their `t3` — because we never subrect and never
+  rescale. An SR path has to split them.
+
+There is no third shape in which the runtime does the upscale.
 
 ### Gap 2 — ~~motion vector encoding is not converted~~ **FIXED** (`mvec_decode = 1`)
 
@@ -860,6 +1362,161 @@ Success is never reported from the absence of an error.
 
 ---
 
+## 6c. Chain mode — `dlss_chain`, default `0`
+
+`dlss_sr = 1` and `dlss_nr = 1` do **not** give you both features. Both want the same accepted TAA
+compute dispatch, and whoever takes it owns the frame — which, before this revision, was DLSS-SR,
+unconditionally. That was an implementation choice, not a limitation: both snippets already load
+side by side through the trampoline's two slots, DLSS-NR already evaluates into its **own** texture
+rather than writing the frame, and DLSS-SR's colour input is a parameter. `dlss_chain = 1` wires
+the one to the other.
+
+### The order, and why it is that way round
+
+```
+game TAA dispatch (suppressed)
+  -> [codec encode]   1920x1080 linear HDR -> display-referred proxy
+  -> DLSS-NR evaluate proxy -> out_tex, at the RENDER extent
+  -> [codec decode]   the denoised answer grafted back onto the linear original
+  -> DLSS-SR evaluate COLOUR = that denoised 1920x1080 image -> u0 at 3840x2160
+  -> one state restore
+```
+
+**Denoise first, then upscale.** Upscaling noise is precisely what you do not want, and it is what
+DLSS-NR alone does in an upsampling configuration: it denoises at one resolution and a spatial
+filter with no temporal information then magnifies whatever is left.
+
+Both evaluates run between **one** `probe::capture_state` and **one** `probe::restore_state`, on
+the raw command list, with the descriptor-heap cache re-synced between them — that sync is the call
+whose absence is a device removal, not an artefact.
+
+### What DLSS-SR actually receives
+
+`st.result_tex`: **linear HDR** at the render extent, in the colour SRV's own format — the
+untouched original plus the network's additive residual. Never the display-referred proxy, which
+exists only between the encode's barrier and the restore and is read by nothing but the DLSS-NR
+evaluate and the decode.
+
+`hdr_codec.hpp`'s identity property is unchanged by chaining: the proof is algebraic in exactly
+three things — the original, `InProxy`'s bits and `InNeural`'s bits — and never mentions the TAA
+output. Chain mode changes only *which resource supplies the original*: the game's own `t5`
+descriptor instead of a copy. So the property still holds, and it yields a stronger on-hardware
+check than the DLSS-NR one:
+
+> **`transfer_strength = 0` in chain mode must be pixel-identical to `dlss_chain=0` / `dlss_sr=1`
+> at the same ini.** At 0 the decode is `result = lerp(original, graded, 0) = original`, exactly,
+> so DLSS-SR is handed the same `t5` bits it is handed today. That single A/B validates the
+> geometry move, the encode, the DLSS-NR evaluate, the decode, the extra barrier and the shared
+> motion guide — independently of image quality.
+
+With `hdr_codec = 0` chain mode feeds DLSS-SR the network's **raw display-referred** answer as if
+it were linear HDR: gap 1 propagated *through* the upscaler rather than merely present in the
+frame. The add-on says so once and runs anyway.
+
+### The geometry move, which is the idea the whole thing rests on
+
+In `MainUpsampling` there is no resolved image at the render resolution anywhere in the frame — the
+TAA pass's output is already 4K. So chained, **DLSS-NR denoises the TAA pass's *input*** (`t5`,
+render resolution), not its output. One call — `nr_ensure_output(colour.w, colour.h, colour.fmt)` —
+moves every downstream DLSS-NR site together: the codec's dispatch domain, the proxy, the result,
+the `Color` and `Output` rects, and the motion guide's extent.
+
+That last one matters. DLSS-NR's guide is prepared at its **output** extent and DLSS-SR's at the
+**render** extent, so they do **not** coincide by default; they coincide here *because* the
+geometry moved. Had `nr_ensure_output` been left on the TAA output, DLSS-NR would have read a
+3840x2160 guide while DLSS-SR read a 1920x1080 one — a silent 2x-per-axis error. One
+`mvec_decode` dispatch therefore serves both networks, with `MVecScaleX/Y` and `MV.Scale.X/Y` all
+forced to exactly 1.0.
+
+### What does *not* happen in chain mode
+
+* **The DLSS-NR copy-back does not run, and must not.** Its result is at the render extent and
+  `u0` is at the output extent, and a full-subresource `CopyTextureRegion` between mismatched
+  extents is *invalid usage*, not an error return. `copy_back = 1` is ignored and the log says so.
+* **`history_restore` is inert**, because it is gated on `copy_back` and exists to undo a write
+  chain mode never makes. No pristine copy is taken; the `original` is read straight from the
+  game's own `t5` SRV, borrowed for the event and never stored — the same borrow the motion-vector
+  decode already makes of the game's velocity and depth descriptors.
+* The only write to `u0` is DLSS-SR's (`sr_direct_output = 1`), or its copy-back
+  (`sr_direct_output = 0, sr_copy_back = 1`).
+
+### The fallback ladder — every rung, and what is on screen
+
+| rung | condition | on screen |
+|---|---|---|
+| 1 | `dlss_chain = 0` | today's build, exactly |
+| 2 | one snippet absent / not armed | one named refusal, then the single feature that *did* arm |
+| 3 | not an upsampling dispatch | one named refusal with the Engine.ini block; DLSS-SR alone if `dlss_sr=1`, else DLSS-NR alone |
+| 4 | DLSS-NR textures unavailable at the render extent | **DLSS-SR alone** — a correct upscaled 4K frame, not denoised |
+| 5 | DLSS-NR `CreateFeature`/`EvaluateFeature` fails | **DLSS-SR alone**; latched off after 8 consecutive failures |
+| 6 | DLSS-SR fails, DLSS-NR fine | the game's own TAAU at 4K. DLSS-NR's evaluate for that frame is **discarded** — one wasted evaluate, a correct frame |
+| 7 | jitter unreadable, geometry latch, SR latched off | the game's own TAAU at 4K |
+| 8 | an exception in the owned window | the game's own TAAU at 4K; the restore still runs |
+
+Rungs 6 and 7 are the two places chain mode is **strictly worse than DLSS-NR alone**: there is no
+legal destination for a 1920x1080 denoise when `u0` is 3840x2160, so "DLSS-NR alone" is not an
+available fallback and the honest answer is the game's own TAAU. Ownership is reported only after
+DLSS-SR succeeded *and* the state restore completed, so none of these can produce a black or stale
+frame.
+
+### Configuration
+
+`Engine.ini` — identical to the DLSS-SR block, chain mode adds no new CVar:
+
+```ini
+[SystemSettings]
+r.TemporalAA.Upsampling=1
+r.SecondaryScreenPercentage=100
+r.ScreenPercentage=50
+```
+
+`stray_dlssnr.ini`:
+
+```ini
+dlss_chain      = 1
+dlss_nr         = 1        ; both snippets must load
+dlss_sr         = 0        ; chain is its own branch; leave this off
+hdr_codec       = 1        ; effectively mandatory - see above
+sr_shader_hash  = 0x....   ; the MainUpsampling permutation's hash, RE-PINNED
+sr_mvec_decode  = 1
+sr_suppress_taa = 0        ; raise to 1 only after the chain is running
+sr_direct_output= 0
+sr_copy_back    = 1
+```
+
+`r.TemporalAA.Upsampling` changes `TAA_PASS_CONFIG`, which is a `#define`, so the DXBC and the
+`fnv1a64` change with it. The pinned `shader_hash` for the `Main` permutation **stops matching**,
+and the only symptom would be `DLSS-NR: pass did not run - this dispatch is not the target shader`.
+`dlss_chain` therefore selects `sr_shader_hash` exactly as `dlss_sr` does, and `shader_hash` keeps
+DLSS-NR's own pin so the two can still be A/B'd on one install.
+
+### Proving it ran
+
+* `DLSS-CHAIN: CHAINED EVALUATE #1 OK - BOTH networks ran on ONE accepted dispatch.` — printed
+  from inside DLSS-SR's success branch **and** guarded on the DLSS-NR half having returned
+  `Success` on the same dispatch. It names both evaluates, both resources and both `Reset` values.
+* `--- DLSS-CHAIN @ frame N: chained=... (of ... DLSS-SR evaluates) sr_armed=1` in the periodic
+  census. `chained` is incremented on that one branch and nowhere else. **If it is zero, the chain
+  did not run, whatever else the log says.**
+* every refusal names itself once: `DLSS-CHAIN: <what and why>`.
+
+### Known unknowns, stated
+
+Chained, DLSS-NR is handed the **pre-TAA, jittered, single-sample** render-resolution scene colour,
+not the TAA-resolved image it has been run on to date. The snippet has no jitter parameter at all,
+so it reads sub-pixel jitter as motion or noise; its own temporal history plus the motion guide
+plus `Reset` is what stands against that. This is unavoidable in this ordering — in
+`MainUpsampling` there is no un-jittered image at the render resolution — and it cannot be settled
+by inspection. An A/B against `r.TemporalAASamples=1` is the cheapest probe. If DLSS-NR turns out
+to need a resolved image, the chain is mis-ordered and the answer is not a tuning change.
+
+Separately: if the colour texture is *wider than the view rect* (`QuantizeSceneBufferSize` rounds
+to a multiple of 4, e.g. 1932 vs 1930), the encode reads those uninitialised columns and the
+network's receptive field can bleed them inward. At `r.ScreenPercentage=50` into 3840x2160 the two
+are exactly equal and this does not arise; at 58.8% it does, and nothing detects it.
+
+---
+
 ## 7. Hard rules this build honours
 
 * **The TAA dispatch is never suppressed.** DLSS-NR consumes *resolved* colour, so it must run
@@ -924,13 +1581,26 @@ extension, to make mingw's `__uuidof` macro parse.
   whole `.addon64` fail to load when the DLL is absent, taking the working NGX path down with it.
   Under Proton this may be Wine's builtin, whose SM5 compute coverage varies by version — which is
   exactly why a compile failure has to be survivable, and is.
+* **The decode is survivable *within itself*, too.** Both graft modes live in one shader and one
+  compile, so a failure anywhere in mode 1's OkLab/AP1 matrices would otherwise latch
+  `codec_failed` and take the *default* graft — the one that ships and that the user plays on —
+  down with the experiment. The literal carries `#define NR_RDX_GRAFT 1` and everything of
+  renodx's sits behind that `#if` inside one function; on failure `build()` flips that character
+  to `0`, recompiles, reports `decode_has_graft = false`, and the CPU pins `hdr_graft` to 0 for
+  the run. `main()` is byte-identical between the two variants, so mode 0 is not merely
+  "unaffected in principle" — it is the same text.
 
 On a successful compile the blob is cached beside the ini as
 `stray_dlssnr_encode.<source-hash>.dxbc` / `stray_dlssnr_decode.<source-hash>.dxbc`. The hash is
 FNV-1a over the exact source text handed to the compiler, so a stale blob from an older revision
 can never be picked up silently. A plain `stray_dlssnr_encode.dxbc` / `stray_dlssnr_decode.dxbc`
 (no hash) is honoured as a **user override** — drop one in on a machine whose `d3dcompiler` cannot
-build the shader — and the log says loudly when an override is in use.
+build the shader — and the log says loudly when an override is in use. Note what an override
+implies for a *root constant*: such a blob is whatever the user built and may predate a constant
+entirely, in which case the control bound to it does nothing. `hdr_graft` is the current example,
+so `blobs::decode_overridden` is now plumbed through to the log and to an amber line above the
+overlay's HDR Graft combo. A control that silently does nothing is this project's recurring defect;
+"we cannot know, so we say we cannot know" is the only honest handling.
 
 The shader source is reviewable in-tree, and it round-trips through glslang's HLSL front end
 cleanly, but note that **it has not been compiled by `fxc` on this host**. The first launch's log

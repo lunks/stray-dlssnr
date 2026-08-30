@@ -150,6 +150,23 @@ else
 	echo "  (skipped: $OBJDUMP not found - verify the disassembly by hand before shipping)"
 fi
 
+# ---------------------------------------------------------------------------------------------
+# The NGX parameter-block selftest. It drives our hand-laid 17-slot vtable through the BYTE
+# OFFSETS the snippet uses and replays the snippet's own parameter-read function against it, then
+# pins the two tuning transforms the overlay tooltips cite.
+#
+# WIRED HERE BECAUSE IT WAS WIRED NOWHERE. The test existed and passed and was run by hand, which
+# meant a range regression - the exact class of bug it was written for - could land without
+# anything failing. It is native (host compiler, not the cross-compiler), needs no Windows, and
+# takes well under a second, so there is no reason for it to be optional.
+echo
+echo "=== NGX parameter-block selftest"
+if ! ./tools/run_ngx_paramblock_selftest.sh; then
+	echo
+	echo "error: the NGX parameter-block selftest failed. Do not ship this build." >&2
+	exit 1
+fi
+
 cat <<'EOF'
 
 Next:

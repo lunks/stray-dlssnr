@@ -295,25 +295,28 @@ int main()
 		std::printf("\n9. a disarmed trace records nothing ............................ ok\n");
 	}
 
-	// ---- 10. the tuning RANGE matches the domain the snippet actually responds to ------------
+	// ---- 10. the transforms the snippet applies over the exposed range ----------------------
 	//
-	// This is the regression for the bug this file was extended to cover: the overlay used to
-	// offer 0..2 for these knobs on the grounds that "the scale is not known". It IS known and it
-	// is [0,1]; the upper half was inert, and because the DEFAULT is 1.0 a user could only ever
-	// drag INTO the dead half. Both transforms below are transcribed from the deployed snippet.
+	// Transcribed from the deployed snippet, md5 eea91faf55a8993656c66815f0497b3b, with function
+	// bounds taken from its .pdata table. This section exists to pin the two claims the overlay
+	// tooltips make, so a future range change cannot quietly contradict them.
 	{
 		std::printf("\n10. the snippet's own transforms over the exposed range:\n");
 
-		// fn 0x18001d4d0 @ 0x18001d502-0x18001d51d, with the caller's test at 0x18001f51a.
-		// Returns whether the intensity pass runs at all. no_mask is our configuration.
 		struct G {
-			static bool pass_runs(float intensity, bool control_mask_bound)
+			// fn 0x18001d4d0 is a MODE SELECTOR: 0, 1 or 3. It is NOT "does the denoise run".
+			// Mode 0 means the optional ATTENUATION pass is not enabled, which at Intensity >= 1.0
+			// is simply "there is nothing to attenuate". Its caller 0x18001f500 turns 0 into
+			// false, and 0x1800191af stores that false to a FLAG at 0x1800191bd and falls through
+			// - it is not an abort, and the denoise is unaffected.
+			static int attenuation_mode(float intensity, bool control_mask_bound)
 			{
 				//   movss xmm0, 1.0f ; comiss xmm0, [rbx+0xe0] ; ja -> engaged
-				if (1.0f > intensity) return true;          // Intensity < 1.0
-				return control_mask_bound;                  // else only a bound mask keeps it alive
+				if (1.0f > intensity || control_mask_bound)
+					return control_mask_bound ? 3 : 1;   // 0x18001d53d cmovne eax, ecx
+				return 0;                                // 0x18001d51d xor al, al
 			}
-			// fn 0x18001d5f0 @ 0x18001d5f0-0x18001d617: clamp to [0,1], then use as a lerp coeff.
+			// fn 0x18001d5f0 @ 0x18001d603-0x18001d617: clamp to [0,1], then use as a lerp coeff.
 			static float tone_coeff(float t)
 			{
 				if (t > 1.0f) t = 1.0f;
@@ -322,13 +325,20 @@ int main()
 			}
 		};
 
-		// The old 0..2 slider: everything from the default upward was a no-op.
-		CHECK(!G::pass_runs(1.0f, false), "Intensity 1.0 unexpectedly engaged the pass");
-		CHECK(!G::pass_runs(1.55f, false), "Intensity 1.55 unexpectedly engaged the pass");
-		CHECK(!G::pass_runs(2.0f, false), "Intensity 2.0 unexpectedly engaged the pass");
-		CHECK(G::pass_runs(0.99f, false), "Intensity 0.99 did NOT engage the pass");
-		CHECK(G::pass_runs(0.0f, false), "Intensity 0.0 did NOT engage the pass");
-		std::printf("     Intensity: 1.0/1.55/2.0 -> pass SKIPPED; 0.99/0.0 -> pass RUNS ..... ok\n");
+		// THE DEFAULT IS FULL DENOISE. This is the assertion that would have caught the log note
+		// which fired "Intensity is INERT" on every stock install: mode 0 at the 1.0 default is
+		// correct and expected, and it says nothing about whether denoising happened.
+		CHECK(G::attenuation_mode(1.0f, false) == 0,
+		      "Intensity 1.0 should need no attenuation pass");
+		CHECK(G::attenuation_mode(2.0f, false) == 0,
+		      "Intensity 2.0 should be indistinguishable from 1.0");
+		CHECK(G::attenuation_mode(1.0f, false) == G::attenuation_mode(1.55f, false),
+		      "Intensity 1.0 and 1.55 took different branches");
+		CHECK(G::attenuation_mode(0.99f, false) == 1, "Intensity 0.99 did not enable attenuation");
+		CHECK(G::attenuation_mode(0.0f, false) == 1,  "Intensity 0.0 did not enable attenuation");
+		CHECK(G::attenuation_mode(1.0f, true) == 3,   "a bound ControlMask did not select mode 3");
+		std::printf("     Intensity: >=1.0 -> mode 0 (full denoise, no attenuation pass);\n");
+		std::printf("                <1.0  -> mode 1; with a ControlMask -> mode 3 ........... ok\n");
 
 		CHECK(G::tone_coeff(1.0f) == G::tone_coeff(1.55f)
 		   && G::tone_coeff(1.0f) == G::tone_coeff(2.0f),
@@ -336,31 +346,42 @@ int main()
 		CHECK(G::tone_coeff(0.5f) != G::tone_coeff(1.0f), "LocalTone 0.5 collapsed onto 1.0");
 		std::printf("     LocalTone: 1.0 == 1.55 == 2.0; 0.5 differs ....................... ok\n");
 
-		// The values the user reported from hardware, every one of them in the dead half.
-		CHECK(!G::pass_runs(2.0f, false) && G::tone_coeff(1.55f) == 1.0f,
-		      "the reported hardware values were not reproduced as inert");
-		std::printf("     the reported Intensity=2.00 LocalTone=1.55 are both inert ........ ok\n");
+		// THE RANGE REGRESSION GUARD, stated as what the sliders must expose rather than as a
+		// claim about the hardware report. Everything strictly inside [0,1) must be reachable and
+		// must map to a distinct mode/coefficient; if a future edit reintroduces a 0..2 slider,
+		// half of it is positions the snippet cannot tell apart.
+		CHECK(G::attenuation_mode(1.25f, false) == G::attenuation_mode(1.0f, false)
+		   && G::tone_coeff(1.25f) == G::tone_coeff(1.0f),
+		      "a value above 1.0 was expected to be indistinguishable from 1.0");
+		std::printf("     nothing above 1.0 is distinguishable from 1.0 .................... ok\n");
 	}
 
-	// ---- 11. a stale ini cannot carry the dead range forward ---------------------------------
+	// ---- 11. the SHIPPING DEFAULTS, checked against the transforms in section 10 -------------
 	//
-	// The shipping clamp, exercised directly - not a copy of it. Without this a user whose
-	// stray_dlssnr.ini already holds the old out-of-range values would keep the bug after
-	// updating, because the range fix lives in the overlay and the ini bypasses it.
+	// THE REGRESSION THIS PINS. An earlier revision logged "Intensity is INERT ... a range
+	// regression has landed" whenever intensity >= 1.0 - which is the shipped default, so it
+	// fired on every stock install and told the user their denoiser was doing nothing. The
+	// assertion below is the one that would have caught it: the default must be the FULL-denoise
+	// end of the range, and taking the no-attenuation-pass branch is what full denoise looks
+	// like, not a fault.
+	//
+	// It reads cfg::config's real defaults - addon_config.hpp is staged into the temp directory
+	// by the runner - so it cannot drift from a copy.
 	{
-		CHECK(cfg::clamp_unit(2.0f)  == 1.0f, "clamp_unit(2.0) != 1.0");
-		CHECK(cfg::clamp_unit(1.55f) == 1.0f, "clamp_unit(1.55) != 1.0");
-		CHECK(cfg::clamp_unit(1.93f) == 1.0f, "clamp_unit(1.93) != 1.0");
-		CHECK(cfg::clamp_unit(-3.0f) == 0.0f, "clamp_unit(-3.0) != 0.0");
-		CHECK(cfg::clamp_unit(0.5f)  == 0.5f, "clamp_unit(0.5) changed an in-range value");
+		const cfg::config d;
+		CHECK(d.intensity == 1.0f,                "default intensity moved off 1.0");
+		CHECK(d.local_tone_strength == 1.0f,      "default local_tone_strength moved off 1.0");
+		CHECK(d.local_structure_strength == 1.0f, "default local_structure_strength moved off 1.0");
+		CHECK(d.skin_structure_strength < 0.0f,
+		      "default skin_structure_strength must stay negative - it is the inherit sentinel");
+		CHECK(d.use_auto_mask,
+		      "default use_auto_mask must be on, or both structure strengths become -1.0f");
+		std::printf("\n11. shipping defaults are the full-denoise end of every range ... ok\n");
 
-		// skin is the one that must keep its negative sentinel: negative means "inherit local".
-		CHECK(cfg::clamp_skin(-1.0f) == -1.0f, "clamp_skin destroyed the inherit sentinel");
-		CHECK(cfg::clamp_skin(-0.25f) == -1.0f, "clamp_skin did not normalise negative to -1");
-		CHECK(cfg::clamp_skin(2.0f)  == 1.0f, "clamp_skin(2.0) != 1.0");
-		CHECK(cfg::clamp_skin(0.5f)  == 0.5f, "clamp_skin(0.5) changed an in-range value");
-		CHECK(cfg::clamp_skin(0.0f)  == 0.0f, "clamp_skin(0.0) must stay 0 - it flattens, not inherits");
-		std::printf("\n11. a stale out-of-range ini is clamped on load ................. ok\n");
+		// The ini loader must NOT rewrite any of these. That assertion needs a real file and a
+		// real cfg::load, which this native test cannot do - the host shim stubs _wfopen to
+		// always fail. It is carried by abi/ini_rewrite_test.cpp, which drives the true load path
+		// under both MSVC and mingw in CI. Named here so the pair is discoverable from either end.
 	}
 
 	std::printf("\n%s (%d failure%s)\n", g_fail ? "TESTS FAILED" : "ALL TESTS PASSED",

@@ -35,11 +35,12 @@ inline int     WideCharToMultiByte(unsigned, DWORD, const wchar_t *, int, char *
                                    const char *, BOOL *) { return 0; }
 
 // ---- added for the tuning-range checks -------------------------------------------------------
-// src/addon_config.hpp is staged into the same temp directory so the selftest can exercise the
-// REAL clamp_unit()/clamp_skin() rather than a transcription of them - a copy could drift from
-// the shipping code, which is exactly the failure this test exists to catch. The only Windows
-// call in that header's parse path is _wfopen; the test never opens a file, so a stub that
-// always fails is enough to compile and cannot change behaviour.
+// src/addon_config.hpp is staged into the same temp directory so the selftest can read the REAL
+// cfg::config defaults rather than a transcription of them - a copy could drift from the shipping
+// code, which is exactly the failure this test exists to catch. The only Windows call in that
+// header's parse path is _wfopen; the test never opens a file, so a stub that always fails is
+// enough to compile and cannot change behaviour. The loader's no-rewrite property therefore
+// cannot be tested here; abi/ini_rewrite_test.cpp carries it, on the real path, in CI.
 //
 // Guarded for _WIN32: on a Windows host the CRT already declares _wfopen and this would be a
 // conflicting redefinition. The shim is only ever needed on the non-Windows build machines this

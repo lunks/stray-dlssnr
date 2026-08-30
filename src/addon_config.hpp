@@ -4,9 +4,30 @@
 // get_config_value keys off ReShade.ini, which the user is also editing for effects, and a
 // missing key there silently yields a default with no diagnostic. Here every parse is reported.
 //
-// Read ONCE, at the first init_device. There is no hot reload: a knob that changed halfway
-// through a frame would produce an evaluate whose create-time and evaluate-time parameters
-// disagree, which is exactly the class of bug that is impossible to see in a screenshot.
+// PARSED once, at the first init_device - but this struct is NO LONGER a read-once snapshot, and
+// the sentence that used to stand here ("There is no hot reload") is now false. Every key below
+// except app_id is a live control in the overlay.
+//
+// The concern that sentence recorded is real and is still honoured, just differently. A knob that
+// changed halfway through a frame would produce an evaluate whose create-time and evaluate-time
+// parameters disagree - a bug that is impossible to see in a screenshot. So a live change never
+// touches this struct mid-pass: overlay_ui::begin_pass copies the overlay's atomics into it ONCE
+// per accepted dispatch, on the render thread, under the lock that pass already holds, and every
+// read inside the pass then sees one coherent set of values. Anything that cannot be applied that
+// way - a different texture format, a pipeline that does not exist yet, a snippet that is not
+// loaded - is deferred to nr_service_reconfigure on the next present.
+//
+// TWO CONSEQUENCES FOR ANYONE EDITING THIS FILE:
+//   * A NEW KEY IS NOT LIVE BY DEFAULT. Adding it here and to the parser gets it parsed and
+//     nothing more. It needs an atomic in overlay_ui::live_block, a line in
+//     OVERLAY_OWNED_FIELDS, a line in begin_pass's snapshot, and a control - or it is a setting
+//     the ini can express and the UI silently cannot.
+//   * READING A FIELD OF THIS STRUCT OFF THE RENDER THREAD IS NOW A DATA RACE. begin_pass writes
+//     it on a recording thread. The main-thread readers that used to exist were removed for
+//     exactly this reason; use the overlay_ui::live_*() accessors instead.
+//
+// The full per-key ladder, with the read site of every key and the reason for its rung, is in the
+// header comment of src/overlay_ui.hpp.
 
 #pragma once
 
@@ -142,6 +163,67 @@ struct config
 	// cast.
 	float    color_strength = 1.0f;
 
+	// ---- which GRAFT-BACK the decode uses --------------------------------------------------
+	// The ENCODE is the same either way: same exact piecewise sRGB, same soft-clip knee 0.75 and
+	// shoulder 5.770780, so the network is shown the same proxy and returns the same answer. Only
+	// the way that answer is carried back onto the untouched HDR original differs.
+	//
+	//   0  ADDITIVE (ours, the DEFAULT, and the only mode whose identity is bit-exact)
+	//        transferred = original + (neural - proxy) / s
+	//      A scene-linear residual. Exactly +0.0 when the network asked for nothing, which is what
+	//      makes transfer_strength=0 an EXACT no-op at every paper_white_scale. RGB is scaled
+	//      uniformly, so the original's hue cannot drift.
+	//
+	//   1  RENODX UpgradeToneMap, reproduced from the reference add-on's own embedded HLSL
+	//      (renodx-reference.addon64, .rdata RVA 0x42f90..0x440bd, contiguous plaintext).
+	//        original_y < proxy_y : ratio = original_y / proxy_y
+	//        else                 : ratio = (neural_y + max(0, original_y - proxy_y)) / neural_y
+	//        result = lerp(original, HueOkLab(neural * ratio, neural), transfer_strength)
+	//      It REBUILDS the pixel from the network's answer and then locks the hue to the NEURAL's
+	//      hue in OkLab, with an AP1 gamut clamp.
+	//
+	// WHAT ACTUALLY DIFFERS, MEASURED, NOT ASSUMED (tools/hdr_codec_selftest.cpp).
+	// Luminance is linear, so their "headroom term" max(0, original_y - proxy_y) is ALGEBRAICALLY
+	// our additive residual:
+	//     neural_y + max(0, original_y - proxy_y)  ==  Y(original + (neural - proxy))
+	// The two modes therefore deliver the SAME luminance gain at every source magnitude. The whole
+	// difference is CHROMA, and it has TWO halves that show at OPPOSITE ends of color_strength:
+	//   * HIGHLIGHTS, at color_strength = 1. Where the soft clip has crushed the proxy to white the
+	//     network's answer is neutral, so mode 1 drags a clipped highlight toward the white point
+	//     while mode 0 leaves its chromaticity alone.
+	//   * SHADOWS, at color_strength = 0. Mode 0 has a chroma floor - it crossfades to the
+	//     network's own colour below Y = 0.001/s - and mode 1, faithfully to renodx, has none at
+	//     all, so it keeps the original's chromaticity and rescales it by an unbounded ratio.
+	//     Measured over 400,000 dark chromatic pixels: worst 27.6 8-bit code values, 42.5 % of them
+	//     differing by 2 or more. Forcing mode 0's valve open collapses that to 0.0, which is what
+	//     pins the cause on the valve. So color_strength = 0 is NOT a control that cancels the
+	//     graft difference; it swaps which half of it you are looking at.
+	//
+	// Mode 1 is a colour experiment, NOT a highlight-recovery fix. Neither mode recovers a bright
+	// highlight, and the ceiling is lower than the soft clip suggests because the proxy is stored
+	// in an r16g16b16a16_float surface: the encoded proxy quantises to exactly 1.0 at 1.81x paper
+	// white (3.47x is the FP32 figure and is not the one that governs), and of a requested +30 %
+	// gain the decode already delivers only ~50 % at 1.15x and ~5 % at 1.86x. Those ratios are to
+	// PAPER WHITE and do not move with paper_white_scale; the scene-linear magnitude they land at
+	// moves in proportion. That is what paper_white_scale is for.
+	//
+	// Mode 1 is also NOT an exact bypass at transfer_strength=0: it works in display-referred space
+	// throughout, so the result is (original * s) / s, which is exact only when s is a power of two
+	// (i.e. paper_white_scale 1.0, 2.0, 0.5, ...). Mode 0 is exact at every value. That is why 0 is
+	// the default.
+	//
+	// LIVE: this is a shader constant in the decode's root-constant block, snapshotted with the
+	// rest of the pass. No feature recreate, no pipeline rebuild - flip it in the overlay and the
+	// very next frame uses the other graft.
+	//
+	// NORMALISED TO {0, 1} AT PARSE, not left as the user typed it. The shader branch is
+	// `g_hdrGraft == 0u ? ours : theirs`, so there is no third behaviour for a third value to
+	// name - and an unlisted value made the overlay drop the combo entirely and print
+	// "2  (not a listed value - sent as-is)", leaving no way back to either mode without editing
+	// this file and restarting. Contrast DLSSNR.Style, where an unlisted value really does reach
+	// NGX with a meaning of its own and is therefore preserved.
+	uint32_t hdr_graft = 0;
+
 	// ---- temporal feedback ----------------------------------------------------------------
 	// Break the loop documented in README gap 5.
 	//
@@ -240,29 +322,54 @@ struct config
 	// is followed by a `cmp eax,0xbad00000` test that substitutes the value below when the host
 	// supplied nothing.
 	//
-	// THE SCALE IS NOW KNOWN, AND IT IS [0,1] - NOT the 0..2 this add-on used to offer. An
-	// earlier note here said "the scale these values sit on is not known" and the overlay ran
-	// 0..2 sliders on the strength of it. That was the bug: for two of these the ENTIRE upper
-	// half is provably inert, and 1.0 - the default - sits exactly at the top of the live range,
-	// so a user who raised a slider from its default could not see anything change, ever.
+	// WHAT EACH OF THESE ACTUALLY DOES, re-derived from the deployed snippet
+	// (nvngx_dlssnr.dll, md5 eea91faf55a8993656c66815f0497b3b) with exact function bounds taken
+	// from the .pdata RUNTIME_FUNCTION table. An earlier revision of this comment said "the scale
+	// these values sit on is not known" and the overlay ran 0..2 sliders on the strength of it;
+	// the revision after that overcorrected and claimed Intensity >= 1.0 "skips the whole pass".
+	// BOTH WERE WRONG. What follows is what the instructions do.
 	//
-	// `intensity` is an ATTENUATION, not a gain, and 1.0 means "no attenuation". The snippet
-	// skips the whole pass unless it is strictly below 1.0 [BIN 0x18001d4d0, called from
-	// 0x18001f500 on the evaluate path]:
+	// ---- intensity: an ATTENUATION, and 1.0 (the default) is FULL denoise -------------------
+	//
+	// 1.0 does NOT disable anything. It disables the OPTIONAL ATTENUATION PASS, because at full
+	// strength there is nothing to attenuate. fn 0x18001d4d0 is a MODE SELECTOR returning 0, 1
+	// or 3 - not a boolean - and 0x18001f500 is the "should this optional pass be enabled and can
+	// the backend do it" query:
 	//
 	//   0001d502  movss  xmm0, dword ptr [rip+0x9017a]     ; xmm0 = 1.0f  (VA 0x1800ad684)
 	//   0001d50a  comiss xmm0, dword ptr [rbx+0xe0]        ; 1.0 vs Intensity
 	//   0001d511  ja     0x18001d521                       ; taken ONLY if Intensity < 1.0
-	//   0001d513  add    rbx, 0x60
-	//   0001d517  cmp    qword ptr [rbx], 0                ; ...else fall back to ControlMask
-	//   0001d51b  jne    0x18001d525
-	//   0001d51d  xor    al, al                            ; >= 1.0 and no mask -> return 0
+	//   0001d517  cmp    qword ptr [rbx+0x60], 0           ; ...else fall back to ControlMask
+	//   0001d51d  xor    al, al                            ; >= 1.0 and no mask -> mode 0
+	//   0001d53d  cmovne eax, ecx                          ; else mode 1, or 3 with a mask bound
 	//
-	// and the caller turns that 0 into "skip the pass entirely" [BIN 0x18001f518 test eax,eax /
-	// 0x18001f51a je -> return false, so the `call 0x1800295e0` at 0x18001f522 never runs]. This
-	// add-on binds no ControlMask, so for us `Intensity >= 1.0` is unconditionally a no-op.
+	// and the caller, 0x18001f500, forwards that mode to a CAPABILITY QUERY:
 	//
-	// `local_tone_strength` is a BLEND COEFFICIENT that the snippet clamps to [0,1] itself
+	//   0001f513  call   0x18001d4d0                       ; mode
+	//   0001f518  test   eax, eax
+	//   0001f51a  je     0x18001f533                       ; mode 0 -> return false
+	//   0001f520  mov    edx, eax                          ; mode passed as arg2
+	//   0001f522  call   0x1800295e0                       ; bt eax, mode-1 : does the backend
+	//                                                      ; support this mode?
+	//
+	// THE FALSE IS NOT AN ABORT. Its one caller stores it in a local flag and falls straight
+	// through into the rest of the evaluate [BIN 0x1800191a8-0x1800191bd]:
+	//
+	//   0019 1a8  call   0x18001f500
+	//   0019 1ad  test   al, al
+	//   0019 1af  je     0x1800191ba                       ; -> xor r12b, r12b
+	//   0019 1b1  mov    r12b, 1
+	//   0019 1bd  mov    byte ptr [rbp-0x7f], r12b         ; a FLAG, not a return
+	//
+	// and the flag's only consumer gates one extra dispatch [BIN 0x180019789 test r12b,r12b /
+	// 0x18001978c je -> skips `call 0x180023080` at 0x1800197d9]. Denoising is unaffected.
+	//
+	// So: 1.0 = no attenuation = full NR, and it is the right default. Values ABOVE 1.0 are
+	// indistinguishable from 1.0, which is why the slider tops out there - not because the
+	// control is dead.
+	//
+	// ---- local_tone_strength: a lerp coefficient the snippet clamps itself -------------------
+	//
 	// [BIN 0x18001d5f0, reached 0x1800159c0 -> 0x180018620 -> 0x18001d7c0 -> 0x18001d5f0]:
 	//
 	//   0001d5f0  movss  xmm2, dword ptr [rcx+0xe4]        ; t = LocalToneStrength
@@ -274,19 +381,55 @@ struct config
 	//   0001d612  jbe    0x18001d617
 	//   0001d614  xorps  xmm2, xmm2                        ; t < 0   -> t = 0
 	//
-	// after which `t` is the lerp coefficient for 14 network parameters written to
-	// [rcx+0x124..0x158]. Every value >= 1.0 is therefore identical to 1.0.
+	// then `t` lerps 14 network parameters into [rcx+0x124..0x158], each from its own neutral
+	// (0.0, except +0x128 whose neutral is 1.0) toward a target. Every value >= 1.0 is therefore
+	// byte-identical to 1.0. This is a real clamp in the binary and is the one range claim on
+	// this list that is proven rather than conventional.
 	//
-	// The two STRUCTURE strengths are different, and the difference is stated honestly because it
-	// is the one thing here that is convention rather than proof: they are NOT clamped anywhere
-	// in the snippet. They pass through raw into the network's conditioning block
-	// [BIN 0x180019f30 derives +0xf8/+0xfc -> 0x180021bb0 loads them at 0x180022548/0x180022551
-	// -> `call 0x18003f490` at 0x180022636 -> `call 0x180061710` at 0x18003f689, which is a pure
-	// setter storing them at layer+0x98 / layer+0x9c with no clamp]. [0,1] is used for them
-	// because it is the domain their two proven siblings share, because the snippet's own
-	// "disabled" sentinel for both is -1.0f, and because they are conditioning inputs to a
-	// trained network, for which out-of-range is undefined rather than "more". If a value above
-	// 1.0 is ever measured to do something useful on hardware, this is the comment to correct.
+	// ---- the two STRUCTURE strengths: LIVE ONLY BEHIND TWO RUNTIME TYPE CHECKS ---------------
+	//
+	// A previous revision called these "proven to reach the network raw and unclamped". THAT WAS
+	// A REACHABILITY CLAIM MISREAD AS A LIVENESS CLAIM. The call chain it cited does exist -
+	// 0x180019f30 derives the effective pair at +0xf8/+0xfc, 0x180021bb0 loads them, 0x18003f490
+	// forwards, 0x180061710 stores them - but it walked the CALL EDGES and never looked at the
+	// guards sitting on them. There are two, and both are `dynamic_cast` null tests:
+	//
+	//   GATE 1, in fn 0x180021bb0. The network object must be an HNetCpp::CCNetwork:
+	//     0021cc4  mov  rcx, qword ptr [rdi+0x48]
+	//     0021cc8  call 0x18007f5cc                        ; __RTDynamicCast, src .?AVNetwork@HNetCpp@@
+	//                                                      ;                  dst .?AVCCNetwork@HNetCpp@@
+	//     0021cd0  mov  qword ptr [rsp+0xe0], rax
+	//     002253f  test rcx, rcx
+	//     0022542  je   0x18002263b                        ; NULL -> the whole block below is skipped
+	//     0022548  movss xmm5, dword ptr [r14+0xfc]        ; effective LOCAL structure
+	//     0022551  movss xmm7, dword ptr [r14+0xf8]        ; effective SKIN  structure
+	//     0022636  call 0x18003f490
+	//
+	//   GATE 2, in fn 0x18003f52c. The layer must be a CCTinlayoutFusedPreBlockSwin1HLayer:
+	//     003f5e8  call 0x18007f5cc                        ; dst .?AVCCTinlayoutFusedPreBlockSwin1HLayer@HNetCpp@@
+	//     003f5f0  test rax, rax
+	//     003f5f3  je   0x18003f68e                        ; NULL -> `call 0x180061710` is skipped
+	//     003f689  call 0x180061710                        ; -> cb+0x98, cb+0x9c
+	//
+	// 0x180061710 itself is indeed a pure unclamped setter [BIN 0x180061756 movss [rdx+0x98] /
+	// 0x18006175e movss [rdx+0x9c]] - but nothing reaches it unless both casts succeed. And
+	// +0xf8/+0xfc have NO other reader: an exhaustive scan of every movss in .text finds exactly
+	// three sites at each displacement, and the two outside 0x180021bb0 are rbp-relative frame
+	// locals in a different function, not this struct. So gates 1 and 2 are the only route.
+	//
+	// WHAT THAT MEANS FOR THE USER: local_structure_strength, skin_structure_strength and
+	// use_auto_mask - which only SELECTS between +0xe8 and the -1.0f constant for those same two
+	// slots - are all downstream of one gate. If the loaded model is not a CCNetwork with a
+	// PreBlockSwin1H layer, all three are inert TOGETHER and no value of any of them does
+	// anything. That is exactly the 3-of-5 pattern reported from hardware, and it is NOT
+	// something a slider range can fix. It is UNRESOLVED whether the shipped model satisfies the
+	// casts; settling it needs a run, and the overlay says so rather than promising these work.
+	//
+	// NOTHING IS CLAMPED ON LOAD. An earlier revision clamped all four here, which removed
+	// reachable values from the two strengths - the very thing the binary declines to do - and
+	// silently rewrote the user's ini. The ini is the unclamped escape hatch; the sliders carry
+	// the conventional [0,1] domain because -1.0f is the snippet's own disabled sentinel and
+	// out-of-range conditioning of a trained network is undefined rather than "more".
 	float    intensity                = 1.0f;
 	float    local_tone_strength      = 1.0f;
 	float    local_structure_strength = 1.0f;
@@ -339,6 +482,50 @@ struct config
 	// not run, whether or not the NR snippet is loaded. This key only controls whether the NR
 	// snippet is loaded and initialised at all.
 	bool     dlss_nr = true;
+
+	// =======================================================================================
+	// CHAIN MODE - DLSS-NR *then* DLSS-SR, on ONE accepted TAA dispatch.
+	// =======================================================================================
+	//
+	// dlss_sr=1 and dlss_nr=1 do not chain: the SR pass TAKES the accepted dispatch and the NR
+	// evaluate never runs. That is an implementation choice, not a limitation - both snippets
+	// already load side by side through the trampoline's two slots, DLSS-NR already evaluates
+	// into its OWN texture rather than writing the frame, and DLSS-SR's colour input is a
+	// parameter. This key wires the one to the other:
+	//
+	//     game TAA dispatch (suppressed)
+	//       -> [codec encode]  render-res linear HDR -> display-referred proxy
+	//       -> DLSS-NR         proxy -> out_tex, at the RENDER extent
+	//       -> [codec decode]  the denoised answer grafted back onto the linear original
+	//       -> DLSS-SR         COLOUR = the denoised render-res image -> u0 at 4K
+	//
+	// Denoise first, THEN upscale. The other order - which is what dlss_sr=0/dlss_nr=1 does
+	// today - denoises at 1920x1080 and then lets a spatial filter magnify whatever noise is
+	// left into 3840x2160.
+	//
+	// WHAT IT COSTS WHEN IT IS 0, which is the default and the shipping configuration: one bool
+	// is parsed and stored, and it is read in a handful of `&&`/`||` chains that short-circuit
+	// false. Nothing is loaded, nothing is allocated, no GPU work changes, and the
+	// "dlss_sr=0 is BIT-IDENTICAL to the build before SR existed" contract above extends to it
+	// verbatim. With dlss_chain=0 the branch at the end of nr_try_run is exactly the one that
+	// ships today.
+	//
+	// REQUIREMENTS, and the add-on says so in the log rather than degrading silently:
+	//   * BOTH snippets must load and arm - nvngx_dlssnr.dll AND nvngx_dlss.dll. If either does
+	//     not, chain mode is refused once, by name, and the run falls back to whichever single
+	//     feature did arm. It never half-runs.
+	//   * UE4 must be in the MainUpsampling permutation (r.TemporalAA.Upsampling=1,
+	//     r.SecondaryScreenPercentage=100, r.ScreenPercentage=50), because otherwise the TAA
+	//     pass's output UAV is the same size as its colour input and there is nothing to upscale
+	//     into. That permutation has DIFFERENT DXBC, so sr_shader_hash must be re-pinned - the
+	//     want-hash selector below treats dlss_chain exactly like dlss_sr.
+	//   * hdr_codec=1 is effectively mandatory. With it off, DLSS-SR is handed the network's raw
+	//     DISPLAY-REFERRED answer as if it were linear HDR - README gap 1, magnified by the
+	//     upscaler. The add-on warns once and runs anyway.
+	//
+	// The DLSS-NR copy-back does not happen in chain mode and CANNOT: its result is at the render
+	// extent and u0 is at the output extent. DLSS-SR's write is the only write to u0.
+	bool     dlss_chain = false;
 
 	// ---- identification --------------------------------------------------------------------
 	// THE ONE-LINE HASH RE-PIN. Flipping r.TemporalAA.Upsampling changes TAA_PASS_CONFIG, and
@@ -542,35 +729,6 @@ inline float parse_float(const char *v, float fallback)
 	return static_cast<float>(r);
 }
 
-// The four NR strength knobs live on [0,1] - see the long note on the tuning-knob defaults for
-// the disassembly. An ini written by an older build (or by hand) can hold anything, and a value
-// above 1.0 is not merely out of range, it is INERT: the snippet skips the intensity pass
-// outright at >= 1.0 and clamps local tone to 1.0, so a stale `intensity = 2.0` would silently
-// reproduce exactly the "this control does nothing" bug the range fix exists to remove. Clamp on
-// load so an existing stray_dlssnr.ini cannot carry the bug forward.
-//
-// `skin_structure_strength` is the one that must NOT be clamped at the bottom to 0: negative is
-// a live sentinel meaning "inherit local_structure_strength" [BIN 0x18001aa6d comiss / 0x18001aa70
-// jae / 0x18001aa72 movss xmm1,[rdi+0xe8]], so it clamps to [-1,1] and any negative normalises
-// to exactly -1.0.
-inline float clamp_unit(float v)
-{
-	if (!(v == v))       // NaN -> the snippet's own fallback
-		return 1.0f;
-	if (v < 0.0f) return 0.0f;
-	if (v > 1.0f) return 1.0f;
-	return v;
-}
-
-inline float clamp_skin(float v)
-{
-	if (!(v == v))       // NaN -> "inherit", the snippet's own fallback for this one
-		return -1.0f;
-	if (v < 0.0f) return -1.0f;
-	if (v > 1.0f) return 1.0f;
-	return v;
-}
-
 inline void trim(std::string &s)
 {
 	size_t b = 0, e = s.size();
@@ -651,6 +809,7 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "transfer_strength")        c.transfer_strength = parse_float(v, c.transfer_strength);
 		else if (key == "color_strength" || key == "colour_strength")
 		                                            c.color_strength = parse_float(v, c.color_strength);
+		else if (key == "hdr_graft")                c.hdr_graft = (parse_u64(v, c.hdr_graft) != 0ull) ? 1u : 0u;
 		else if (key == "history_restore")          c.history_restore = parse_bool(v, c.history_restore);
 		else if (key == "restore_graphics_root")    c.restore_graphics_root = parse_bool(v, c.restore_graphics_root);
 		else if (key == "populate_parameters")      c.populate_parameters = parse_bool(v, c.populate_parameters);
@@ -663,10 +822,10 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "depth_inverted")           c.depth_inverted = parse_bool(v, c.depth_inverted);
 		else if (key == "mvec_scale_x")             c.mvec_scale_x = parse_float(v, c.mvec_scale_x);
 		else if (key == "mvec_scale_y")             c.mvec_scale_y = parse_float(v, c.mvec_scale_y);
-		else if (key == "intensity")                c.intensity = clamp_unit(parse_float(v, c.intensity));
-		else if (key == "local_tone_strength")      c.local_tone_strength = clamp_unit(parse_float(v, c.local_tone_strength));
-		else if (key == "local_structure_strength") c.local_structure_strength = clamp_unit(parse_float(v, c.local_structure_strength));
-		else if (key == "skin_structure_strength")  c.skin_structure_strength = clamp_skin(parse_float(v, c.skin_structure_strength));
+		else if (key == "intensity")                c.intensity = parse_float(v, c.intensity);
+		else if (key == "local_tone_strength")      c.local_tone_strength = parse_float(v, c.local_tone_strength);
+		else if (key == "local_structure_strength") c.local_structure_strength = parse_float(v, c.local_structure_strength);
+		else if (key == "skin_structure_strength")  c.skin_structure_strength = parse_float(v, c.skin_structure_strength);
 		else if (key == "style")                    c.style = static_cast<uint32_t>(parse_u64(v, c.style));
 		// ---- BEGIN overlay_ui hook ----
 		else if (key == "ui_correction")            c.ui_correction = static_cast<uint32_t>(parse_u64(v, c.ui_correction));
@@ -675,6 +834,7 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "app_id")                   c.app_id = parse_u64(v, c.app_id);
 		else if (key == "dlss_sr")                  c.dlss_sr = parse_bool(v, c.dlss_sr);
 		else if (key == "dlss_nr")                  c.dlss_nr = parse_bool(v, c.dlss_nr);
+		else if (key == "dlss_chain")               c.dlss_chain = parse_bool(v, c.dlss_chain);
 		else if (key == "sr_shader_hash")           c.sr_shader_hash = parse_u64(v, c.sr_shader_hash);
 		else if (key == "sr_out_width")             c.sr_out_width = static_cast<uint32_t>(parse_u64(v, c.sr_out_width));
 		else if (key == "sr_out_height")            c.sr_out_height = static_cast<uint32_t>(parse_u64(v, c.sr_out_height));

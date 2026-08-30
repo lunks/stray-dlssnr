@@ -2,7 +2,7 @@ name: build
 
 on:
   push:
-    branches: [ main, dlss-sr ]
+    branches: [ main, dlss-sr, nr-sr-chain, nr-tuning-live ]
     tags: [ 'v*' ]
   pull_request:
   workflow_dispatch:
@@ -60,6 +60,66 @@ jobs:
              trampoline\remix_nvngx.cpp ^
              /Fe:remix_nvngx.dll
           if errorlevel 1 exit /b 1
+
+      # -----------------------------------------------------------------------------------------
+      # THE CODEC'S SHADERS MUST ACTUALLY COMPILE.
+      #
+      # A FEATURE THAT COMPILES IS NOT A FEATURE THAT RUNS. src/hdr_codec.hpp carries its two
+      # compute shaders as C++ STRING LITERALS and hands them to D3DCompile at load; the C++ build
+      # above cannot see inside them at all. A typo in that HLSL is invisible here, and its runtime
+      # symptom is not a crash but a SILENT DEGRADATION: build_blob logs the error blob, create()
+      # returns false, and the codec latches OFF - so the user, who plays on this path every day,
+      # silently loses the whole HDR transfer and gets the darkened frame back.
+      #
+      # fxc is the exact compiler the add-on calls (d3dcompiler_47's D3DCompile, cs_5_0), and the
+      # flags below are the same three build_blob passes: /O3 = OPTIMIZATION_LEVEL3,
+      # /Ges = ENABLE_STRICTNESS, /Gis = IEEE_STRICTNESS. The sources are extracted from the header
+      # exactly the way full_source() assembles them - prelude, newline, entry point - so what is
+      # compiled here is byte-for-byte what ships.
+      # -----------------------------------------------------------------------------------------
+      - name: The HDR codec's HLSL must compile with fxc (cs_5_0), the way it will at runtime
+        shell: pwsh
+        run: |
+          $src = Get-Content -Raw src/hdr_codec.hpp
+          $m = [regex]::Matches($src, '(?s)R"HLSL\((.*?)\)HLSL"')
+          if ($m.Count -ne 3) {
+            throw "expected exactly 3 R`"HLSL(...)HLSL`" literals in src/hdr_codec.hpp (prelude, encode, decode); found $($m.Count). This gate has stopped testing what it thinks it is testing."
+          }
+          $prelude = $m[0].Groups[1].Value
+          # full_source() is prelude + "`n" + entry. Reproduce that exactly.
+          Set-Content -NoNewline -Path encode_full.hlsl -Value ($prelude + "`n" + $m[1].Groups[1].Value)
+          $decode = $prelude + "`n" + $m[2].Groups[1].Value
+          Set-Content -NoNewline -Path decode_full.hlsl -Value $decode
+
+          # THE SECOND DECODE VARIANT. hdr_codec::full_source_decode(false) flips exactly one
+          # character - the 1 in `#define NR_RDX_GRAFT 1` - and build() compiles THAT if the first
+          # one failed, so that a d3dcompiler which cannot build the reference graft costs the
+          # experiment and not the default the user plays on. If this variant does not compile,
+          # the survival path is not a survival path, and nobody would find out until the day it
+          # was needed. Reproduce the substitution exactly as full_source_decode does.
+          if ($decode -notmatch '#define NR_RDX_GRAFT 1') {
+            throw "the NR_RDX_GRAFT marker is missing from the decode literal, so hdr_codec::full_source_decode(false) would return the same text and the graft-failure fallback has silently stopped existing."
+          }
+          Set-Content -NoNewline -Path decodenograft_full.hlsl -Value ($decode -replace '#define NR_RDX_GRAFT 1', '#define NR_RDX_GRAFT 0')
+
+          $fxcPath = $null
+          $found = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" -ErrorAction SilentlyContinue |
+                   Sort-Object FullName | Select-Object -Last 1
+          if ($found) { $fxcPath = $found.FullName }
+          if (-not $fxcPath) {
+            $cmd = Get-Command fxc.exe -ErrorAction SilentlyContinue
+            if ($cmd) { $fxcPath = $cmd.Source }
+          }
+          if (-not $fxcPath) { throw "fxc.exe was not found. This gate is the only thing that compiles the codec's HLSL; do not skip it." }
+          Write-Host "fxc: $fxcPath"
+
+          foreach ($e in @('encode','decode','decodenograft')) {
+            & $fxcPath /nologo /T cs_5_0 /E main /O3 /Ges /Gis /Fo "$e.dxbc" "${e}_full.hlsl" 2>&1 | Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) { throw "fxc FAILED on the $e shader. At runtime this is a silent latch-off of the whole HDR codec." }
+            $sz = (Get-Item "$e.dxbc").Length
+            Write-Host "  OK  $e -> $sz bytes of cs_5_0 DXBC"
+            if ($sz -lt 256) { throw "the $e blob is implausibly small ($sz bytes)" }
+          }
 
       # ReShade identifies an add-on by three exported data symbols. If they are missing the
       # add-on either does not appear or appears unnamed, which is indistinguishable from the
@@ -390,6 +450,63 @@ jobs:
       # set, that a missing file is created, and that an unwritable target reports failure instead
       # of claiming success.
       # -----------------------------------------------------------------------------------------
+      # -----------------------------------------------------------------------------------------
+      # THE HDR CODEC'S DECODE, REPLAYED NUMERICALLY, ON BOTH TOOLCHAINS.
+      #
+      # hdr_graft put a BRANCH inside a shader the user plays on every day, and mode 0 is that
+      # user's default. "Mode 0 is unchanged" is not an argument about where a brace went: the test
+      # carries the SHIPPING decode and the CURRENT decode as two separate transcriptions and
+      # compares 1,080,000 outputs bit for bit, and it separately proves the identity property
+      # (transfer_strength = 0 is an exact no-op) still holds over another 1,080,000 cases.
+      # It also pins the NaN firewall and the alpha carry-through in BOTH modes - the two things
+      # that fixed real bugs here and are not allowed to regress into the new path.
+      # -----------------------------------------------------------------------------------------
+      - name: HDR codec decode replay, both graft modes (MSVC)
+        shell: cmd
+        run: |
+          cl /nologo /std:c++17 /EHsc /O2 /MT /W3 tools\hdr_codec_selftest.cpp /Fe:hdr_selftest_msvc.exe
+          if errorlevel 1 exit /b 1
+          hdr_selftest_msvc.exe
+          if errorlevel 1 exit /b 1
+
+      - name: HDR codec decode replay, both graft modes (mingw-w64)
+        shell: bash
+        run: |
+          export PATH="/c/mingw64/bin:$PATH"
+          g++ -std=gnu++17 -O2 -Wall -Wextra -static -static-libgcc -static-libstdc++ \
+              tools/hdr_codec_selftest.cpp -o hdr_selftest_mingw.exe
+          ./hdr_selftest_mingw.exe
+
+      # -----------------------------------------------------------------------------------------
+      # THE DECODE'S SECOND SOURCE VARIANT MUST BE REAL.
+      #
+      # Both graft modes live in ONE shader and ONE compile, so a d3dcompiler that cannot build
+      # mode 1's OkLab/AP1 matrices would - without a fallback - fail the decode outright, latch
+      # codec_failed, and hand the user back the darkened pre-codec frame they play without every
+      # day. hdr_codec::build therefore retries with full_source_decode(false), which flips one
+      # character. The fxc step above compiles BOTH variants, but it reimplements the substitution
+      # in PowerShell; this one calls the real function and checks that every graft symbol is
+      # behind the #if, so the preprocessor really removes them and the retry is not theatre.
+      # -----------------------------------------------------------------------------------------
+      - name: The decode's graft-free source variant is real (MSVC)
+        shell: cmd
+        run: |
+          cl /nologo /std:c++17 /EHsc /O2 /MT /W3 ^
+             /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+             /I include tools\hdr_source_variants_test.cpp /Fe:hdr_variants_msvc.exe
+          if errorlevel 1 exit /b 1
+          hdr_variants_msvc.exe
+          if errorlevel 1 exit /b 1
+
+      - name: The decode's graft-free source variant is real (mingw-w64)
+        shell: bash
+        run: |
+          export PATH="/c/mingw64/bin:$PATH"
+          g++ -std=gnu++17 -O2 -Wall -Wextra -static -static-libgcc -static-libstdc++ \
+              -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -DNOMINMAX -DNDEBUG \
+              -I include tools/hdr_source_variants_test.cpp -o hdr_variants_mingw.exe
+          ./hdr_variants_mingw.exe
+
       - name: ini writer round-trip (MSVC)
         shell: cmd
         run: |
@@ -409,6 +526,43 @@ jobs:
               -Wall -Wextra -Wno-attributes -Wno-unknown-pragmas -Wno-unused-parameter \
               -I include abi/ini_rewrite_test.cpp -o ini_test_mingw.exe
           ./ini_test_mingw.exe
+
+      # -----------------------------------------------------------------------------------------
+      # THE NGX PARAMETER-BLOCK SELFTEST. It drives src/ngx_interop.hpp's hand-laid 17-slot vtable
+      # through the BYTE OFFSETS the deployed snippet uses, replays the snippet's own
+      # parameter-read function (fn 0x180019f30) against it, and pins the two tuning transforms
+      # the overlay tooltips cite.
+      #
+      # GATING, AND NEW. The test existed, passed, and was run by hand - wired into neither CI nor
+      # build.sh - so the exact class of regression it was written to catch could land with every
+      # job green. It is also in build.sh now; both toolchains run it here because the vtable it
+      # checks is the one place where MSVC and GCC layout differences would show up as a silently
+      # wrong slot rather than a compile error.
+      # -----------------------------------------------------------------------------------------
+      - name: NGX parameter-block selftest (MSVC)
+        shell: cmd
+        run: |
+          rem The test includes the REAL src/ngx_interop.hpp, whose first include is
+          rem "reshade_compat.hpp" - a quote-include resolves against src/, which would drag in
+          rem windows.h and reshade.hpp. Stage the header next to the host shims instead, exactly
+          rem as tools/run_ngx_paramblock_selftest.sh does, so the test cannot drift from a copy.
+          mkdir stage_ngx
+          copy /Y src\ngx_interop.hpp stage_ngx\ >nul
+          copy /Y src\addon_config.hpp stage_ngx\ >nul
+          copy /Y tools\ngx_paramblock_shim\*.hpp stage_ngx\ >nul
+          copy /Y tools\ngx_paramblock_shim\*.h stage_ngx\ >nul
+          cl /nologo /std:c++17 /EHsc /O2 /MT /W3 ^
+             /I stage_ngx tools\ngx_paramblock_selftest.cpp /Fe:ngx_selftest_msvc.exe
+          if errorlevel 1 exit /b 1
+          ngx_selftest_msvc.exe
+          if errorlevel 1 exit /b 1
+
+      - name: NGX parameter-block selftest (mingw-w64)
+        shell: bash
+        run: |
+          export PATH="/c/mingw64/bin:$PATH"
+          export CXX=g++
+          ./tools/run_ngx_paramblock_selftest.sh
 
       # -----------------------------------------------------------------------------------------
       # The overlay runs on the PRESENT thread. nr_try_run takes st->mutex and then g.mutex
