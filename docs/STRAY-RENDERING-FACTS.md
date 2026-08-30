@@ -155,15 +155,35 @@ varies, but the row offsets below did not:
 * `size = 131 float4s (2096 bytes)`
 * `size = 145 float4s (2320 bytes)`
 
-Measured row offsets (rows are float4 rows, i.e. byte offset / 16):
+Row offsets (rows are float4 rows, i.e. byte offset / 16). The stock UE 4.27.2 layout was
+established twice independently — read out of `VIEW_UNIFORM_BUFFER_MEMBER_TABLE`
+(`SceneView.h:582-774`) and recomputed by a layout script over the same declaration list:
 
 | Field | Row | Byte offset |
 |---|---|---|
+| `ViewToClip` | 28 | 448 |
+| `ViewToClipNoAA` | 32 | 512 |
 | `ClipToPrevClip` | 122 | 1952 |
 | `TemporalAAJitter` | 126 | 2016 |
+| `ViewRectMin` | 129 | 2064 |
+| `ViewSizeAndInvSize` | 130 | 2080 |
+| `LightProbeSizeRatioAndInvSizeRatio` | 131 | 2096 |
+| `TemporalAAParams` | 152 | — |
 
-`ClipToPrevClip` at row 122 was confirmed by DXBC analysis of Stray's own TAA shader, matching
-the stock UE 4.27.2 layout.
+The six rows a jitter recovery needs — `proj=28 noaa=32 clip=122 jitter=126 size=130 params=152` —
+were located in Stray's running View buffer and reported at the strongest tier (`tier=full`).
+
+`ClipToPrevClip` at row 122 was confirmed **in Stray's own TAA shader by pure DXBC instruction
+analysis**, with no reflection names involved.
+
+Two notes on reading this buffer, both observed:
+
+* `LightProbeSizeRatioAndInvSizeRatio` at row 131 is `(1,1,1,1)`, and is a decoy for a naive
+  search that expects an identity-looking row.
+* The shader declares `dcl_constantbuffer cb1[131]`. That 131 is the **highest row the shader
+  indexes**, not the buffer's size — `ViewSizeAndInvSize` ends at byte 2096.
+* These offsets are fixed for a given engine build but are not invariant across a licensee edit to
+  the member table, which is why they were checked rather than trusted.
 
 **Jitter convention**, from the engine source and consistent with the above:
 
