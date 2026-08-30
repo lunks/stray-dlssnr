@@ -2291,7 +2291,8 @@ static void nr_set_resource(ngx::parameter_block *p, const ngx::resource_param_n
 //
 // Measured against the deployed snippet (nvngx_dlssnr.dll md5 eea91faf55a8993656c66815f0497b3b),
 // NVSDK_NGX_D3D12_EvaluateFeature reaches exactly one function that reads these keys
-// [BIN 0x1800159c0 -> 0x180018620 -> 0x180019f30], and that function issues 61 Gets per evaluate.
+// [BIN 0x1800159c0 -> 0x180018620 -> 0x180019f30], and that function issues 60 Gets per evaluate
+// (counted by walking every guard-dispatched vtable call in 0x180019f30..0x18001ac2a).
 // A trace that reports far fewer, or that reports these five as absent, is the finding.
 static void nr_log_get_trace(const nr_state &st, ngx::parameter_block &p)
 {
