@@ -42,6 +42,14 @@
 // Every handler body is wrapped so a C++ exception cannot escape into ReShade and terminate the
 // process. If this add-on destabilises STRAY we lose the ability to test anything at all.
 
+// ---- BEGIN overlay_ui hook ----
+// MUST STAY ABOVE reshade_compat.hpp. include/reshade_overlay.hpp has NO include guard and its
+// whole body is `#if defined(IMGUI_VERSION_NUM)`, so anything that pulls in reshade.hpp before
+// <imgui.h> deletes namespace ImGui from this translation unit permanently - and reshade.hpp's
+// own #pragma once means it never gets a second chance. src/overlay_imgui.hpp #errors if this
+// moves, and a gating CI step fails the build if the wrong order ever compiles.
+#include "overlay_ui.hpp"
+// ---- END overlay_ui hook ----
 #include "reshade_compat.hpp"
 
 #include "shader_detect.hpp"
@@ -61,6 +69,7 @@
 // used here; the jitter half is DLSS-SR's and is untouched.
 #include "ue4_jitter.hpp"
 #include "dlss_sr.hpp"
+#include "rt_census.hpp"
 
 #include <d3d12.h>
 
@@ -123,6 +132,18 @@ static void logf(reshade::log::level level, const char *fmt, ...)
 #define LOGI(...) logf(reshade::log::level::info,    __VA_ARGS__)
 #define LOGW(...) logf(reshade::log::level::warning, __VA_ARGS__)
 #define LOGE(...) logf(reshade::log::level::error,   __VA_ARGS__)
+
+// The functor rt_census.hpp logs through. A free function, not a lambda, so every call site can
+// pass the same one without capturing anything. Levels are rt_census::log_{info,warn,error}.
+static void rt_census_log(int level, const char *msg)
+{
+	switch (level)
+	{
+	case rt_census::log_warn:  LOGW("%s", msg); break;
+	case rt_census::log_error: LOGE("%s", msg); break;
+	default:                   LOGI("%s", msg); break;
+	}
+}
 
 // Nothing may escape a callback into ReShade.
 // Variadic on purpose: a body containing a top-level comma (e.g. "bool a = false, b = false;")
@@ -375,6 +396,10 @@ static void on_destroy_device(device *dev)
 				(unsigned long long)sh->dropped_heap_growth.load(std::memory_order_relaxed),
 				(unsigned long long)sh->copies_missing_src.load(std::memory_order_relaxed));
 		}
+		// The last chance to report: DLL_PROCESS_DETACH runs under the loader lock and is no
+		// place to take two mutexes and write dozens of log lines. A hard kill loses this block,
+		// which is exactly why the periodic summary exists as well.
+		rt_census::report(true, &rt_census_log);
 		nr_destroy_device(dev);
 		probe::pd_destroy<probe::device_shadow>(dev, probe::kDeviceShadowGuid);
 	})
@@ -713,6 +738,19 @@ static void on_init_pipeline(device *dev, pipeline_layout layout, uint32_t subob
 		if (pso.handle == 0 || subobjects == nullptr)
 			return;
 
+		// DXR FIRST, AND BEFORE THE PS/CS FILTER BELOW.
+		//
+		// The loop that follows skips every sub-object that is not a pixel or compute shader, so
+		// raygen_shader / miss_shader / closest_hit_shader / any_hit_shader / intersection_shader /
+		// callable_shader / libraries / shader_groups all fall through it and NOTHING about ray
+		// tracing ever reaches g.n_dxil. That is why the census's `dxil=` counter has never been
+		// evidence about DXR in either direction: it counts PS and CS only, and a DXIL ray tracing
+		// library is not either of those. rt_census::note_pipeline is the fix; the census line in
+		// on_present now says so out loud rather than leaving `dxil=0` to be misread as "no RT".
+		//
+		// A strict no-op when rt_census=0: one relaxed atomic load, then return.
+		rt_census::note_pipeline(subobject_count, subobjects, pso, &rt_census_log);
+
 		pipeline_record rec;
 		rec.layout = layout;
 
@@ -861,6 +899,10 @@ static void on_bind_pipeline(command_list *cmd, pipeline_stage stages, pipeline 
 		{
 			cs->state_object = pso;
 			cs->pso = pipeline{ 0 };
+			// Tier 0 of the census: SetPipelineState1 is only ever used for ray tracing state
+			// objects, so this is a free count of "RT pipelines were bound". Strict no-op when
+			// rt_census=0 - one relaxed atomic load.
+			rt_census::note_state_object_bind(pso);
 		}
 		else
 		{
@@ -1464,6 +1506,20 @@ struct nr_state
 	uint32_t guide_w = 0, guide_h = 0;
 
 	bool     need_reset = true;          // DLSSNR.Reset for the next evaluate
+
+	// CAMERA-CUT DETECTION. UE4 assigns PrevViewMatrices = ViewMatrices on any frame where
+	// bResetCamera holds (camera cut, level load, time reset, large camera movement,
+	// bForceCameraVisibilityReset), so View.TemporalAAJitter.zw becomes bitwise equal to .xy.
+	// ue4_jitter.hpp has computed exactly this as result::reset_signalled since it was written;
+	// nothing consumed it until now. STRAY is full of hard cutscene transitions, and without this
+	// the NR temporal history carries stale samples across them and ghosts for several frames.
+	// The reference add-on gets the equivalent for free by inheriting the host game's reset flag.
+	// ATOMICS ON PURPOSE, exactly as mvec_frames/mvec_cb_reuse are: the on_present census reads
+	// these and must NOT take st->mutex, because nr_try_run takes st->mutex then g.mutex and the
+	// reverse order would deadlock. Do not "simplify" these back into plain fields.
+	std::atomic<bool>     jitter_cut_ok{ false };  // jitter row readable AND validated this run
+	std::atomic<uint64_t> camera_cuts{ 0 };        // cuts signalled, for the census
+	bool     logged_cut_source = false;
 	bool     feature_failed = false;     // latched per (out_w,out_h); cleared when they move
 	bool     pending_teardown = false;   // serviced on the next present, on the main thread
 	uint64_t evaluate_count = 0;
@@ -2161,6 +2217,14 @@ static bool nr_ensure_feature(nr_state &st, ID3D12GraphicsCommandList *cl, uint3
 	// own usage.
 	ngx::set_i32(p, ngx::kParamFreeMemOnRelease, 1);
 
+	// PARITY WITH THE REFERENCE ADD-ON. renodx writes PerfQualityValue = 0 at create
+	// [BIN 0x18000dfd5], and unlike DLSS.Feature.Create.Flags - which has ZERO occurrences in
+	// nvngx_dlssnr.dll and is therefore inapplicable to feature 18 - "PerfQualityValue" IS an
+	// exact string in this snippet. Feature 18 does not upscale, so this is almost certainly
+	// inert; it is written anyway as zero-cost insurance against the snippet reading a key we
+	// leave absent. 0 = MaxPerf, which is the reference's value.
+	ngx::set_i32(p, ngx::kParamPerfQualityValue, 0);
+
 	void *handle = nullptr;
 	const ngx::Result r = g_snippet.create_feature(cl, ngx::kFeatureDLSSNR, p, &handle);
 	if (ngx::failed(r) || handle == nullptr)
@@ -2670,6 +2734,40 @@ static bool nr_update_clip_to_prev_clip(device *dev, probe::device_shadow &sh, c
 		st.view_layout_failed = true;
 		st.clip_ok = false;   // permanent latch: drop to raw, never freeze the last matrix
 		return false;
+	}
+
+	// ------------------------------------------------------------------ camera-cut detection
+	// A second 16-byte read out of the SAME mapped upload pool, one row, only when the jitter row
+	// validated during discovery. Deliberately BEFORE the clip read and independent of it: a cut
+	// is worth signalling even on a frame whose ClipToPrevClip read then fails, because Reset is
+	// how NGX is told to discard history, and a stale history is exactly what a cut produces.
+	// Failure here is silent and costs nothing - need_reset simply is not raised.
+	if (st.view_layout.row_jitter >= 0 &&
+	    static_cast<uint64_t>(st.view_layout.row_jitter + 1) * ue4jitter::kBytesPerRow <= avail)
+	{
+		float j[4];
+		const uint64_t joff = br.offset +
+			static_cast<uint64_t>(st.view_layout.row_jitter) * ue4jitter::kBytesPerRow;
+		if (ue4jitter::read_view_cb(pool, joff, ue4jitter::kBytesPerRow, j))
+		{
+			st.jitter_cut_ok.store(true, std::memory_order_relaxed);
+			// Bitwise equality, not a tolerance: UE4 COPIES the matrices on a reset frame, so the
+			// two float pairs are the same bits. A tolerance would fire on any slow pan.
+			if (j[2] == j[0] && j[3] == j[1])
+			{
+				st.need_reset = true;
+				st.camera_cuts.fetch_add(1, std::memory_order_relaxed);
+				if (!st.logged_cut_source)
+				{
+					st.logged_cut_source = true;
+					LOGI("DLSS-NR: camera-cut detection is LIVE - View.TemporalAAJitter.zw == .xy "
+					     "at row %d, so UE4 reset the view this frame and DLSSNR.Reset is being "
+					     "pulsed. This is the signal the reference add-on gets for free from its "
+					     "host game's reset flag. Logged once; the running count is in the census.",
+					     st.view_layout.row_jitter);
+				}
+			}
+		}
 	}
 
 	float m[16];
@@ -3510,6 +3608,25 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	// One device, one TAA pass, one recording thread at a time - but the lock is cheap and this
 	// runs once a frame, and it is what makes the one-shot log latches sound.
 	std::lock_guard<std::mutex> lock(st->mutex);
+
+	// ---- BEGIN overlay_ui hook ----
+	// THE ONE PLACE THE OVERLAY REACHES THE RENDER PATH. On this thread, under the lock this pass
+	// already holds, it copies its atomics into g_cfg ONCE - which is what makes the several
+	// settings that are read more than once per pass (restore_graphics_root by capture_state and
+	// again by restore_state, paper_white_scale twice inside one expression, copy_back at six
+	// sites) coherent for the whole pass instead of a set of independently torn reads. It also
+	// turns a changed depth convention or motion scale into one DLSSNR.Reset frame, drops
+	// st->pending_res when the thing that armed it was toggled, and services the overlay's
+	// "Reset NR feature" button through the existing deferred-teardown path. The full argument,
+	// with line references, is in the header comment of src/overlay_ui.hpp.
+	//
+	// A plain `return`, NOT NR_BAIL: NR_BAIL's one-shot latch would burn itself on the first
+	// toggle and never speak again. Returning here leaves 'issued' false, so ReShade issues the
+	// game's own Dispatch - a strict no-op.
+	if (!overlay_ui::begin_pass(g_cfg, st->need_reset, st->pending_res, st->pending_teardown,
+	                            st->feature_failed, st->codec.ok, st->codec_failed, st->orig_ok))
+		return;
+	// ---- END overlay_ui hook ----
 
 	// ---------------------------------------------------------------- resolve the SRVs
 	shader_record shader;
@@ -4381,8 +4498,41 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 		// Negative means "inherit LocalStructureStrength". 0.0 is NOT neutral.
 		ngx::set_f32(p, ngx::kParamSkinStructureStrength,  g_cfg.skin_structure_strength);
 		ngx::set_u32(p, ngx::kParamStyle,                  g_cfg.style);
+		// ---- BEGIN overlay_ui hook ----
+		// The overlay's "NR UI Correction" checkbox. Per-evaluate, exactly like Style, and NOT
+		// baked at create time - and st->params is the SAME parameter block nr_ensure_feature
+		// writes into, so a later CreateFeature sees it as well. DLSSNR.UICorrection is a real
+		// parameter of THIS snippet build: exactly one exact-line match in nvngx_dlssnr.dll's
+		// string table, against ZERO for DLSSNR.Upscaling. Without this write the checkbox would
+		// be a control that does nothing - the user would A/B it, see no change, and record a
+		// false negative. Default 0, which is also the snippet's own fallback, so an untouched
+		// install is bit-identical to one without this line.
+		ngx::set_u32(p, ngx::kParamUICorrection,           g_cfg.ui_correction);
+
+		// PARITY. renodx writes both indicator-axis keys = 0 [BIN 0x180014adb / 0x180014aee] and
+		// both strings exist in the snippet. These condition the NGX debug indicator overlay,
+		// which is registry-armed and off by default, so this is purely defensive: it stops the
+		// snippet reading an absent key if the indicator is ever enabled on this machine.
+		ngx::set_u32(p, ngx::kParamIndicatorInvertX, 0u);
+		ngx::set_u32(p, ngx::kParamIndicatorInvertY, 0u);
+		// ---- END overlay_ui hook ----
 
 		const ngx::Result r = g_snippet.evaluate_feature(d3d12_cmd, st->feature, p, nullptr);
+
+		// ---- BEGIN overlay_ui hook ----
+		// Everything the overlay's status block needs, published as relaxed atomics that flow ONE way
+		// - render thread to overlay - exactly as st->hist_restored and census_codec_on already do.
+		// The overlay keeps its own evaluate counter rather than reading st->evaluate_count, which is
+		// a plain uint64 under st->mutex. The timestamp taken inside is the point of the exercise: a
+		// cumulative count cannot tell "14203 and climbing" from "14203 and stopped four minutes ago",
+		// which is exactly the confusion that cost a whole play session.
+		overlay_ui::publish_evaluate(
+			static_cast<uint32_t>(r), ngx::result_to_string(r), !ngx::failed(r),
+			st->out_w, st->out_h, probe::format_name(st->out_fmt), probe::format_name(st->neural_fmt),
+			velocity.w, velocity.h, scale_x, scale_y, codec_encoded,
+			st->hist_restored.load(std::memory_order_relaxed),
+			st->hist_dropped.load(std::memory_order_relaxed));
+		// ---- END overlay_ui hook ----
 		if (ngx::failed(r))
 		{
 			if (!st->logged_eval_fail)
@@ -4752,6 +4902,19 @@ static void nr_init_device(device *dev)
 		s_config_loaded = true;
 		LOGI("DLSS-NR: reading configuration from %sstray_dlssnr.ini", ngx::narrow(dir).c_str());
 		cfg::load(g_cfg, dir, [](const char *line) { LOGI("%s", line); });
+
+		// Armed HERE, above the `enabled` check below, and deliberately so: the RT census is
+		// read-only instrumentation with no render-path effect, and measuring what ray tracing
+		// the title runs is useful whether or not the DLSS-NR pass itself is turned on. It is
+		// gated only by its own key.
+		rt_census::arm(g_cfg.rt_census, g_cfg.rt_census_frames, &rt_census_log);
+		// ---- BEGIN overlay_ui hook ----
+		// Copy the live half of the freshly parsed ini into the overlay's atomics. Main thread,
+		// before any dispatch and before any overlay draw, so nothing can observe a half-seeded
+		// state. Also records the directory the Save button rewrites, and the baseline that the
+		// "Revert to stray_dlssnr.ini" button and the dirty test compare against.
+		overlay_ui::seed_from_config(g_cfg, dir);
+		// ---- END overlay_ui hook ----
 	}
 
 	if (!g_cfg.enabled)
@@ -5452,6 +5615,50 @@ static bool on_dispatch(command_list *cmd, uint32_t group_count_x, uint32_t grou
 }
 
 // =============================================================================================
+// DXR. Read-only, and the ONLY handler in this file that can never do anything but observe.
+// =============================================================================================
+//
+// MUST RETURN FALSE, ALWAYS. Returning true SUPPRESSES the game's DispatchRays - ReShade's hook
+// reads `if (invoke_addon_event<dispatch_rays>(...)) return;` (d3d12_command_list.cpp:1147) and
+// then never calls the original. A census that deleted the frame's ray tracing would be a
+// spectacular way to answer "does ray tracing run".
+//
+// On D3D12 all four resource handles arrive ZERO and the shader binding tables are identified
+// only by their GPU virtual addresses in the *_offset arguments. rt_census keys its buckets on
+// (raygen_offset - miss_offset), which is address-independent; see rt_census.hpp.
+//
+// The bound state object comes from the command-list shadow: UE emits SetPipelineState1 and
+// DispatchRays back to back (D3D12RayTracing.cpp:3936-3937), so cs->state_object is this
+// dispatch's RTPSO.
+static bool on_dispatch_rays(command_list *cmd,
+                             resource /*raygen*/, uint64_t raygen_offset, uint64_t raygen_size,
+                             resource /*miss*/, uint64_t miss_offset, uint64_t miss_size, uint64_t miss_stride,
+                             resource /*hit_group*/, uint64_t hit_offset, uint64_t hit_size, uint64_t hit_stride,
+                             resource /*callable*/, uint64_t callable_offset, uint64_t callable_size, uint64_t callable_stride,
+                             uint32_t width, uint32_t height, uint32_t depth)
+{
+	PROBE_GUARD_FALSE({
+		// Strict no-op when rt_census=0: note_dispatch's first statement is a relaxed atomic load
+		// followed by a return, and this function then returns false, so ReShade issues the
+		// game's DispatchRays exactly as it would with no add-on present.
+		uint64_t state_object = 0;
+		if (rt_census::on())
+		{
+			auto *cs = probe::pd_get<probe::cmd_shadow>(cmd, probe::kCmdShadowGuid);
+			if (cs != nullptr)
+				state_object = cs->state_object.handle;
+		}
+
+		rt_census::note_dispatch(state_object,
+			raygen_offset, raygen_size,
+			miss_offset, miss_size, miss_stride,
+			hit_offset, hit_size, hit_stride,
+			callable_offset, callable_size, callable_stride,
+			width, height, depth, &rt_census_log);
+	})
+}
+
+// =============================================================================================
 // Frame boundary: periodic census so nothing is invisible even when detail lines are budgeted
 // =============================================================================================
 static void on_present(command_queue *, swapchain *sc, const rect *, const rect *, uint32_t, const rect *)
@@ -5480,6 +5687,13 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 		const uint32_t sr_rh           = (nst != nullptr) ? nst->sr_census_render_h.load(std::memory_order_relaxed) : 0;
 		const uint32_t sr_ow           = (nst != nullptr) ? nst->sr_census_out_w.load(std::memory_order_relaxed) : 0;
 		const uint32_t sr_oh           = (nst != nullptr) ? nst->sr_census_out_h.load(std::memory_order_relaxed) : 0;
+		const uint64_t nr_camera_cuts  = (nst != nullptr) ? nst->camera_cuts.load(std::memory_order_relaxed) : 0;
+		const bool     nr_jitter_cut_ok= (nst != nullptr) ? nst->jitter_cut_ok.load(std::memory_order_relaxed) : false;
+
+		// The RT census keeps its own frame counter and its own reporting interval, and takes its
+		// own two mutexes - never g.mutex - so it cannot deadlock against nr_try_run. Strict
+		// no-op when rt_census=0: one relaxed atomic load.
+		rt_census::on_frame(&rt_census_log);
 
 		std::lock_guard<std::mutex> lock(g.mutex);
 		g.frame++;
@@ -5493,13 +5707,25 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 		// dispatch with 'dropped' flat is the success signature; 'dropped' climbing means the
 		// resource we denoised is NOT turning up as a colour SRV at the next dispatch, i.e. the
 		// UE 4.27 history model does not hold for this build and the loop is NOT broken.
-		if (nst != nullptr && (nr_hist_applied != 0 || nr_hist_dropped != 0 || g_cfg.history_restore))
+		// ---- BEGIN overlay_ui hook ----
+		// history_restore and copy_back are LIVE now, and the value in g_cfg is written by the
+		// overlay's snapshot on a RECORDING thread; on_present runs on the main thread. So the
+		// GATE and the values it prints both read the overlay's atomics - the gate included,
+		// because a racy gate is the same data race as a racy argument AND can additionally admit
+		// a line that then reports the opposite state. This is the only place outside nr_try_run
+		// that would otherwise read a snapshot-written field.
+		//
+		// Three tokens differ from the original statement, which read:
+		//     ... || g_cfg.history_restore))            in the condition
+		//     (int)g_cfg.history_restore, (int)g_cfg.copy_back,   in the argument list
+		if (nst != nullptr && (nr_hist_applied != 0 || nr_hist_dropped != 0 || overlay_ui::live_history_restore()))
 			LOGI("--- DLSS-NR history restore @ frame %llu: applied=%llu dropped=%llu "
 			     "(history_restore=%d copy_back=%d hdr_codec_running=%d pristine=%s)",
 			     (unsigned long long)g.frame,
 			     (unsigned long long)nr_hist_applied, (unsigned long long)nr_hist_dropped,
-			     (int)g_cfg.history_restore, (int)g_cfg.copy_back,
+			     (int)overlay_ui::live_history_restore(), (int)overlay_ui::live_copy_back(),
 			     (int)nr_codec_on, nr_orig_on ? "allocated" : "MISSING");
+		// ---- END overlay_ui hook ----
 
 		// The motion-vector decode's own accounting. 'decoded' climbing at one per accepted
 		// dispatch with mode=full is the success signature. 'cb_reuse' climbing means the
@@ -5530,16 +5756,29 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 			     sr_rw, sr_rh, sr_ow, sr_oh,
 			     (int)g_sr_armed.load(std::memory_order_relaxed),
 			     (int)g_cfg.sr_suppress_taa, (int)g_cfg.sr_direct_output, (int)g_cfg.sr_copy_back);
+		// `dxil=` COUNTS PIXEL AND COMPUTE SHADERS ONLY. on_init_pipeline's loop skips every
+		// sub-object that is not a PS or a CS, so a DXIL ray tracing library can never reach it
+		// and dxil=0 has never meant "no ray tracing". The rt= field says which it is, so the
+		// number can no longer be misread.
+		// Camera cuts: `cuts` climbing at scene transitions is the success signature. `ok=0` means
+		// the jitter row never validated, so cut detection is simply unavailable this run and the
+		// behaviour is exactly what it was before it existed.
+		if (nst != nullptr)
+			LOGI("--- DLSS-NR camera cuts @ frame %llu: cuts=%llu detector=%s",
+			     (unsigned long long)g.frame, (unsigned long long)nr_camera_cuts,
+			     nr_jitter_cut_ok ? "LIVE (View.TemporalAAJitter.zw==.xy)"
+			                      : "UNAVAILABLE (jitter row did not validate)");
 
-		LOGI("--- probe census @ frame %llu: shaders=%llu (not_dxbc=%llu dxil=%llu) | "
-		     "census fail=%llu pass=%llu | vel_const fail=%llu pass=%llu | "
-		     "loops_rej=%llu conf_rej=%llu | PASSED_ALL=%llu | srv_dumps=%u/%u",
+		LOGI("--- probe census @ frame %llu: shaders=%llu (not_dxbc=%llu dxil=%llu, PS/CS ONLY - "
+		     "says NOTHING about DXR) | census fail=%llu pass=%llu | vel_const fail=%llu pass=%llu | "
+		     "loops_rej=%llu conf_rej=%llu | PASSED_ALL=%llu | srv_dumps=%u/%u | rt=%s",
 			(unsigned long long)g.frame,
 			(unsigned long long)g.n_shaders_seen, (unsigned long long)g.n_not_dxbc, (unsigned long long)g.n_dxil,
 			(unsigned long long)g.n_fail_census, (unsigned long long)g.n_pass_census,
 			(unsigned long long)g.n_fail_velocity_const, (unsigned long long)g.n_pass_velocity_const,
 			(unsigned long long)g.n_fail_loops, (unsigned long long)g.n_fail_confidence,
-			(unsigned long long)g.n_pass_all, g.srv_dumps, kMaxSrvDumps);
+			(unsigned long long)g.n_pass_all, g.srv_dumps, kMaxSrvDumps,
+			rt_census::on() ? "MEASURED - see the RT CENSUS block" : "NOT MEASURED (set rt_census=1)");
 
 		if (first && g.n_shaders_seen == 0)
 			LOGW("no PS/CS seen by the first present. If this persists, init_pipeline is not "
@@ -5624,6 +5863,17 @@ static void register_events()
 	register_event<addon_event::draw>(&on_draw);
 	register_event<addon_event::draw_indexed>(&on_draw_indexed);
 	register_event<addon_event::dispatch>(&on_dispatch);
+	// DXR. Registered UNCONDITIONALLY even though rt_census defaults to 0, because the config is
+	// not read until the first init_device and ReShade's DispatchRays hook calls
+	// invoke_addon_event<dispatch_rays> with no has_addon_event() guard - a late
+	// ReShadeRegisterEvent would push_back into addon_event_list[90] while a recording thread is
+	// iterating it. The handler's cost with the census off is one relaxed atomic load and
+	// `return false`. See the gate section at the top of src/rt_census.hpp.
+	//
+	// build_acceleration_structure is deliberately NOT registered: ReShade allocates a
+	// std::vector and converts every geometry desc on EVERY AS build as soon as that event has
+	// any listener at all (d3d12_command_list.cpp:1053-1077), empty handler or not.
+	register_event<addon_event::dispatch_rays>(&on_dispatch_rays);
 
 	register_event<addon_event::present>(&on_present);
 }
@@ -5638,6 +5888,38 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 			return FALSE;
 		register_events();
 		LOGI("STRAY DLSS-NR registered at RESHADE_API_VERSION=%u.", (unsigned)RESHADE_API_VERSION);
+		// ---- BEGIN overlay_ui hook ----
+		// DllMain is the one point in this file that sits BELOW every global the overlay reports on,
+		// so the status hook is installed here rather than scattered through init. It copies BY VALUE
+		// and only the LOAD-ONLY half of g_cfg: the live half is written by the snapshot on a
+		// recording thread, and handing the overlay a pointer would make reading one of those by
+		// accident possible.
+		overlay_ui::facts_hook() = [](overlay_ui::host_facts &f) {
+			f.addon_name          = NAME;
+			f.enabled_at_load     = g_cfg.enabled;
+			f.diagnostics         = g_cfg.diagnostics;
+			f.hdr_codec_at_load   = g_cfg.hdr_codec;
+			f.shader_hash         = g_cfg.shader_hash;
+			f.srv_depth           = g_cfg.srv_depth;
+			f.srv_velocity        = g_cfg.srv_velocity;
+			f.srv_colour          = g_cfg.srv_colour;
+			f.uav_output          = g_cfg.uav_output;
+			f.populate_parameters = g_cfg.populate_parameters;
+			f.require_trampoline  = g_cfg.require_trampoline;
+			f.app_id              = g_cfg.app_id;
+			f.ini_found           = g_cfg.ini_found;
+			f.snippet_loaded      = g_snippet.available;
+			f.trampoline          = g_snippet.trampoline_module != nullptr;
+			f.armed               = g_nr_armed.load(std::memory_order_relaxed);
+			f.abi_thunks_active   = probe::msvc_abi_thunks_active();
+			std::snprintf(f.snippet_reason, sizeof(f.snippet_reason), "%s",
+				g_snippet.not_available_reason.c_str());
+		};
+		// Binding the ImGui table is GetProcAddress on an already-loaded module plus a call that
+		// returns the address of a static table, so it is loader-lock safe. A ReShade build without
+		// add-on ImGui support costs the overlay and nothing else; the denoise is unaffected.
+		overlay_ui::install();
+		// ---- END overlay_ui hook ----
 		{
 			// The C++ ABI self-check. See msvc_abi.hpp: the three device virtuals that return a
 			// class by value are the only place where a non-MSVC build of this add-on and an

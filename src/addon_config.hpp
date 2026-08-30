@@ -34,6 +34,31 @@ struct config
 	// ReShade.log - but they are switchable so that "strict no-op" can be made literal.
 	bool     diagnostics = true;
 
+	// ---- the DXR dispatch census (src/rt_census.hpp) ---------------------------------------
+	// DEFAULTS OFF, and off means off.
+	//
+	// With rt_census = 0 every census entry point returns immediately after ONE relaxed atomic
+	// load: on_init_pipeline's note_pipeline, on_bind_pipeline's note_state_object_bind, the
+	// dispatch_rays handler (which then returns false, so ReShade issues the game's DispatchRays
+	// exactly as with no add-on present), on_present's on_frame, and on_destroy_device's report.
+	// Nothing is counted, named, logged, allocated or created. The census allocates NOTHING at
+	// any time, on or off - every table it keeps is a fixed-size array.
+	//
+	// The one thing that is true either way: the dispatch_rays EVENT is registered in DllMain.
+	// It has to be, because the ini is not read until the first init_device and ReShade's
+	// DispatchRays hook invokes the event with no listener check, so registering it late would
+	// race a recording thread. The cost with the census off is one extra indirect call inside a
+	// loop that already runs.
+	//
+	// With rt_census = 1 the add-on reads DXR sub-objects at init_pipeline (entry-point names,
+	// straight out of ReShade's DXIL RDAT reflection), counts SetPipelineState1, and records one
+	// bucket per distinct DispatchRays signature - dimensions, SBT sizes and strides, and the
+	// bound state object. It writes to ReShade.log and touches nothing else.
+	bool     rt_census = false;
+	// How many presents between RT census summary blocks. A summary is also emitted at
+	// destroy_device. 600 is ten seconds at 60 fps.
+	uint32_t rt_census_frames = 600;
+
 	// ---- identification ------------------------------------------------------------------
 	// The PRIMARY measured target in STRAY: compute, sm 5.0, t0 DEPTH r32_g8_typeless,
 	// t2 VELOCITY r16g16b16a16_unorm, t5/t6 COLOUR r16g16b16a16_float, all 1920x1080.
@@ -223,6 +248,13 @@ struct config
 	// 0.0 is NOT neutral - it flattens skin structure.
 	float    skin_structure_strength  = -1.0f;
 	uint32_t style                    = 0;
+	// ---- BEGIN overlay_ui hook ----
+	// DLSSNR.UICorrection. A real parameter of THIS snippet build, unlike DLSSNR.Upscaling: the
+	// exact string is in nvngx_dlssnr.dll's table (measured), and the snippet reads it with a
+	// proper failure guard whose fallback is 0. Its VISUAL effect on this content has not been
+	// verified, so the default here is the snippet's own. Exposed by the overlay as a live knob.
+	uint32_t ui_correction            = 0;
+	// ---- END overlay_ui hook ----
 
 	// Gates BOTH structure strengths. With this at 0 the snippet internally forces both to -1 and
 	// neither does anything. Binding an explicit ControlMask also forces it to 0 inside the
@@ -529,6 +561,8 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 
 		if      (key == "enabled")                  c.enabled = parse_bool(v, c.enabled);
 		else if (key == "diagnostics")              c.diagnostics = parse_bool(v, c.diagnostics);
+		else if (key == "rt_census")                c.rt_census = parse_bool(v, c.rt_census);
+		else if (key == "rt_census_frames")         c.rt_census_frames = static_cast<uint32_t>(parse_u64(v, c.rt_census_frames));
 		else if (key == "shader_hash")              c.shader_hash = parse_u64(v, c.shader_hash);
 		else if (key == "srv_depth")                c.srv_depth = static_cast<uint32_t>(parse_u64(v, c.srv_depth));
 		else if (key == "srv_velocity")             c.srv_velocity = static_cast<uint32_t>(parse_u64(v, c.srv_velocity));
@@ -558,6 +592,9 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "local_structure_strength") c.local_structure_strength = parse_float(v, c.local_structure_strength);
 		else if (key == "skin_structure_strength")  c.skin_structure_strength = parse_float(v, c.skin_structure_strength);
 		else if (key == "style")                    c.style = static_cast<uint32_t>(parse_u64(v, c.style));
+		// ---- BEGIN overlay_ui hook ----
+		else if (key == "ui_correction")            c.ui_correction = static_cast<uint32_t>(parse_u64(v, c.ui_correction));
+		// ---- END overlay_ui hook ----
 		else if (key == "use_auto_mask")            c.use_auto_mask = parse_bool(v, c.use_auto_mask);
 		else if (key == "app_id")                   c.app_id = parse_u64(v, c.app_id);
 		else if (key == "dlss_sr")                  c.dlss_sr = parse_bool(v, c.dlss_sr);

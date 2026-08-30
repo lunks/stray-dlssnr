@@ -159,3 +159,388 @@ jobs:
             stray_dlssnr.addon64
             remix_nvngx.dll
           if-no-files-found: error
+
+  # =============================================================================================
+  # ImGui ABI probe. Gating.
+  #
+  # ReShade hands add-ons an imgui_function_table_19250 of raw FUNCTION POINTERS
+  # (include/reshade_overlay.hpp). Fifteen of its entries return ImVec2/ImVec4 BY VALUE, and
+  # ImVec2 sits exactly on the fault line between the two compilers' return rules:
+  #
+  #   MSVC returns a class in RAX only if it is POD-like - in particular, no user-declared
+  #   constructor. ImVec2 has two constexpr constructors, so MSVC returns it in MEMORY.
+  #   GCC returns a class in RAX if it is <= 8 bytes and TRIVIALLY COPYABLE, which ImVec2 is.
+  #
+  # If those two rules disagree, a mingw add-on calling ReShade's MSVC-compiled GetCursorScreenPos
+  # hands it a garbage RCX and ReShade writes eight bytes through it. That is a wild store inside
+  # the user's running game, so this is settled by measurement, in this job, and not by argument.
+  #
+  # This is NOT the same problem as src/msvc_abi.hpp. That one is about non-static MEMBER
+  # functions, where the two ABIs put the hidden return pointer in DIFFERENT registers (MSVC:
+  # this=RCX, hidden=RDX; Itanium: hidden=RCX, this=RDX). For a FREE function - which is what a
+  # function pointer is - both ABIs agree the hidden pointer goes in RCX. The only question left
+  # is WHETHER a hidden pointer is used at all, and that is what this job measures.
+  # =============================================================================================
+  abi:
+    name: ImGui ABI probe (MSVC callee vs both callers)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # The callee is ALWAYS MSVC: it stands in for ReShade.
+      - name: Build the MSVC callee (stands in for ReShade)
+        shell: cmd
+        run: |
+          cl /nologo /std:c++17 /EHsc /O2 /MT /W3 /LD abi\imvec_callee.cpp /Fe:abi_callee.dll
+          if errorlevel 1 exit /b 1
+
+      - name: Build the MSVC caller (control)
+        shell: cmd
+        run: |
+          cl /nologo /std:c++17 /EHsc /O2 /MT /W3 abi\imvec_caller.cpp /Fe:caller_msvc.exe
+          if errorlevel 1 exit /b 1
+
+      - name: Build the mingw caller (the toolchain shipping on hardware today)
+        shell: bash
+        run: |
+          export PATH="/c/mingw64/bin:$PATH"
+          g++ --version | head -1
+          g++ -std=gnu++17 -O2 -Wall -Wextra \
+              -static -static-libgcc -static-libstdc++ \
+              abi/imvec_caller.cpp -o caller_mingw.exe
+
+      # Static evidence, independent of anything that runs. Shows each toolchain's callee-side
+      # decision directly in the generated code.
+      - name: Disassemble both sides of the by-value return
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          cl /nologo /c /std:c++17 /EHsc /O2 /MT abi\imvec_callee.cpp /Fo:callee.obj | Out-Null
+          Write-Host "--- MSVC callee: cb_ret_vec2 (expect: writes through RCX, returns RCX) ---"
+          dumpbin /disasm /nologo callee.obj |
+            Select-String -Pattern '^cb_ret_vec2:' -Context 0,10 |
+            ForEach-Object { $_.Line; $_.Context.PostContext }
+
+          $env:PATH = "C:\mingw64\bin;$env:PATH"
+          g++ -std=gnu++17 -O2 -c abi/imvec_caller.cpp -o caller_mingw.o
+          Write-Host "--- mingw callee: local_ret_vec2, same signature (expect: packs into RAX) ---"
+          objdump -d --demangle caller_mingw.o |
+            Select-String -Pattern 'local_ret_vec2\(\)>:' -Context 0,6 |
+            ForEach-Object { $_.Line; $_.Context.PostContext }
+
+      # The control. If this fails the harness itself is broken and nothing else means anything.
+      - name: Run MSVC caller (control - must pass)
+        shell: cmd
+        run: |
+          caller_msvc.exe report
+          if errorlevel 1 exit /b 1
+
+      # The real question. Gating: every whitelist candidate must pass under mingw too.
+      - name: Run mingw caller (gating - the whitelist must hold under mingw)
+        shell: cmd
+        run: |
+          caller_mingw.exe report
+          if errorlevel 1 exit /b 1
+
+      # Deliberately isolated and non-gating: this is the call we expect to be unsafe under one of
+      # the two toolchains, and a fault here is a RESULT, not a build break.
+      - name: Direct by-value return call, MSVC (informational)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          & .\caller_msvc.exe direct
+          Write-Host "exit code: $LASTEXITCODE"
+
+      - name: Direct by-value return call, mingw (informational)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          & .\caller_mingw.exe direct
+          Write-Host "exit code: $LASTEXITCODE"
+
+      # Collapse it all into one line that says what the add-on is allowed to do.
+      - name: Verdict
+        shell: pwsh
+        run: |
+          $msvc  = (& .\caller_msvc.exe  report | Out-String)
+          $mingw = (& .\caller_mingw.exe report | Out-String)
+          $vm = [regex]::Match($msvc,  'VERDICT imvec2_return_convention (\w+)').Groups[1].Value
+          $vg = [regex]::Match($mingw, 'VERDICT imvec2_return_convention (\w+)').Groups[1].Value
+          Write-Host "ImVec2 by-value return -- MSVC caller: $vm ; mingw caller: $vg"
+          if ($vm -ne 'AGREE') {
+            throw "MSVC caller disagrees with the MSVC callee. Impossible unless the harness is wrong."
+          }
+          if ($vg -eq 'AGREE') {
+            Write-Host "::notice::mingw and MSVC agree on the ImVec2 return convention."
+          } else {
+            Write-Host "::warning::mingw and MSVC DISAGREE on the ImVec2 return convention. The 14 ImVec2-returning entries of imgui_function_table_19250 must not be called with their DECLARED signature while the shipping binary is a mingw build."
+          }
+
+          # The recovery thunk: same entries, redeclared as ImVec2*(ImVec2*). If this holds on both
+          # toolchains then those 14 are reachable when genuinely needed, rather than lost.
+          $tm = [regex]::Match($msvc,  'thunk_ret_vec2\s+(\w+)').Groups[1].Value
+          $tg = [regex]::Match($mingw, 'thunk_ret_vec2\s+(\w+)').Groups[1].Value
+          Write-Host "Out-param recovery thunk -- MSVC: $tm ; mingw: $tg"
+          if ($tm -ne 'PASS' -or $tg -ne 'PASS') {
+            throw "The out-parameter recovery thunk failed on at least one toolchain. src/overlay_imgui.hpp::by_value_ret documents it as measured-safe; that claim is now false and the header must be corrected."
+          }
+          Write-Host "::notice::by_value_ret() verified on both toolchains: a by-value ImVec2 return can be reached safely through an out-param redeclaration."
+        
+
+      # -----------------------------------------------------------------------------------------
+      # The whitelist itself, compiled AND LINKED under both toolchains.
+      #
+      # Linking is the point. reshade_overlay.hpp supplies inline definitions only for entries that
+      # exist in imgui_function_table_19250, while imgui.h declares hundreds more, so calling
+      # something the table does not carry compiles cleanly and dies at link time with an undefined
+      # reference. Building this as a DLL is what turns that into a CI failure.
+      #
+      # It also proves include/imgui.h is the right version: reshade_overlay.hpp is wrapped in
+      # `#if defined(IMGUI_VERSION_NUM)` and #errors unless it is exactly 19250.
+      # -----------------------------------------------------------------------------------------
+      # -----------------------------------------------------------------------------------------
+      # Include order. reshade_overlay.hpp has NO include guard and its body is wrapped in
+      # `#if defined(IMGUI_VERSION_NUM)`; reshade.hpp (#pragma once) includes it. So pulling
+      # reshade_compat.hpp in before <imgui.h> deletes the entire ImGui surface from the
+      # translation unit permanently. src/overlay_imgui.hpp #errors on that. This step proves the
+      # guard still fires - it fails the build if the bad order COMPILES.
+      # -----------------------------------------------------------------------------------------
+      - name: Wrong include order must not compile (MSVC)
+        shell: pwsh
+        run: |
+          cl /nologo /std:c++17 /EHsc /c /W3 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX `
+             /I include abi\include_order_negative.cpp /Fo:ord_msvc.obj 2>&1 | Out-String | Write-Host
+          if ($LASTEXITCODE -eq 0) {
+            throw "include_order_negative.cpp COMPILED. The include-order guard in src/overlay_imgui.hpp is not firing, so a future edit could include reshade_compat.hpp first and silently lose namespace ImGui."
+          }
+          # cl left a non-zero $LASTEXITCODE behind, which is the outcome we WANT. A pwsh step
+          # inherits it and would fail, so retire it explicitly.
+          Write-Host "  OK  guard fired, wrong include order rejected"
+          exit 0
+
+      - name: Wrong include order must not compile (mingw-w64)
+        shell: bash
+        run: |
+          export PATH="/c/mingw64/bin:$PATH"
+          if g++ -std=gnu++17 -c -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -DNOMINMAX \
+                 -I include abi/include_order_negative.cpp -o ord_mingw.o 2>&1; then
+            echo "::error::include_order_negative.cpp COMPILED under mingw. The include-order guard is not firing."
+            exit 1
+          fi
+          echo "  OK  guard fired, wrong include order rejected"
+
+      - name: Whitelist compiles and links (MSVC)
+        shell: cmd
+        run: |
+          cl /nologo /std:c++17 /EHsc /O2 /MT /W3 /LD ^
+             /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+             /I include ^
+             abi\overlay_calls_probe.cpp /Fe:overlay_probe_msvc.dll
+          if errorlevel 1 exit /b 1
+
+      - name: Whitelist compiles and links (mingw-w64)
+        shell: bash
+        run: |
+          export PATH="/c/mingw64/bin:$PATH"
+          g++ -std=gnu++17 -O2 -shared -static -static-libgcc -static-libstdc++ \
+              -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -DNOMINMAX -DNDEBUG \
+              -Wall -Wextra -Wno-attributes -Wno-unknown-pragmas -Wno-unused-parameter \
+              -I include \
+              abi/overlay_calls_probe.cpp -o overlay_probe_mingw.dll
+
+      # -----------------------------------------------------------------------------------------
+      # THE OVERLAY ITSELF, compiled and LINKED under both toolchains, GATING.
+      #
+      # The add-on build already compiles src/overlay_ui.hpp - but the mingw add-on job is
+      # continue-on-error, and mingw is the toolchain of the binary on the user's machine TODAY.
+      # A break in the overlay under mingw would therefore be non-gating there. It is gating here.
+      # -----------------------------------------------------------------------------------------
+      - name: Overlay compiles and links (MSVC)
+        shell: cmd
+        run: |
+          cl /nologo /std:c++17 /EHsc /O2 /MT /W3 /LD ^
+             /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+             /I include ^
+             abi\overlay_ui_probe.cpp /Fe:overlay_ui_msvc.dll
+          if errorlevel 1 exit /b 1
+
+      - name: Overlay compiles and links (mingw-w64)
+        shell: bash
+        run: |
+          export PATH="/c/mingw64/bin:$PATH"
+          g++ -std=gnu++17 -O2 -shared -static -static-libgcc -static-libstdc++ \
+              -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -DNOMINMAX -DNDEBUG \
+              -Wall -Wextra -Wno-attributes -Wno-unknown-pragmas -Wno-unused-parameter \
+              -I include \
+              abi/overlay_ui_probe.cpp -o overlay_ui_mingw.dll
+
+      # -----------------------------------------------------------------------------------------
+      # The ini writer, RUN for real on both toolchains.
+      #
+      # It is the only part of the overlay that touches the user's own data, its failure mode is
+      # silent and permanent (a truncated ini makes every key after the cut take its built-in
+      # default), and it is Win32 - _wfopen plus MoveFileExW for the temp-file swap - so it has to
+      # be exercised here rather than argued about. Checks that comments, ordering, column
+      # alignment, CRLF endings, trailing comments, the colour/color alias and every key the
+      # overlay does NOT own all survive a rewrite, that the result re-parses to exactly what was
+      # set, that a missing file is created, and that an unwritable target reports failure instead
+      # of claiming success.
+      # -----------------------------------------------------------------------------------------
+      - name: ini writer round-trip (MSVC)
+        shell: cmd
+        run: |
+          cl /nologo /std:c++17 /EHsc /O2 /MT /W3 ^
+             /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+             /I include abi\ini_rewrite_test.cpp /Fe:ini_test_msvc.exe
+          if errorlevel 1 exit /b 1
+          ini_test_msvc.exe
+          if errorlevel 1 exit /b 1
+
+      - name: ini writer round-trip (mingw-w64)
+        shell: bash
+        run: |
+          export PATH="/c/mingw64/bin:$PATH"
+          g++ -std=gnu++17 -O2 -static -static-libgcc -static-libstdc++ \
+              -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -DNOMINMAX -DNDEBUG \
+              -Wall -Wextra -Wno-attributes -Wno-unknown-pragmas -Wno-unused-parameter \
+              -I include abi/ini_rewrite_test.cpp -o ini_test_mingw.exe
+          ./ini_test_mingw.exe
+
+      # -----------------------------------------------------------------------------------------
+      # The overlay runs on the PRESENT thread. nr_try_run takes st->mutex and then g.mutex
+      # (stray_dlssnr.cpp:2201, :2225), and on_present already reads the DLSS-NR counters as
+      # atomics rather than locking, specifically to avoid inverting that order - the AB/BA
+      # deadlock is spelled out at :1513-1516. A lock anywhere in the overlay would join that
+      # ordering graph, and it would also block Present behind CreateFeature's network-weight
+      # upload. Separately, ngx::store mutates a std::unordered_map the SNIPPET also calls into,
+      # so pushing a slider value straight at NGX from this thread is heap corruption.
+      #
+      # Both are design invariants that a future edit could break without any symptom in CI. This
+      # is the cheapest gate that notices.
+      # -----------------------------------------------------------------------------------------
+      - name: The overlay must not lock, and must not write NGX parameters
+        shell: pwsh
+        run: |
+          $banned = @(
+            @{ p = 'std::mutex';        why = 'the overlay must hold no lock: it runs on the present thread and nr_try_run takes st->mutex then g.mutex' },
+            @{ p = 'std::lock_guard';   why = 'same - see the AB/BA deadlock note at stray_dlssnr.cpp:1513-1516' },
+            @{ p = 'std::unique_lock';  why = 'same' },
+            @{ p = 'std::scoped_lock';  why = 'same' },
+            @{ p = 'ngx::set_';         why = 'NGX parameters are written only on the render thread; ngx::store mutates a map the snippet also calls into' },
+            @{ p = 'ngx::store';        why = 'same' },
+            @{ p = 'pd_get';            why = 'the overlay must not reach into nr_state; everything it needs is published as an atomic' },
+            @{ p = 'kNrStateGuid';      why = 'same' }
+          )
+          $hits = @()
+          $n = 0
+          foreach ($line in Get-Content src/overlay_ui.hpp) {
+            $n++
+            if ($line -match '^\s*//') { continue }
+            foreach ($b in $banned) {
+              if ($line -match [regex]::Escape($b.p)) { $hits += ("src/overlay_ui.hpp:${n}: " + $b.p + "  --  " + $b.why) }
+            }
+          }
+          if ($hits.Count) {
+            Write-Host "::error::src/overlay_ui.hpp broke one of the overlay's concurrency invariants."
+            $hits | ForEach-Object { Write-Host "  $_" }
+            throw "overlay concurrency invariant violated"
+          }
+          Write-Host "  OK  the overlay takes no lock, touches no nr_state and writes no NGX parameter"
+
+      # -----------------------------------------------------------------------------------------
+      # THE GATE THAT WOULD HAVE CAUGHT "NR UI CORRECTION".
+      #
+      # A control was added to the overlay, an ini key was added for it, addon_config parsed it,
+      # begin_pass snapshotted it into g_cfg, the ini writer round-tripped it, and an
+      # ngx::kParam* constant was declared for it - and NOTHING EVER WROTE IT TO THE PARAMETER
+      # BLOCK. Every layer looked right in isolation; the value simply reached the snippet as
+      # nothing at all while the tooltip said "Live". Nobody would have A/B'd their way to that
+      # conclusion; they would have concluded the parameter does nothing on STRAY, which is a
+      # false negative recorded as a measurement in a project whose entire method is measurement.
+      #
+      # A declared parameter NAME with no write site is exactly that shape, it is invisible to the
+      # compiler (the constant is used - by its own definition), and it is one grep to notice.
+      # Note the interaction with the step above: overlay_ui.hpp is BANNED from calling ngx::set_*,
+      # so the render path in src/ is the only place such a write can legitimately live - which is
+      # precisely why the one place the omission could have been spotted was structurally excluded.
+      #
+      # If a parameter is ever declared deliberately without a write site, give it a use anyway or
+      # delete it. "Declared but never sent" is not a state this add-on has a use for.
+      # -----------------------------------------------------------------------------------------
+      - name: Every declared NGX parameter name must actually be written somewhere
+        shell: pwsh
+        run: |
+          $decls = @{}
+          $n = 0
+          foreach ($line in Get-Content src/ngx_interop.hpp) {
+            $n++
+            if ($line -match '^\s*//') { continue }
+            if ($line -match 'const\s+char\s*\*\s*(kParam\w+)\s*=') { $decls[$Matches[1]] = $n }
+          }
+          if ($decls.Count -eq 0) {
+            Write-Host "::error::found no kParam* declarations in src/ngx_interop.hpp - this gate has stopped testing anything"
+            throw "kParam declaration scan found nothing"
+          }
+          $lines = @()
+          foreach ($f in Get-ChildItem -Recurse -Include *.cpp,*.hpp -Path src) {
+            $lines += @(Get-Content $f.FullName)
+          }
+          # Comments do not count as a use - a kParam named only in prose is still never sent -
+          # and neither does the declaration itself, which would make every constant self-using.
+          $body = $lines | Where-Object {
+            $_ -notmatch '^\s*//' -and $_ -notmatch 'const\s+char\s*\*\s*kParam\w+\s*='
+          }
+          $joined = $body -join "`n"
+          $dead = @()
+          foreach ($k in $decls.Keys) {
+            if ($joined -notmatch ("\b" + [regex]::Escape($k) + "\b")) {
+              $dead += ("  src/ngx_interop.hpp:" + $decls[$k] + ": " + $k + " is declared and never used")
+            }
+          }
+          if ($dead.Count) {
+            Write-Host "::error::An NGX parameter name is declared but never written to a parameter block. Any overlay control or ini key bound to it is a control that does nothing: the user changes it, nothing reaches the snippet, and they record a false negative. Add the ngx::set_* call on the render path, or delete the constant, the ini key and the control together."
+            $dead | ForEach-Object { Write-Host $_ }
+            throw "declared-but-never-written NGX parameter"
+          }
+          Write-Host ("  OK  all " + $decls.Count + " declared NGX parameter names have a write site")
+
+      # -----------------------------------------------------------------------------------------
+      # The gate that actually protects the shipped binary. The probe above proves WHICH calls are
+      # unsafe; this proves the add-on does not make them. Fourteen table entries return ImVec2 by
+      # value and are unusable from a mingw build. ColorConvertU32ToFloat4 is deliberately NOT on
+      # this list: it returns ImVec4, which is 16 bytes, and the probe shows both toolchains return
+      # it in memory. Delete this step only when the mingw job is deleted.
+      # -----------------------------------------------------------------------------------------
+      - name: No add-on source may call a by-value-ImVec2-returning ImGui entry point
+        shell: pwsh
+        run: |
+          $forbidden = @(
+            'GetWindowPos','GetWindowSize','GetFontTexUvWhitePixel','GetCursorScreenPos',
+            'GetContentRegionAvail','GetCursorPos','GetCursorStartPos','GetItemRectMin',
+            'GetItemRectMax','GetItemRectSize','CalcTextSize','GetMousePos',
+            'GetMousePosOnOpeningCurrentPopup','GetMouseDragDelta'
+          )
+          $files = Get-ChildItem -Recurse -Include *.cpp,*.hpp -Path src | Where-Object { $_.Name -ne 'reshade_compat.hpp' }
+          $hits = @()
+          foreach ($f in $files) {
+            $n = 0
+            foreach ($line in Get-Content $f.FullName) {
+              $n++
+              if ($line -match '^\s*//') { continue }
+              foreach ($fn in $forbidden) {
+                if ($line -match ("ImGui::" + $fn + "\s*\(")) {
+                  $hits += "$($f.FullName):${n}: ImGui::$fn"
+                }
+              }
+            }
+          }
+          if ($hits.Count) {
+            Write-Host "::error::An add-on source calls an ImGui entry point that returns ImVec2 BY VALUE. Under mingw that is a wild 8-byte store into ReShade's caller frame - measured as an ACCESS_VIOLATION by the abi job. Use the out-parameter form or drop the call."
+            $hits | ForEach-Object { Write-Host "  $_" }
+            throw "forbidden ImGui call(s) present"
+          }
+          Write-Host "  OK  no add-on source calls a by-value-ImVec2-returning ImGui entry point"

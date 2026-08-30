@@ -137,6 +137,8 @@ silently taking a default.
 |---|---|---|
 | `enabled` | `1` | `0` = strict no-op on the render path |
 | `diagnostics` | `1` | the probe's read-only log output |
+| `rt_census` | **`0`** | the DXR dispatch census — see below. Off is a strict no-op |
+| `rt_census_frames` | `600` | presents between census summary blocks |
 | `shader_hash` | `0x1708ec956099e259` | the primary measured TAA pass; `0` = any shader passing all census gates (not recommended) |
 | `srv_depth` / `srv_velocity` / `srv_colour` | `0` / `2` / `5` | t-registers on that shader |
 | `uav_output` | `0` | u-register carrying the resolved colour |
@@ -158,12 +160,45 @@ silently taking a default.
 | `mvec_scale_x` / `mvec_scale_y` | `0` / `0` | `0` = derive from extents (forced to `1.0` when `mvec_decode=1`). With the decode on, `-1` is the per-axis **sign A/B** |
 | `intensity`, `local_tone_strength`, `local_structure_strength` | `1.0` | the snippet's own fallbacks |
 | `skin_structure_strength` | `-1.0` | negative = inherit local structure strength; `0.0` is **not** neutral |
-| `style` | `0` | uint |
+| `style` | `0` | uint. **Only `0` is known to exist in this snippet build** — `1`/`2` carry the reference add-on's names (Natural/Cinematic) and are unmeasured here |
 | `use_auto_mask` | `1` | gates both structure strengths |
+| `ui_correction` | `0` | `DLSSNR.UICorrection`. A real parameter of this build (one exact-line match in `nvngx_dlssnr.dll`'s string table; read with a `0xbad00000` guard, fallback `0`). Written per evaluate. **Its visual effect on STRAY is unverified** — a diagnostic knob, not a tuning one |
 
 The five tuning knobs default to the snippet's **own internal fallbacks**, recovered from its
 disassembly. `1.0` is a fallback, **not a calibrated neutral midpoint**, and the scale these
 values sit on is not known. Change them one at a time.
+
+### `rt_census` — the DXR dispatch census
+
+Read-only instrumentation (`src/rt_census.hpp`) that measures which ray tracing effects the title
+actually runs: the RT shader entry-point names the engine compiles — read out of the DXIL `RDAT`
+part by ReShade, so they are the engine's own strings (`OcclusionRGS`,
+`RayTracingReflectionsRGS`, `AmbientOcclusionRGS`, …) — plus one bucket per distinct `DispatchRays`
+signature, with counts, extents, shader-binding-table sizes and strides, and the bound state
+object. A summary block goes to `ReShade.log` every `rt_census_frames` presents and again at
+device teardown, so one log read answers *which effects dispatched, how often, at what resolution*.
+
+**It defaults to `0`, and off means off.** Every entry point returns after one relaxed atomic
+load: the `init_pipeline` hook, the `SetPipelineState1` hook, the `dispatch_rays` handler (which
+then returns `false`, so ReShade issues the game's dispatch exactly as with no add-on present),
+the `present` hook and the `destroy_device` hook. Nothing is counted, named, logged or allocated —
+and the census allocates nothing at any time, on or off: every table it keeps is a fixed-size
+array. The `dispatch_rays` *event* is registered unconditionally in `DllMain` because the ini is
+not read until the first `init_device` and ReShade invokes that event with no listener check, so a
+late registration would race a recording thread; the cost with the census off is one extra
+indirect call in a loop that already runs. `build_acceleration_structure` is deliberately **not**
+registered — ReShade allocates and converts every geometry desc on every AS build as soon as that
+event has any listener at all.
+
+It is gated **only** by `rt_census`, not by `enabled`, so the title's ray tracing can be measured
+with the DLSS-NR pass switched off.
+
+Related: the `probe census` line's `dxil=` counter counts **pixel and compute shaders only** —
+`on_init_pipeline` skips every sub-object that is not a PS or a CS, so a DXIL ray tracing library
+could never reach it and `dxil=0` never meant "no ray tracing". The line now says so, and ends in
+`rt=MEASURED` or `rt=NOT MEASURED`.
+
+Deployment and the exact greps that read the result: **`STAGING-census.md`**.
 
 ### `paper_white_scale` is a tuning knob with no calibrated value
 
