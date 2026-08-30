@@ -136,3 +136,22 @@ static constexpr uint32_t kTokenCbXxywImmRel = 0x06208D06u;
 // 4.00801611f == 1.0f / (0.499f * 0.5f), the DecodeVelocityFromTexture scale in Common.ush.
 // Bit pattern verified on host: 0x408041AB, little-endian bytes AB 41 80 40.
 static constexpr uint32_t kVelocityDecodeScaleBits = 0x408041ABu;
+
+// DLSS-NR ADDITION - the OTHER half of DecodeVelocityFromTexture, and it is not 0.5.
+//
+//   V.xy = EncodedV.xy * InvDiv - 32767.0f/65535.0f * InvDiv          Common.ush:1561
+//
+// The compiler folds the second term into a MAD immediate: (32767/65535) * InvDiv
+// = 2.00397754f == 0x4000412B, which appears NEGATED in a mad as 0xC000412B (bytes 2B 41 00 C0).
+//
+// This is scanned for and LOGGED, and is deliberately NOT a gate. Gate B has only ever matched
+// the SCALE, so "STRAY's decode is stock" was an inference; this turns it into a measurement on
+// the user's next normal run, at zero behavioural risk. If it does NOT appear alongside the
+// scale in the pinned TAA shader, STRAY customised DecodeVelocityFromTexture and stock UE source
+// is not authoritative for the bias - which would mean mvec_decode must be re-derived from the
+// game's own DXBC before it is trusted.
+//
+// Bit patterns recomputed on this host: 32767/65535 = 0.49999237f = 0x3EFFFF00, and
+// 0.49999237f * 4.00801611f = 2.00397754f = 0x4000412B.
+static constexpr uint32_t kVelocityDecodeBiasBits    = 0x4000412Bu;
+static constexpr uint32_t kVelocityDecodeNegBiasBits = 0xC000412Bu;

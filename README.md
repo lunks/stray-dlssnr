@@ -43,9 +43,25 @@ the start of the next accepted dispatch, **after verifying** the resource really
 colour SRV there. The contract: *the game's TAA never sees a denoised pixel; post-processing only
 ever sees denoised pixels.*
 
-Both are fail-open. If the codec's shaders cannot be compiled, or any of the four textures cannot
-be allocated, the feature that needed them latches off with a logged reason and the add-on runs
-**exactly as it did before either existed**.
+**3. The motion-vector decode** (`mvec_decode`, default `1`) — this was §6 gap 2. The snippet wants
+**absolute pixels on the colour grid, y-down**; UE4 packs screen-space velocity into a
+normalised-integer texture with a scale **and a bias**, which `MVecScaleX/Y` can never remove — so
+DLSS-NR was running on a meaningless motion guide. A third compute dispatch now applies UE 4.27's
+own `DecodeVelocityFromTexture` and, **wherever the velocity texel is the cleared sentinel**,
+reconstructs camera motion by reprojecting depth through `View.ClipToPrevClip`.
+
+That second half is the one that matters: UE writes velocity only for movable primitives that
+actually moved, so a naive decode would hand DLSS **zero motion for the static world, the sky and
+all translucency** — worse than the status quo. `View.ClipToPrevClip` is read CPU-side from the
+game's own View uniform buffer at a row that must agree **two independent ways** (the buffer's
+content signature and this game's TAA bytecode), and the pass **refuses to run** if they disagree
+rather than reprojecting the world through the wrong four rows. `MVecScaleX/Y` are then forced to
+`1.0` so the grid correction cannot double-apply.
+
+All three are fail-open. If a feature's shaders cannot be compiled, or its textures cannot be
+allocated, or — for the motion vectors — the View constant buffer cannot be located and validated,
+that feature latches off with a logged reason and the add-on runs **exactly as it did before it
+existed**. The motion-vector ladder in particular has no rung that is worse than `mvec_decode=0`.
 
 ---
 
@@ -134,7 +150,12 @@ silently taking a default.
 | `require_trampoline` | `1` | refuse to run without `remix_nvngx.dll` |
 | `populate_parameters` | `0` | call the snippet's `PopulateParameters_Impl` |
 | `depth_inverted` | `1` | UE4 reversed-Z — **inferred, not measured**, see §6 |
-| `mvec_scale_x` / `mvec_scale_y` | `0` / `0` | `0` = derive from extents |
+| `mvec_decode` | `1` | decode UE4's velocity encoding and reconstruct camera motion into absolute colour-grid pixels; `0` = the old raw encoded buffer (§6, gap 2) |
+| `mvec_reconstruct` | `1` | reconstruct camera motion from depth where the velocity texel is invalid. `0` = decode only, invalid texels **exactly zero** — a bring-up A/B, **worse than `mvec_decode=0`** for play |
+| `mvec_dilate` | `0` | UE's `AA_CROSS` nearest-depth velocity dilation; off because DLSS does its own neighbourhood work |
+| `mvec_clip_row` | `0` | pin the `View.ClipToPrevClip` float4 row. `0` = discover **and** cross-check against this game's own TAA bytecode |
+| `mvec_clip_transpose` | `0` | read `ClipToPrevClip` transposed — the escape hatch for the matrix convention |
+| `mvec_scale_x` / `mvec_scale_y` | `0` / `0` | `0` = derive from extents (forced to `1.0` when `mvec_decode=1`). With the decode on, `-1` is the per-axis **sign A/B** |
 | `intensity`, `local_tone_strength`, `local_structure_strength` | `1.0` | the snippet's own fallbacks |
 | `skin_structure_strength` | `-1.0` | negative = inherit local structure strength; `0.0` is **not** neutral |
 | `style` | `0` | uint |
@@ -396,17 +417,212 @@ The shaders are compiled at load with `D3DCompile` to `cs_5_0` DXBC (see §8). I
 possible on a given Proton build, the codec latches **off** with the compiler's error blob printed
 verbatim, and the add-on falls back to exactly the pre-codec behaviour.
 
-### Gap 2 — motion vector encoding is not converted
+### Gap 2 — ~~motion vector encoding is not converted~~ **FIXED** (`mvec_decode = 1`)
 
 The snippet expects **absolute pixels on the colour grid, y-down**. STRAY's `t2` is
 `r16g16b16a16_unorm`; UE4 packs screen-space velocity into it with a scale **and a bias**, so the
 raw texture is not in those units at all. `DLSSNR.MVecScaleX/Y` rescales a grid but **cannot
-remove a bias**, so it cannot fix this.
+remove a bias**, so it cannot fix this. Until this landed, the pass ran and reported success while
+the motion guide was meaningless.
 
-The pass will run and report success while the motion guide is meaningless. Symptom: ghosting or
-smearing that does not track camera motion. The fix is a small decode compute pass producing an
-`R16G16_FLOAT` buffer in absolute colour-grid pixels. The add-on logs this whenever the bound
-velocity buffer is a normalised-integer format.
+There are **two halves**, and the second is the one that matters most.
+
+#### (a) The decode
+
+UE 4.27 `Common.ush:1537-1570`:
+
+```hlsl
+EncodedV.xy = V.xy * (0.499f * 0.5f) + 32767.0f / 65535.0f          // encode
+V.xy        = EncodedV.xy * InvDiv - 32767.0f / 65535.0f * InvDiv   // decode
+InvDiv      = 1.0f / (0.499f * 0.5f)                                // 4.00801611f
+```
+
+`InvDiv` in float32 is `0x408041AB` — **bit-identical** to `kVelocityDecodeScaleBits`, the constant
+this project's Gate B already matches **inside STRAY's own DXBC**, and which is a hard reject. The
+shipped game demonstrably carries it. **[HW]**
+
+**The bias is not `0.5`.** It is `32767/65535 = 0.49999237…` (`0x3EFFFF00`), folding in the decode
+to a MAD constant `2.00397754f` (`0x4000412B`). Epic's comment at `Common.ush:1539` says why
+`0.499` and not `0.5`: it keeps the **clear colour `(0,0)` outside the encodable range** so it can
+be a sentinel. Verified numerically on the build host — over the whole `V ∈ [-2,2]` range the
+encoded `.x` lands in `[0.00099236, 0.99899238]`, u16 `[65, 65469]`, so exactly-zero is unreachable
+for a texel UE actually wrote. A `0.5` scale would land on exactly `0.0` at `V = -2` and collide.
+
+**The units are not pixels.** They are an **NDC delta, span 2.0, current − previous, Y axis UP**
+(`Common.ush:1535`; `VelocityCommon.ush:11-18`).
+
+> **The 4-channel `unorm` format is not caused by `r.BasePassOutputsVelocity`.**
+> `VelocityRendering.cpp:354-358` picks `PF_A16B16G16R16` **iff the shader platform supports ray
+> tracing**, else `PF_G16R16`. On a 4090/DX12 platform that is the ray-tracing branch. An earlier
+> revision of this README attributed the format to the CVar; the observed format was right and the
+> stated cause was wrong. Only `.xy` are read here either way.
+
+#### (b) The velocity buffer is sparse — the half people get wrong
+
+UE writes the velocity texture only where it decided to; elsewhere the texel is the cleared
+`(0,0,0,0)` (`VelocityRendering.cpp:363`, `FClearValueBinding::Transparent`) and UE's own TAA falls
+back to reprojecting depth through `View.ClipToPrevClip`. The validity test is exact:
+
+```hlsl
+bool DynamicN = EncodedVelocity.x > 0.0;      // TAAStandalone.usf:2004
+```
+
+**Red channel, strict `>`, on the raw encoded sample.** Six separate UE 4.27 consumers spell it
+identically. Not `.y`, not `any()`, not the decoded value.
+
+**`r.BasePassOutputsVelocity=1` does not make the buffer dense.** `BasePassPixelShader.usf:979`
+zeroes `GBuffer.Velocity`, `:985` gates the real value on `GetPrimitiveData(...).OutputVelocity > 0`,
+and `:997-1000` zeroes it again when `DrawsVelocity == 0`; `VelocityRendering.cpp:456-460` returns
+false for any primitive whose transform equals its previous one. What the CVar changes is *where*
+moving geometry is rasterised — base-pass MRT instead of a separate pass, which is what lets
+world-position-offset materials produce velocity at all — not *whether* static geometry does.
+Static opaque, sky, unmoved movables, translucency and particles all stay at exactly zero.
+
+So a naive decode hands DLSS **zero motion for the majority of the screen**, which is worse than the
+status quo. Where the texel is invalid the pass runs UE's own reconstruction verbatim
+(`TAACommon.ush:348-356`):
+
+```hlsl
+ThisClip   = float4(ScreenPos, DeviceZ, 1);
+PrevClip   = mul(ThisClip, View.ClipToPrevClip);
+BackN      = ScreenPos - PrevClip.xy / PrevClip.w;
+```
+
+This produces the *same quantity in the same units* as the decode — provable from UE's own code
+rather than argued: `TAAStandalone.usf` assigns one into the other's variable with no conversion.
+
+#### The output contract, and the sign trap
+
+```
+mvec_px = BackN * float2(-0.5 * ViewW, +0.5 * ViewH)     // y-down colour-grid pixels
+```
+
+so that `current_pixel + mvec == previous_pixel`.
+
+**The X channel is negated and the Y channel is not.** Two flips that cancel on Y and compound on
+X: DLSS wants previous-minus-current while UE stores current-minus-previous (negates **both**), and
+UE `ScreenPos` is y-**up** while the pixel grid is y-**down** (negates **only Y**). A naive "flip
+the Y" gets *both* signs wrong and still half-works — exactly the "kind of works but smears"
+failure. This is algebraically identical to what NVIDIA's own UE plugin ships
+(`VelocityCombine.usf:195-197`).
+
+**The DLSS direction itself is `[WEB]`, not measured here.** It comes from the DLSS Programming
+Guide and from NVIDIA's plugin; it has **not** been confirmed against DLSS-NR (feature 18)
+specifically. That is why it is exposed rather than welded in — `mvec_scale_x = -1` /
+`mvec_scale_y = -1` flip either axis through NGX's own parameter with no rebuild.
+
+#### Where `ClipToPrevClip` comes from
+
+The four float4 rows are read **on the CPU** out of the game's own View uniform buffer — the root
+CBV the add-on already captures as `{ID3D12Resource*, offset}` at `push_descriptors` — using
+`ue4_jitter.hpp`'s validated discovery, vendored into `src/`. The row is required to agree **two
+independent ways**: the constant buffer's own content signature (projection anchor + 94) and this
+game's TAA bytecode analysed by the probe. STRAY measures **122** both ways. A disagreement
+**refuses** the reconstruction rather than reprojecting the world through the wrong four rows,
+which would be confident, coherent and completely wrong.
+
+Reading it CPU-side (64 bytes/frame) rather than binding the game's `b1` to our shader is
+deliberate: binding it would make the row an assumption instead of a validated fact, and the
+documented worst case — reading `$Globals` at `b0` — produces plausible numbers from the wrong
+frame with no diagnostic.
+
+#### The fallback ladder
+
+**Every** failure lands on today's behaviour — the game's raw encoded velocity bound as
+`DLSSNR.MVec` with the derived grid scale — except the one the user explicitly asked for. The pass
+can never make the add-on worse than `mvec_decode=0`.
+
+| trigger | result |
+|---|---|
+| `mvec_decode=0` | raw — bit-for-bit today, gap-2 warning and all |
+| shader or PSO could not be built | raw, run-latched |
+| `r16g16_float` target could not be allocated | raw, per-resolution latch |
+| the game's velocity/depth SRV handles not recovered | raw |
+| no View CB / discovery failed / **the two clip rows disagree** | raw when `mvec_reconstruct=1`; decode-only when `mvec_reconstruct=0` |
+| per-frame CB read failed | **keep the last good matrix**; latch off after 30 consecutive |
+| the four rows fail the plausibility test | **keep the last good matrix**; latch off after 30 consecutive |
+| a permanent View-CB latch fires *after* a good frame | raw — the cached matrix is **dropped**, never frozen |
+| `EvaluateFeature` fails 8 frames running with the decoded guide bound | raw, run-latched — the binding reverts to exactly the pre-decode one and NGX gets one Reset frame |
+| `mvec_reconstruct=0` | decode only, invalid texels exactly zero |
+
+Staleness is **bounded everywhere**. The last-good-matrix behaviour belongs only to the two
+*transient* per-frame paths above, and both give up after 30 consecutive failures. A **permanent**
+latch — no root CBV at `b1`, a CBV that does not resolve to a readable buffer, the clip row out of
+bounds — drops `clip_ok` with it, so it lands on `raw` rather than reprojecting the static world
+through a matrix frozen at whatever the last good frame held. That failure would be *coherent* and
+*camera-independent*, i.e. strictly worse than `mvec_decode=0`, and the census line would still
+report a healthy run.
+
+The `EvaluateFeature` rung exists because `mvec_decode` defaults to `1`: the pass changes both the
+resource **and** the DXGI format handed to the snippet, and D3D12 acceptance of a 2-channel guide is
+not measured. Without a rung, a rejection would leave `evaluated` false every frame — no copy-back,
+**no denoise at all** — for the whole session. It now reverts to the binding that works today.
+
+A missing `ClipToPrevClip` falls back to **raw**, not to decode-only, on purpose: decode-only hands
+DLSS zero motion for the entire static world, which is the failure this feature exists to prevent.
+Today's raw guide is at least uniformly wrong rather than confidently wrong in one region.
+
+When the pass runs, `MVecScaleX/Y` are **forced to exactly 1.0** — the pass already emits absolute
+colour-grid pixels, so letting the derived grid ratio through would double-apply it. In STRAY that
+ratio happens to be 1.0 today (colour and velocity are both 1920×1080), so a stale ratio would be
+invisible here and would come back as a silent 2× error the moment either grid moved. The NGX reset
+latch keys on the bound **resource** as well as the extent, because the ladder can swap the guide
+between our texture and the game's at an unchanged extent — a change of *units* an extent-only test
+cannot see.
+
+#### Validated on the build host
+
+`tools/mvec_selftest.cpp` replays every piece of arithmetic the shader runs, against
+independently-computed ground truth. It **restates** the shader's maths rather than sharing code
+with it, so a disagreement is a real disagreement. Build and run it on the build host:
+
+```sh
+c++ -std=c++17 -O2 -Wall -o /tmp/mvec_selftest tools/mvec_selftest.cpp && /tmp/mvec_selftest
+```
+
+**24 assertions, all passing:**
+
+| check | result |
+|---|---|
+| `InvDiv` bit pattern | `4.00801611` → `0x408041AB` ✓ matches the constant found in STRAY's DXBC |
+| folded MAD bias | `2.00397754` → `0x4000412B` (negated `0xC000412B`) |
+| bias ≠ 0.5 | `32767/65535` → `0x3EFFFF00`, provably distinct from `0x3F000000` |
+| zero sentinel | encoded `.x` ∈ `[0.00099236, 0.99899238]`, u16 `[65, 65469]` — zero unreachable |
+| `0.499` is load-bearing | a `0.5` encode gives exactly `0.0` at `V = -2`, colliding with the sentinel |
+| encode → unorm16 → decode | worst error `3.076e-05` NDC ≤ one LSB (`6.1158e-05`) |
+| quantisation | `0.0587 px` in X, `0.0330 px` in Y at 1920×1080 — irrelevant for a denoiser |
+| camera reprojection | worst `|BackN − ground truth|` = `2.98e-08` NDC over 6 world points |
+| **transpose discrimination** | untransposed error `0.0`; transposed error `0.370` NDC — the shipped convention is right **and** the wrong one is detectable |
+| sign, strafe right | `BackN.x = -0.073` → `MV.x = +70.15 px` — history lies to the **right** ✓ |
+| sign, pitch up | `MV.y = -233.83 px` — history **above** ✓ |
+| sign, pitch down | `MV.y = +233.83 px` — history **below** ✓ |
+| the asymmetry | `BackN = (+0.1,+0.1)` → `MV = (-96.0, +54.0) px` — opposite signs |
+| root-constant packing | 128 bytes / 32 dwords; `g_clipToPrevClip` lands exactly on register `c4` |
+| `ScreenPos` orientation | top-left `(-,+)`, bottom-right `(+,-)`, centre exactly `(0,0)` — y is up |
+| identity matrix | exactly zero motion over a 5×5×4 sample grid (the still-camera check) |
+
+The one thing a host replay **cannot** settle is the DLSS sign convention — see above.
+
+#### Hardware A/B, in this order (all ini-only, no rebuild)
+
+| # | config | expectation |
+|---|---|---|
+| 1 | `mvec_decode=0` | today, byte-for-byte. The control. |
+| 2 | `mvec_decode=1 mvec_reconstruct=0` | moving objects track; static world still smears. Isolates half (a). |
+| 3 | `mvec_decode=1 mvec_reconstruct=1` | the target. Static world tracks camera motion. |
+| 4 | 3, standing still | no shimmer. Static geometry boiling at pixel level while moving objects look fine is the jitter-double-counting signature. |
+| 5 | 3 + strafe **right** | world moves left; must not smear. `MV.x` is positive here. |
+| 6 | 3 + `mvec_scale_x=-1` | should be **worse**. If better, the X sign alone is inverted. |
+| 7 | 3 + `mvec_scale_y=-1` | should be **worse**. If better, the Y sign alone is inverted. X and Y are **not** symmetric, so both single-axis flips have to be tried. |
+| 8 | **3 + `mvec_scale_x=-1` `mvec_scale_y=-1`** | **the direction-convention test — the only one that settles the `[WEB]`-only link.** Should be worse. If it is **better**, DLSS-NR wants *current − previous* and the shipped contract `mvec = BackN * (-0.5W, +0.5H)` must be negated **in the shader**, not left corrected by these keys. |
+| 9 | 3 + `mvec_clip_transpose=1` | should be worse, and worse **at the edges**. Identity is transpose-invariant, so a still camera cannot tell. |
+| 10 | 3 + `transfer_strength=0` | still pixel-identical to `copy_back=0`. The regression gate for the HDR codec. |
+
+Tests 6 and 7 **cannot** settle the direction convention, and it is a mistake to read them as if
+they could. Getting the convention wrong negates **both** axes at once; test 6 leaves Y inverted and
+test 7 leaves X inverted, so under a fully inverted guide *both* come out "worse" and match their
+printed expectation while the shipped binding is still wrong on both axes. Test 8 is the only row
+that reaches the doubly-negated configuration.
 
 ### Gap 3 — the depth buffer is typeless and planar
 

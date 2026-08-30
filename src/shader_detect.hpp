@@ -244,6 +244,11 @@ struct TAAShaderInfo
 	bool     has_multiple_render_targets     = false;
 	bool     found_velocity_constant         = false;
 	int32_t  velocity_constant_pattern       = -1; // which of the three byte patterns hit
+	// DLSS-NR ADDITION - the DECODE BIAS, scanned and reported but NEVER gated on. See
+	// dxbc_tokens.hpp kVelocityDecodeBiasBits for why this exists and what its absence would mean.
+	// +1 == the negated form (a mad), 0 == the positive form, -1 == not found.
+	int32_t  velocity_bias_form              = -1;
+	bool     found_velocity_bias             = false;
 	bool     loops_balanced_nonzero          = false;
 	float    confidence                      = 0.0f;
 
@@ -652,6 +657,35 @@ inline bool IsUE4TAACandidate(const uint8_t *code, size_t size, TAAShaderInfo &i
 
 		if (!info.found_velocity_constant)
 			return false;
+	}
+
+	// ------------------------------------- Gate B', the DECODE BIAS: MEASURED, NEVER GATED ON
+	//
+	// Gate B above matches only the SCALE 4.00801611f. The other half of
+	// DecodeVelocityFromTexture is the bias, and it is NOT 0.5 - it is 32767/65535, folded by the
+	// compiler into a MAD immediate (32767/65535) * InvDiv = 2.00397754f (0x4000412B), which shows
+	// up NEGATED (0xC000412B) in the `mad` form UE's decode compiles to.
+	//
+	// This is what turns "STRAY's velocity decode is stock UE 4.27" from an inference into a
+	// measurement, and mvec_decode.hpp's entire constant set hangs on it. It is scanned here and
+	// printed on the existing Gate B detail line; it deliberately does NOT reject anything, so
+	// this block cannot change which shader is identified. Absence is a loud warning, not a
+	// refusal - the decode could legitimately have been spelled another way by a different
+	// compiler version, and Gate B plus the SRV class quorum are what actually identify the pass.
+	{
+		word_t neg_bias; neg_bias.u = kVelocityDecodeNegBiasBits;   // 0xC000412B, bytes 2B 41 00 C0
+		word_t pos_bias; pos_bias.u = kVelocityDecodeBiasBits;      // 0x4000412B
+
+		if (CountPattern(code, size, neg_bias.b, 4, true) != 0)
+		{
+			info.found_velocity_bias = true;
+			info.velocity_bias_form  = 1;
+		}
+		else if (CountPattern(code, size, pos_bias.b, 4, true) != 0)
+		{
+			info.found_velocity_bias = true;
+			info.velocity_bias_form  = 0;
+		}
 	}
 
 	// ------------------------------------------------------------------ Gate C: loop rejection

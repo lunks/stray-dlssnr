@@ -476,10 +476,12 @@ inline pD3DCompile resolve_compiler(LogFn log)
 	{
 		char buf[512];
 		std::snprintf(buf, sizeof(buf),
-			"DLSS-NR: d3dcompiler_47.dll / D3DCompile is not available (LastError=%lu). The HDR "
-			"codec cannot be built here. Drop a precompiled stray_dlssnr_encode.dxbc and "
-			"stray_dlssnr_decode.dxbc beside stray_dlssnr.ini to use it anyway, or leave "
-			"hdr_codec off - the add-on runs exactly as it does without the codec.",
+			"DLSS-NR: d3dcompiler_47.dll / D3DCompile is not available (LastError=%lu). NOTHING "
+			"this add-on compiles at runtime can be built here - the HDR codec and the "
+			"motion-vector decode alike. Drop precompiled stray_dlssnr_encode.dxbc, "
+			"stray_dlssnr_decode.dxbc and stray_dlssnr_mvec.dxbc beside stray_dlssnr.ini to use "
+			"them anyway, or leave hdr_codec / mvec_decode off - the add-on runs exactly as it "
+			"does without them.",
 			(unsigned long)GetLastError());
 		log(log_error, buf);
 	}
@@ -527,16 +529,21 @@ inline std::wstring widen_hex(uint64_t v)
 	return s;
 }
 
-// Produces the DXBC for one entry point. In order:
+// Produces the DXBC for one entry point from ALREADY-ASSEMBLED source text. In order:
 //   1. <dir><name>.dxbc                  - a user-supplied override, always preferred, logged loudly
 //   2. <dir><name>.<source hash>.dxbc    - this build's own cache, produced by a previous launch
 //   3. D3DCompile(cs_5_0)                - and the result is written to (2) on success
-// Any failure returns false with a logged reason; the caller then leaves the codec off.
+// Any failure returns false with a logged reason; the caller then leaves the feature off.
+//
+// 'feature' names the thing being built in every message ("HDR codec", "motion-vector decode").
+// It is the ONLY thing this factoring added: build_one below still calls it with "HDR codec" and
+// with full_source(entry_source), so the hash, the cache FILENAMES, the compiler input and every
+// message this codec emits are byte-identical to before mvec_decode.hpp existed. That equality is
+// the regression test - check that stray_dlssnr_encode.<hash>.dxbc keeps its name.
 template <typename LogFn>
-inline bool build_one(const std::wstring &dir, const wchar_t *wname, const char *name,
-                      const char *entry_source, std::vector<uint8_t> &out, LogFn log)
+inline bool build_blob(const std::wstring &dir, const wchar_t *wname, const char *name,
+                       const char *feature, const std::string &src, std::vector<uint8_t> &out, LogFn log)
 {
-	const std::string  src  = full_source(entry_source);
 	const uint64_t     hash = source_hash(src);
 	const std::wstring override_path = dir + wname + L".dxbc";
 	const std::wstring cache_path    = dir + wname + L"." + widen_hex(hash) + L".dxbc";
@@ -546,10 +553,10 @@ inline bool build_one(const std::wstring &dir, const wchar_t *wname, const char 
 	if (read_file(override_path, out) && !out.empty())
 	{
 		std::snprintf(buf, sizeof(buf),
-			"DLSS-NR: HDR codec %s - using the USER-SUPPLIED bytecode %ls.dxbc (%zu bytes). This "
+			"DLSS-NR: %s %s - using the USER-SUPPLIED bytecode %ls.dxbc (%zu bytes). This "
 			"file OVERRIDES the shader source compiled into the add-on (source hash 0x%016llx); "
 			"delete it to go back to the built-in shader.",
-			name, wname, out.size(), (unsigned long long)hash);
+			feature, name, wname, out.size(), (unsigned long long)hash);
 		log(log_warn, buf);
 		return true;
 	}
@@ -557,9 +564,9 @@ inline bool build_one(const std::wstring &dir, const wchar_t *wname, const char 
 	if (read_file(cache_path, out) && !out.empty())
 	{
 		std::snprintf(buf, sizeof(buf),
-			"DLSS-NR: HDR codec %s - reusing the cached bytecode %ls.%016llx.dxbc (%zu bytes), "
+			"DLSS-NR: %s %s - reusing the cached bytecode %ls.%016llx.dxbc (%zu bytes), "
 			"which was compiled from exactly this shader source.",
-			name, wname, (unsigned long long)hash, out.size());
+			feature, name, wname, (unsigned long long)hash, out.size());
 		log(log_info, buf);
 		return true;
 	}
@@ -584,8 +591,8 @@ inline bool build_one(const std::wstring &dir, const wchar_t *wname, const char 
 		const char *msg = (errors != nullptr) ? static_cast<const char *>(errors->GetBufferPointer())
 		                                      : "(no error blob)";
 		std::snprintf(buf, sizeof(buf),
-			"DLSS-NR: D3DCompile(cs_5_0) FAILED for the HDR codec %s shader, hr=0x%08lx: %s",
-			name, (unsigned long)hr, msg);
+			"DLSS-NR: D3DCompile(cs_5_0) FAILED for the %s %s shader, hr=0x%08lx: %s",
+			feature, name, (unsigned long)hr, msg);
 		log(log_error, buf);
 		if (errors != nullptr) errors->Release();
 		if (code != nullptr)   code->Release();
@@ -594,8 +601,8 @@ inline bool build_one(const std::wstring &dir, const wchar_t *wname, const char 
 	if (errors != nullptr)
 	{
 		// Warnings. Compiled anyway, but say so.
-		std::snprintf(buf, sizeof(buf), "DLSS-NR: D3DCompile warnings for the HDR codec %s shader: %s",
-			name, static_cast<const char *>(errors->GetBufferPointer()));
+		std::snprintf(buf, sizeof(buf), "DLSS-NR: D3DCompile warnings for the %s %s shader: %s",
+			feature, name, static_cast<const char *>(errors->GetBufferPointer()));
 		log(log_warn, buf);
 		errors->Release();
 	}
@@ -607,21 +614,31 @@ inline bool build_one(const std::wstring &dir, const wchar_t *wname, const char 
 	if (write_file(cache_path, out.data(), out.size()))
 	{
 		std::snprintf(buf, sizeof(buf),
-			"DLSS-NR: HDR codec %s compiled to %zu bytes of cs_5_0 DXBC and cached as "
+			"DLSS-NR: %s %s compiled to %zu bytes of cs_5_0 DXBC and cached as "
 			"%ls.%016llx.dxbc. Copy that file to a machine whose d3dcompiler cannot compile it "
 			"and rename it to %ls.dxbc to use it there.",
-			name, out.size(), wname, (unsigned long long)hash, wname);
+			feature, name, out.size(), wname, (unsigned long long)hash, wname);
 		log(log_info, buf);
 	}
 	else
 	{
 		std::snprintf(buf, sizeof(buf),
-			"DLSS-NR: HDR codec %s compiled to %zu bytes of cs_5_0 DXBC. The blob could NOT be "
+			"DLSS-NR: %s %s compiled to %zu bytes of cs_5_0 DXBC. The blob could NOT be "
 			"cached to disk (the add-on's directory is not writable); it will be recompiled on "
-			"every launch, which is harmless.", name, out.size());
+			"every launch, which is harmless.", feature, name, out.size());
 		log(log_info, buf);
 	}
 	return true;
+}
+
+// The codec's own two entry points: build_blob over the shared prelude + the entry source. This
+// wrapper is what keeps full_source() and source_hash() - and therefore the on-disk cache
+// filenames stray_dlssnr_encode.<hash>.dxbc / stray_dlssnr_decode.<hash>.dxbc - unchanged.
+template <typename LogFn>
+inline bool build_one(const std::wstring &dir, const wchar_t *wname, const char *name,
+                      const char *entry_source, std::vector<uint8_t> &out, LogFn log)
+{
+	return build_blob(dir, wname, name, "HDR codec", full_source(entry_source), out, log);
 }
 
 struct blobs
