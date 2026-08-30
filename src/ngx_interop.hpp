@@ -196,6 +196,14 @@ static constexpr const char *kParamStyle                  = "DLSSNR.Style";
 // parameter block converts between the numeric Set/Get overloads, so an unsigned Set is readable
 // by the snippet's signed Get. Its VISUAL effect on this content is unverified - see overlay_ui.
 static constexpr const char *kParamUICorrection           = "DLSSNR.UICorrection";
+
+// Generic NGX keys the reference add-on writes and we did not. All three are exact strings in
+// nvngx_dlssnr.dll (unlike DLSS.Feature.Create.Flags, which has zero occurrences there and is
+// therefore NOT a feature-18 key). Written for parity; see the call sites for why each is
+// expected to be inert here.
+static constexpr const char *kParamPerfQualityValue       = "PerfQualityValue";
+static constexpr const char *kParamIndicatorInvertX       = "DLSS.Indicator.Invert.X.Axis";
+static constexpr const char *kParamIndicatorInvertY       = "DLSS.Indicator.Invert.Y.Axis";
 // ---- END overlay_ui hook ----
 
 // Generic NGX, nvsdk_ngx_defs.h:709-710, 758.
