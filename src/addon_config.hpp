@@ -704,6 +704,13 @@ struct config
 	// setting for nr_probe_frames frames with the camera parked, measures the network's own input
 	// against its own output in the same frame, and repeats the baseline at the end so the run
 	// carries its own noise floor.
+	// Hand NGX a logging callback in Init_Ext's FeatureCommonInfo so the SNIPPET's own
+	// diagnostics reach ReShade.log. Default 0 because the struct layout mirrors nvsdk_ngx_defs.h
+	// and cannot be verified from this tree: a wrong layout is a bad pointer into a gated entry
+	// point that is already known to be able to hang rather than fail. Turn it on deliberately,
+	// when EvaluateFeature's Success is not telling you what you need - which is exactly the
+	// output-is-zero case this was added for.
+	uint32_t ngx_logging     = 0;
 	uint32_t nr_probe        = 0;
 	uint32_t nr_probe_frames = 120;
 
@@ -1093,6 +1100,7 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "ui_correction")            c.ui_correction = static_cast<uint32_t>(parse_u64(v, c.ui_correction));
 		// ---- END overlay_ui hook ----
 		else if (key == "use_auto_mask")            c.use_auto_mask = parse_bool(v, c.use_auto_mask);
+		else if (key == "ngx_logging")              c.ngx_logging = static_cast<uint32_t>(parse_u64(v, c.ngx_logging));
 		else if (key == "nr_probe")                 c.nr_probe = static_cast<uint32_t>(parse_u64(v, c.nr_probe));
 		else if (key == "nr_probe_frames")          c.nr_probe_frames = static_cast<uint32_t>(parse_u64(v, c.nr_probe_frames));
 		else if (key == "app_id")                   c.app_id = parse_u64(v, c.app_id);

@@ -701,6 +701,56 @@ inline const char *value_kind_name(unsigned char k)
 }
 
 // ------------------------------------------------------------------------------------------
+// NVSDK_NGX_FeatureCommonInfo - Init_Ext's last argument, which this add-on passed as nullptr
+// until the output-is-zero measurement made the snippet's own reasoning the thing we needed.
+//
+// WHY IT MATTERS: EvaluateFeature returns Success while DLSSNR.Output comes back EXACTLY zero
+// (measured: IN [0.79 .. 4729.6], OUT [0.0 .. 0.0], no negatives, no NaN, 6.9M samples/step).
+// From outside, Success is the only signal we get. The snippet, however, carries its own
+// diagnostics for precisely this state - its .rdata holds, among others:
+//
+//     "DLSSNR: Evaluate called but network not ready"
+//     "DLSSNR: No embedded weights for config '%s'"
+//     "DLSSNR: init_kernels() failed: %s"
+//     "DLSSNR: CC active resize to %dx%d failed: %s"
+//
+// none of which can reach us with a null FeatureCommonInfo. Supplying the logging callback is
+// how we stop inferring and let it say what it is doing.
+//
+// LAYOUT IS LOAD-BEARING AND UNVERIFIABLE FROM HERE. This mirrors nvsdk_ngx_defs.h; a wrong
+// layout is not a compile error, it is a bad pointer handed to a gated entry point that this
+// tree has already measured as able to HANG rather than fail. That is why it is gated behind
+// ngx_logging (default 0) rather than switched on for everyone.
+enum LoggingLevel : uint32_t
+{
+	LoggingLevel_Off     = 0,
+	LoggingLevel_On      = 1,
+	LoggingLevel_Verbose = 2,
+};
+
+// NVSDK_CONV is __cdecl on Windows x64.
+typedef void (__cdecl *PFN_AppLogCallback)(const char *message, LoggingLevel level, uint32_t source_component);
+
+struct PathListInfo
+{
+	const wchar_t *const *Path   = nullptr;
+	unsigned int          Length = 0;
+};
+
+struct LoggingInfo
+{
+	PFN_AppLogCallback LoggingCallback          = nullptr;
+	LoggingLevel       MinimumLoggingLevel      = LoggingLevel_Off;
+	bool               DisableOtherLoggingSinks = false;
+};
+
+struct FeatureCommonInfo
+{
+	PathListInfo PathListInfo;
+	LoggingInfo  LoggingInfo;
+};
+
+// ------------------------------------------------------------------------------------------
 // The snippet.
 // ------------------------------------------------------------------------------------------
 typedef Result (__cdecl *PFN_Init_Ext)(unsigned long long app_id, const wchar_t *app_data_path,

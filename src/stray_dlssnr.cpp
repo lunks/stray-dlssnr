@@ -2071,6 +2071,36 @@ static bool                 g_depth_dxbc_tried = false;
 // no such window - any deviation at all is a human, whenever it happened.
 static bool                 g_depth_inverted_at_load = true;
 
+// ---- THE SNIPPET'S OWN LOG -----------------------------------------------------------------
+// Called BY nvngx_dlssnr.dll, on whatever thread it likes, once ngx_logging=1 puts a
+// FeatureCommonInfo in front of Init_Ext. Everything here must be safe from a foreign thread and
+// must not throw back across that boundary - logf is a vsnprintf into a stack buffer plus
+// ReShade's own log call, and there is nothing else in the body for a reason.
+static void __cdecl nr_ngx_log_callback(const char *message, ngx::LoggingLevel level, uint32_t source)
+{
+	if (message == nullptr)
+		return;
+	logf(level == ngx::LoggingLevel_Off ? reshade::log::level::debug : reshade::log::level::info,
+	     "[NGX snippet, feature %u] %s", source, message);
+}
+
+// Built once and kept alive for the whole process: NGX is handed a POINTER to this and the
+// documented lifetime is "must outlive the runtime", so a stack temporary here would be a
+// dangling read on the first message rather than an immediate crash.
+static ngx::FeatureCommonInfo g_ngx_common_info;
+
+static const void *nr_ngx_common_info()
+{
+	if (g_cfg.ngx_logging == 0)
+		return nullptr;   // exactly the pre-existing behaviour
+	g_ngx_common_info.LoggingInfo.LoggingCallback          = &nr_ngx_log_callback;
+	g_ngx_common_info.LoggingInfo.MinimumLoggingLevel      = ngx::LoggingLevel_Verbose;
+	// Leave the snippet's own sinks alone: if our struct layout is wrong, its file log is the
+	// only channel left that could tell us so.
+	g_ngx_common_info.LoggingInfo.DisableOtherLoggingSinks = false;
+	return &g_ngx_common_info;
+}
+
 static void nr_pipeline_log(int lvl, const char *msg)
 {
 	logf(lvl == hdr_codec::log_error ? reshade::log::level::error
@@ -7059,7 +7089,8 @@ static bool nr_lazy_ngx_init(device *dev)
 		// The snippet resolves its weights out of its own embedded WEIGHTS_HT resource, so this
 		// path is only used for the log file it writes. It must be WRITABLE, or Init_Ext fails
 		// with FAIL_UnableToWriteToAppDataPath.
-		const ngx::Result r = g_snippet.init_ext(g_cfg.app_id, dir.c_str(), st->d3d12, ngx::kVersionApi, nullptr);
+		const ngx::Result r = g_snippet.init_ext(g_cfg.app_id, dir.c_str(), st->d3d12, ngx::kVersionApi,
+		                                         nr_ngx_common_info());
 		if (ngx::failed(r))
 		{
 			nr_log_ngx(reshade::log::level::error, "NVSDK_NGX_D3D12_Init_Ext", r);
@@ -7254,7 +7285,7 @@ static bool nr_lazy_ngx_init(device *dev)
 	if ((overlay_ui::live_dlss_sr() || overlay_ui::live_dlss_chain()) && g_sr_snippet.available)
 	{
 		const ngx::Result r = g_sr_snippet.init_ext(g_cfg.app_id, dir.c_str(), st->d3d12,
-		                                            ngx::kVersionApi, nullptr);
+		                                            ngx::kVersionApi, nr_ngx_common_info());
 		if (ngx::failed(r))
 		{
 			LOGE("DLSS-SR: NVSDK_NGX_D3D12_Init_Ext FAILED: 0x%08x %s. %s",
