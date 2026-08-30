@@ -1493,6 +1493,20 @@ struct nr_state
 	uint32_t guide_w = 0, guide_h = 0;
 
 	bool     need_reset = true;          // DLSSNR.Reset for the next evaluate
+
+	// CAMERA-CUT DETECTION. UE4 assigns PrevViewMatrices = ViewMatrices on any frame where
+	// bResetCamera holds (camera cut, level load, time reset, large camera movement,
+	// bForceCameraVisibilityReset), so View.TemporalAAJitter.zw becomes bitwise equal to .xy.
+	// ue4_jitter.hpp has computed exactly this as result::reset_signalled since it was written;
+	// nothing consumed it until now. STRAY is full of hard cutscene transitions, and without this
+	// the NR temporal history carries stale samples across them and ghosts for several frames.
+	// The reference add-on gets the equivalent for free by inheriting the host game's reset flag.
+	// ATOMICS ON PURPOSE, exactly as mvec_frames/mvec_cb_reuse are: the on_present census reads
+	// these and must NOT take st->mutex, because nr_try_run takes st->mutex then g.mutex and the
+	// reverse order would deadlock. Do not "simplify" these back into plain fields.
+	std::atomic<bool>     jitter_cut_ok{ false };  // jitter row readable AND validated this run
+	std::atomic<uint64_t> camera_cuts{ 0 };        // cuts signalled, for the census
+	bool     logged_cut_source = false;
 	bool     feature_failed = false;     // latched per (out_w,out_h); cleared when they move
 	bool     pending_teardown = false;   // serviced on the next present, on the main thread
 	uint64_t evaluate_count = 0;
@@ -2116,6 +2130,14 @@ static bool nr_ensure_feature(nr_state &st, ID3D12GraphicsCommandList *cl, uint3
 	// own usage.
 	ngx::set_i32(p, ngx::kParamFreeMemOnRelease, 1);
 
+	// PARITY WITH THE REFERENCE ADD-ON. renodx writes PerfQualityValue = 0 at create
+	// [BIN 0x18000dfd5], and unlike DLSS.Feature.Create.Flags - which has ZERO occurrences in
+	// nvngx_dlssnr.dll and is therefore inapplicable to feature 18 - "PerfQualityValue" IS an
+	// exact string in this snippet. Feature 18 does not upscale, so this is almost certainly
+	// inert; it is written anyway as zero-cost insurance against the snippet reading a key we
+	// leave absent. 0 = MaxPerf, which is the reference's value.
+	ngx::set_i32(p, ngx::kParamPerfQualityValue, 0);
+
 	void *handle = nullptr;
 	const ngx::Result r = g_snippet.create_feature(cl, ngx::kFeatureDLSSNR, p, &handle);
 	if (ngx::failed(r) || handle == nullptr)
@@ -2591,6 +2613,40 @@ static bool nr_update_clip_to_prev_clip(device *dev, probe::device_shadow &sh, c
 		st.view_layout_failed = true;
 		st.clip_ok = false;   // permanent latch: drop to raw, never freeze the last matrix
 		return false;
+	}
+
+	// ------------------------------------------------------------------ camera-cut detection
+	// A second 16-byte read out of the SAME mapped upload pool, one row, only when the jitter row
+	// validated during discovery. Deliberately BEFORE the clip read and independent of it: a cut
+	// is worth signalling even on a frame whose ClipToPrevClip read then fails, because Reset is
+	// how NGX is told to discard history, and a stale history is exactly what a cut produces.
+	// Failure here is silent and costs nothing - need_reset simply is not raised.
+	if (st.view_layout.row_jitter >= 0 &&
+	    static_cast<uint64_t>(st.view_layout.row_jitter + 1) * ue4jitter::kBytesPerRow <= avail)
+	{
+		float j[4];
+		const uint64_t joff = br.offset +
+			static_cast<uint64_t>(st.view_layout.row_jitter) * ue4jitter::kBytesPerRow;
+		if (ue4jitter::read_view_cb(pool, joff, ue4jitter::kBytesPerRow, j))
+		{
+			st.jitter_cut_ok.store(true, std::memory_order_relaxed);
+			// Bitwise equality, not a tolerance: UE4 COPIES the matrices on a reset frame, so the
+			// two float pairs are the same bits. A tolerance would fire on any slow pan.
+			if (j[2] == j[0] && j[3] == j[1])
+			{
+				st.need_reset = true;
+				st.camera_cuts.fetch_add(1, std::memory_order_relaxed);
+				if (!st.logged_cut_source)
+				{
+					st.logged_cut_source = true;
+					LOGI("DLSS-NR: camera-cut detection is LIVE - View.TemporalAAJitter.zw == .xy "
+					     "at row %d, so UE4 reset the view this frame and DLSSNR.Reset is being "
+					     "pulsed. This is the signal the reference add-on gets for free from its "
+					     "host game's reset flag. Logged once; the running count is in the census.",
+					     st.view_layout.row_jitter);
+				}
+			}
+		}
 	}
 
 	float m[16];
@@ -3612,6 +3668,13 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 		// false negative. Default 0, which is also the snippet's own fallback, so an untouched
 		// install is bit-identical to one without this line.
 		ngx::set_u32(p, ngx::kParamUICorrection,           g_cfg.ui_correction);
+
+		// PARITY. renodx writes both indicator-axis keys = 0 [BIN 0x180014adb / 0x180014aee] and
+		// both strings exist in the snippet. These condition the NGX debug indicator overlay,
+		// which is registry-armed and off by default, so this is purely defensive: it stops the
+		// snippet reading an absent key if the indicator is ever enabled on this machine.
+		ngx::set_u32(p, ngx::kParamIndicatorInvertX, 0u);
+		ngx::set_u32(p, ngx::kParamIndicatorInvertY, 0u);
 		// ---- END overlay_ui hook ----
 
 		const ngx::Result r = g_snippet.evaluate_feature(d3d12_cmd, st->feature, p, nullptr);
@@ -4518,6 +4581,8 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 		const uint64_t nr_mvec_frames  = (nst != nullptr) ? nst->mvec_frames.load(std::memory_order_relaxed) : 0;
 		const uint64_t nr_mvec_reuse   = (nst != nullptr) ? nst->mvec_cb_reuse.load(std::memory_order_relaxed) : 0;
 		const uint32_t nr_mvec_mode    = (nst != nullptr) ? nst->census_mvec_mode.load(std::memory_order_relaxed) : 0;
+		const uint64_t nr_camera_cuts  = (nst != nullptr) ? nst->camera_cuts.load(std::memory_order_relaxed) : 0;
+		const bool     nr_jitter_cut_ok= (nst != nullptr) ? nst->jitter_cut_ok.load(std::memory_order_relaxed) : false;
 
 		// The RT census keeps its own frame counter and its own reporting interval, and takes its
 		// own two mutexes - never g.mutex - so it cannot deadlock against nr_try_run. Strict
@@ -4575,6 +4640,15 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 		// sub-object that is not a PS or a CS, so a DXIL ray tracing library can never reach it
 		// and dxil=0 has never meant "no ray tracing". The rt= field says which it is, so the
 		// number can no longer be misread.
+		// Camera cuts: `cuts` climbing at scene transitions is the success signature. `ok=0` means
+		// the jitter row never validated, so cut detection is simply unavailable this run and the
+		// behaviour is exactly what it was before it existed.
+		if (nst != nullptr)
+			LOGI("--- DLSS-NR camera cuts @ frame %llu: cuts=%llu detector=%s",
+			     (unsigned long long)g.frame, (unsigned long long)nr_camera_cuts,
+			     nr_jitter_cut_ok ? "LIVE (View.TemporalAAJitter.zw==.xy)"
+			                      : "UNAVAILABLE (jitter row did not validate)");
+
 		LOGI("--- probe census @ frame %llu: shaders=%llu (not_dxbc=%llu dxil=%llu, PS/CS ONLY - "
 		     "says NOTHING about DXR) | census fail=%llu pass=%llu | vel_const fail=%llu pass=%llu | "
 		     "loops_rej=%llu conf_rej=%llu | PASSED_ALL=%llu | srv_dumps=%u/%u | rt=%s",
