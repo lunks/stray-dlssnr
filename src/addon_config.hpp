@@ -754,6 +754,27 @@ struct config
 	// same as r16g16b16a16_float). The colour binding is the remaining difference.
 	uint32_t codec_bind_proxy = 1;
 
+	// THE POPULATED REGION OF DLSSNR.Output, in texels. 0 = "the network filled the surface",
+	// which is the historical behaviour and an exact no-op in the decode.
+	//
+	// renodx's DLSS 5 add-on carries this note about the snippet build we load:
+	//
+	//   "DLSSNR 310.8 writes the neural answer at its active network resolution even when the
+	//    Output resource is larger (the signed runtime reports success but leaves the remainder
+	//    untouched). Sample that populated region explicitly."
+	//
+	// If that holds here, reading the output one-to-one blends UNWRITTEN memory over most of the
+	// frame: the additive graft then subtracts the proxy against zeros (the measured ~19%
+	// darkening, 36.02 untouched -> 29.3 written back) and every tuning control reads as inert
+	// because most of what is sampled is not the network's answer. Measured on hardware:
+	// local_structure 0.0 vs 1.0 and use_auto_mask 0 vs 1 move the frame 0.54 in total, against a
+	// ~0.5 noise floor.
+	//
+	// LEFT AT 0 UNTIL MEASURED. nr_probe now reports the written region's bounds; set these to what
+	// it reports rather than guessing, because a wrong value silently resamples the whole image.
+	uint32_t neural_populated_w = 0;
+	uint32_t neural_populated_h = 0;
+
 	// =======================================================================================
 	// DLSS SUPER RESOLUTION (NGX feature 1, nvngx_dlss.dll). See STAGING-sr.md.
 	// =======================================================================================
@@ -1147,6 +1168,8 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "neural_format")            c.neural_format = static_cast<uint32_t>(parse_u64(v, c.neural_format));
 		else if (key == "nr_probe_selftest")        c.nr_probe_selftest = static_cast<uint32_t>(parse_u64(v, c.nr_probe_selftest));
 		else if (key == "codec_bind_proxy")         c.codec_bind_proxy = static_cast<uint32_t>(parse_u64(v, c.codec_bind_proxy));
+		else if (key == "neural_populated_w")       c.neural_populated_w = static_cast<uint32_t>(parse_u64(v, c.neural_populated_w));
+		else if (key == "neural_populated_h")       c.neural_populated_h = static_cast<uint32_t>(parse_u64(v, c.neural_populated_h));
 		else if (key == "app_id")                   c.app_id = parse_u64(v, c.app_id);
 		else if (key == "dlss_sr")                  c.dlss_sr = parse_bool(v, c.dlss_sr);
 		else if (key == "dlss_nr")                  c.dlss_nr = parse_bool(v, c.dlss_nr);

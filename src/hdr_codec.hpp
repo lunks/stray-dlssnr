@@ -350,8 +350,10 @@ cbuffer NrDecodeArgs : register(b0)
 	// g_decodePad0, so the root-constant COUNT and the root signature are unchanged - this is a
 	// tier-0 live knob, not a pipeline rebuild.
 	uint  g_hdrGraft;
-	float g_decodePad1;
-	float g_decodePad2;
+	// THE POPULATED REGION OF InNeural, in texels. 0 (or equal to g_width/g_height) means "the
+	// network filled the whole surface", which is the historical behaviour and an exact no-op.
+	uint  g_neuralW;
+	uint  g_neuralH;
 };
 
 // Note: the destination is R16G16B16A16_FLOAT or R11G11B10_FLOAT. Writing a value the format
@@ -361,6 +363,36 @@ static const float kNrMaxHalf = 65504.0f;
 static const float kNrMinChromaLuminance = 0.001f;
 
 // color.slangh's calcBt709Luminance, inlined by hand.
+// WHERE TO READ THE NETWORK'S ANSWER.
+//
+// renodx's DLSS 5 add-on carries this note about the snippet build this add-on loads:
+//
+//   "DLSSNR 310.8 writes the neural answer at its active network resolution even when the
+//    Output resource is larger (the signed runtime reports success but leaves the remainder
+//    untouched). Sample that populated region explicitly."
+//
+// Reading DLSSNR.Output one-to-one across the full extent therefore blends UNWRITTEN memory
+// wherever the network wrote nothing - which subtracts the proxy against zeros in the additive
+// graft and darkens the frame, and makes every tuning control look inert because most of what is
+// read is not the network's answer at all.
+//
+// IDENTITY IS PRESERVED. With g_neuralW/H unset, or equal to the output extent, this returns
+// int2(threadId) exactly and the decode is bit-for-bit what it was. That is the default, so the
+// shipped behaviour does not change until the populated region is actually measured and supplied.
+int2 nrNeuralCoord(uint2 threadId)
+{
+	if (g_neuralW == 0u || g_neuralH == 0u ||
+	    (g_neuralW == g_width && g_neuralH == g_height))
+		return int2(threadId);
+
+	// Same scene location, lower sampling grid: map the output texel's centre into the populated
+	// region, so the residual still pairs neural and proxy at the same point in the image.
+	const float2 uv  = (float2(threadId) + 0.5f) / float2(g_width, g_height);
+	const float2 pos = uv * float2(g_neuralW, g_neuralH);
+	return int2(clamp(pos, float2(0.0f, 0.0f),
+	                  float2(float(g_neuralW) - 1.0f, float(g_neuralH) - 1.0f)));
+}
+
 float nrBt709Luminance(float3 linearColor)
 {
 	return dot(linearColor, float3(0.2126f, 0.7152f, 0.0722f));
@@ -588,7 +620,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 	// Both read back out of the FP16 surfaces, through the SAME decode. That is what makes the
 	// identity bit-exact; see the header comment.
 	const float3 proxy  = nrSrgbDecode(InProxy.Load(int3(int2(threadId), 0)).rgb);
-	const float3 neural = nrSrgbDecode(InNeural.Load(int3(int2(threadId), 0)).rgb);
+	const float3 neural = nrSrgbDecode(InNeural.Load(int3(nrNeuralCoord(threadId), 0)).rgb);
 
 	// (*) the scene-linear change the network asked for. Exactly +0.0 when it asked for none.
 	const float3 neuralDelta = (neural - proxy) / scale;
@@ -843,8 +875,12 @@ struct decode_args
 	// the root signature, the pipeline layout and the PSO are all untouched - which is what makes
 	// this knob live at tier 0 instead of a feature recreate.
 	uint32_t graft_mode = 0;
-	uint32_t pad1 = 0;
-	uint32_t pad2 = 0;
+	// The populated region of DLSSNR.Output, in texels. 0 = "the network filled the surface",
+	// which is the historical behaviour and an exact no-op in the shader. REPLACES pad1/pad2, so
+	// the constant COUNT is unchanged and the root signature, pipeline layout and PSO are all
+	// untouched - the same tier-0 trick graft_mode used.
+	uint32_t neural_w = 0;
+	uint32_t neural_h = 0;
 };
 static_assert(sizeof(decode_args) == 32, "decode_args must be exactly 8 root constants");
 

@@ -3872,7 +3872,11 @@ static void nr_codec_decode(command_list *cmd, nr_state &st, resource_view origi
 	// all, the mode is in effect. Threaded through the extraction rather than read from
 	// g_cfg here, because the chain path calls this with the same value the encode used.
 	da.graft_mode        = graft_mode;
-	da.pad1 = da.pad2 = 0;
+	// The populated region of DLSSNR.Output. 0/0 is the historical behaviour and an exact no-op
+	// in the shader; anything else makes the decode read the network's answer from the region it
+	// actually wrote. See addon_config.hpp for why this exists.
+	da.neural_w = g_cfg.neural_populated_w;
+	da.neural_h = g_cfg.neural_populated_h;
 	cmd->push_constants(shader_stage::compute, st.codec.decode_layout, hdr_codec::kParamConstants,
 	                    0, hdr_codec::kDecodeConstantCount, &da);
 
