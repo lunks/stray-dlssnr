@@ -52,8 +52,8 @@
 //                              between them "a correctness failure, not a tuning difference".
 //      transfer/color_strength read up to 3x each in their clamp expressions, :2647-2650.
 //      mvec_scale_x/y          read twice each, :2805-2808 (a !=0.0f test, then the value).
-//      copy_back               SIX sites in one pass: :1663 :2499 :2636 :3050 :3069 :3127.
-//      history_restore         :1663 :2499 :2636 :3093 :3127.
+//      copy_back               SIX sites in one pass: :1663 :2499 :2636 :2882 :3050 :3069.
+//      history_restore         SIX as well: :1663 :2499 :2636 :2883 :3093 :3127.
 //
 //    Be precise about WHY rather than overclaiming: on x86-64 an aligned 4-byte load is atomic in
 //    hardware, so a physically torn float is not reachable. The two real problems are (i) a
@@ -126,7 +126,7 @@
 //                       string table (measured: 0 exact matches in nvngx_dlssnr.dll, while
 //                       DLSSNR.UICorrection / .Style / .Intensity / .ScalingRatio each return 1),
 //                       and ScalingRatio is dead - ngx_interop.hpp:180-183 and
-//                       stray_dlssnr.cpp:1902-1903 both record that three sites read it and then
+//                       stray_dlssnr.cpp:1910-1911 both record that three sites read it and then
 //                       unconditionally store 1.0f over the result. This add-on does not upscale.
 //   NR Preset           SHOWN, DISABLED. It maps to DLSSNR.Hint.Render.Preset, which is written
 //                       at CreateFeature (:1909), and :1907-1908 records that only preset 1
@@ -625,7 +625,7 @@ inline bool live_history_restore() { return live().history_restore.load(std::mem
 //
 // NOT ReShade's config API, for four reasons, the first two of which are already written down in
 // this tree:
-//   1. reshade.hpp:198-199 - set_config_value "Sets AND SAVES". That is one ReShade.ini write per
+//   1. reshade.hpp:202 - set_config_value "Sets AND SAVES". That is one ReShade.ini write per
 //      frame of a slider drag.
 //   2. addon_config.hpp:3-5 already argues the case: ReShade's get_config_value keys off
 //      ReShade.ini, "which the user is also editing for effects, and a missing key there silently
@@ -640,7 +640,7 @@ inline bool live_history_restore() { return live().history_restore.load(std::mem
 //     documentation the user actually reads; a naive regenerate destroys it. Every comment, every
 //     unrecognised line, every blank line and the original key order and spelling survive.
 //   * TEMP FILE + MoveFileExW(REPLACE_EXISTING). A half-written ini is worse than none: per
-//     addon_config.hpp:219-223 every key after the cut silently takes its built-in default.
+//     addon_config.hpp:226-230 every key after the cut silently takes its built-in default.
 //   * NEVER round-trip a key the UI does not own. shader_hash, srv_*, uav_output, app_id,
 //     require_trampoline, populate_parameters, enabled, diagnostics and hdr_codec are read-only
 //     here and are not touched by the writer - clobbering a hand-measured identification pin is
