@@ -216,17 +216,17 @@ jobs:
         continue-on-error: true
         run: |
           cl /nologo /c /std:c++17 /EHsc /O2 /MT abi\imvec_callee.cpp /Fo:callee.obj | Out-Null
-          Write-Host "--- MSVC callee: cb_ret_vec2 ---"
-          $d = (dumpbin /disasm /nologo callee.obj) -join "`n"
-          $m = [regex]::Match($d, '(?ms)^cb_ret_vec2:.*?(?=^\S.*?:\s*$|\z)')
-          if ($m.Success) { Write-Host $m.Value } else { Write-Host "(not found)" }
+          Write-Host "--- MSVC callee: cb_ret_vec2 (expect: writes through RCX, returns RCX) ---"
+          dumpbin /disasm /nologo callee.obj |
+            Select-String -Pattern '^cb_ret_vec2:' -Context 0,10 |
+            ForEach-Object { $_.Line; $_.Context.PostContext }
 
           $env:PATH = "C:\mingw64\bin;$env:PATH"
           g++ -std=gnu++17 -O2 -c abi/imvec_caller.cpp -o caller_mingw.o
-          Write-Host "--- mingw caller: local_ret_vec2 (same signature, compiled by g++) ---"
-          $o = (objdump -d --demangle caller_mingw.o) -join "`n"
-          $m2 = [regex]::Match($o, '(?ms)^[0-9a-f]+ <.*?local_ret_vec2.*?>:.*?(?=^\s*$)')
-          if ($m2.Success) { Write-Host $m2.Value } else { Write-Host "(not found)" }
+          Write-Host "--- mingw callee: local_ret_vec2, same signature (expect: packs into RAX) ---"
+          objdump -d --demangle caller_mingw.o |
+            Select-String -Pattern 'local_ret_vec2\(\)>:' -Context 0,6 |
+            ForEach-Object { $_.Line; $_.Context.PostContext }
 
       # The control. If this fails the harness itself is broken and nothing else means anything.
       - name: Run MSVC caller (control - must pass)
@@ -275,3 +275,70 @@ jobs:
           } else {
             Write-Host "::warning::mingw and MSVC DISAGREE on the ImVec2 return convention. The 15 by-value-returning entries of imgui_function_table_19250 are OFF LIMITS to the add-on while the shipping binary is a mingw build."
           }
+
+      # -----------------------------------------------------------------------------------------
+      # The whitelist itself, compiled AND LINKED under both toolchains.
+      #
+      # Linking is the point. reshade_overlay.hpp supplies inline definitions only for entries that
+      # exist in imgui_function_table_19250, while imgui.h declares hundreds more, so calling
+      # something the table does not carry compiles cleanly and dies at link time with an undefined
+      # reference. Building this as a DLL is what turns that into a CI failure.
+      #
+      # It also proves include/imgui.h is the right version: reshade_overlay.hpp is wrapped in
+      # `#if defined(IMGUI_VERSION_NUM)` and #errors unless it is exactly 19250.
+      # -----------------------------------------------------------------------------------------
+      - name: Whitelist compiles and links (MSVC)
+        shell: cmd
+        run: |
+          cl /nologo /std:c++17 /EHsc /O2 /MT /W3 /LD ^
+             /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+             /I include ^
+             abi\overlay_calls_probe.cpp /Fe:overlay_probe_msvc.dll
+          if errorlevel 1 exit /b 1
+
+      - name: Whitelist compiles and links (mingw-w64)
+        shell: bash
+        run: |
+          export PATH="/c/mingw64/bin:$PATH"
+          g++ -std=gnu++17 -O2 -shared -static -static-libgcc -static-libstdc++ \
+              -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -DNOMINMAX -DNDEBUG \
+              -Wall -Wextra -Wno-attributes -Wno-unknown-pragmas -Wno-unused-parameter \
+              -I include \
+              abi/overlay_calls_probe.cpp -o overlay_probe_mingw.dll
+
+      # -----------------------------------------------------------------------------------------
+      # The gate that actually protects the shipped binary. The probe above proves WHICH calls are
+      # unsafe; this proves the add-on does not make them. Fourteen table entries return ImVec2 by
+      # value and are unusable from a mingw build. ColorConvertU32ToFloat4 is deliberately NOT on
+      # this list: it returns ImVec4, which is 16 bytes, and the probe shows both toolchains return
+      # it in memory. Delete this step only when the mingw job is deleted.
+      # -----------------------------------------------------------------------------------------
+      - name: No add-on source may call a by-value-ImVec2-returning ImGui entry point
+        shell: pwsh
+        run: |
+          $forbidden = @(
+            'GetWindowPos','GetWindowSize','GetFontTexUvWhitePixel','GetCursorScreenPos',
+            'GetContentRegionAvail','GetCursorPos','GetCursorStartPos','GetItemRectMin',
+            'GetItemRectMax','GetItemRectSize','CalcTextSize','GetMousePos',
+            'GetMousePosOnOpeningCurrentPopup','GetMouseDragDelta'
+          )
+          $files = Get-ChildItem -Recurse -Include *.cpp,*.hpp -Path src | Where-Object { $_.Name -ne 'reshade_compat.hpp' }
+          $hits = @()
+          foreach ($f in $files) {
+            $n = 0
+            foreach ($line in Get-Content $f.FullName) {
+              $n++
+              if ($line -match '^\s*//') { continue }
+              foreach ($fn in $forbidden) {
+                if ($line -match ("ImGui::" + $fn + "\s*\(")) {
+                  $hits += "$($f.FullName):${n}: ImGui::$fn"
+                }
+              }
+            }
+          }
+          if ($hits.Count) {
+            Write-Host "::error::An add-on source calls an ImGui entry point that returns ImVec2 BY VALUE. Under mingw that is a wild 8-byte store into ReShade's caller frame - measured as an ACCESS_VIOLATION by the abi job. Use the out-parameter form or drop the call."
+            $hits | ForEach-Object { Write-Host "  $_" }
+            throw "forbidden ImGui call(s) present"
+          }
+          Write-Host "  OK  no add-on source calls a by-value-ImVec2-returning ImGui entry point"
