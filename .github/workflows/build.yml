@@ -313,7 +313,10 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             throw "include_order_negative.cpp COMPILED. The include-order guard in src/overlay_imgui.hpp is not firing, so a future edit could include reshade_compat.hpp first and silently lose namespace ImGui."
           }
+          # cl left a non-zero $LASTEXITCODE behind, which is the outcome we WANT. A pwsh step
+          # inherits it and would fail, so retire it explicitly.
           Write-Host "  OK  guard fired, wrong include order rejected"
+          exit 0
 
       - name: Wrong include order must not compile (mingw-w64)
         shell: bash
