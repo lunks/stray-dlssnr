@@ -559,11 +559,9 @@ every source level:
   network's answer and locks the hue to *that*; where the proxy clipped, the network's answer is
   neutral white, so a saturated highlight is pulled toward the white point. `[6.0, 5.2, 3.0]` comes
   back as `[6.0, 5.2, 3.0]` in mode 0 and as roughly `[5.21, 5.21, 5.21]` in mode 1. Over 60,000
-  random pixels at `color_strength = 1` the two differ by up to **84 % of the pixel's magnitude** —
-the worst case is a source of `[0.68, 0.95, 11.16]`, which mode 0 returns as `[0.60, 0.87, 11.04]`
-and mode 1 returns as `[1.17, 1.64, 1.73]`: a deep blue highlight, flattened. (The worst case moved
-from the one quoted here before because selftest section 5 was restructured and draws a different
-part of the sequence; the *magnitude* of the divergence did not.)
+  random pixels at `color_strength = 1` the two differ by up to **83 % of the pixel's magnitude** — the
+worst case is `[10.04, 10.12, 0.94]`, which mode 0 leaves essentially alone and mode 1 returns as
+`[9.45, 9.45, 9.45]`.
 
 **So `hdr_graft = 1` is a colour experiment, not a highlight-recovery fix.** It is a defensible,
 different aesthetic — *trust the network's colour* — and STRAY's neon signage is exactly where you
@@ -633,8 +631,9 @@ c++ -std=c++17 -O2 -Wall -o /tmp/hdr_codec_selftest tools/hdr_codec_selftest.cpp
 below: it calls the real `full_source_decode()` and proves the graft-free variant differs by
 exactly one byte, that both `#define` markers are where the code thinks they are, and that every
 graft symbol (`float3x3`, `nrRdxToOkLab`, …) has all of its code uses **inside** the `#if` — so
-the preprocessor really removes them and the retry is not theatre. It needs `<d3dcompiler.h>`, so
-it runs on the Windows toolchains only; CI runs it under both MSVC and mingw.
+the preprocessor really removes them and the retry is not theatre. **23 assertions, all passing.**
+It needs `<d3dcompiler.h>`, so it runs on the Windows toolchains only; CI runs it under both MSVC
+and mingw, which agree to the digit.
 
 **37 assertions, all passing:**
 
@@ -649,10 +648,10 @@ it runs on the Windows toolchains only; CI runs it under both MSVC and mingw.
 | headroom term ≡ additive residual | worst relative difference `3.82e-07` over 150,250 else-branch samples |
 | their asymmetric branch | fires 49,750 / 200,000 times on FP16 data — real, not an edge case |
 | mode 1 at `transfer_strength = 0` | exact at `paper_white_scale` 1.0 / 2.0 / 0.5; **7144**, **4365**, **7076** of 20,000 non-exact at 1.5 / 2.2 / 0.75, worst `1.08e-07` relative. Mode 0: **0/20,000 at every one** |
-| divergence, `color_strength = 0`, ordinary pixels | **0.8** of an 8-bit code value over 60,000 pixels — they *do* agree here |
+| divergence, `color_strength = 0`, ordinary pixels | **0.7** of an 8-bit code value over 60,000 pixels — they *do* agree here |
 | divergence, `color_strength = 0`, **shadows** | **27.6** code values over 400,000 dark chromatic pixels, **42.5 %** of them ≥ 2 |
 | …and its cause | mode 0 with its chroma valve forced open vs mode 1, same 400,000 pixels: **0.0** code values |
-| divergence, `color_strength = 1` | **84 %** of the pixel's magnitude (135 code values) |
+| divergence, `color_strength = 1` | **83 %** of the pixel's magnitude (140 code values) |
 | the transfer's ceiling | `fp16(SrgbEncode(SoftClip(v))) == 1.0` at `v ≥ 1.8088`; `SoftClip(v) == 1.0f` in FP32 at `v ≥ 3.4740`; the ×-paper-white ceiling is invariant across `paper_white_scale` 1.0 / 2.0 / 4.0 |
 
 CI runs the same replay under **both** MSVC and mingw — and the two agree to the printed digit on
