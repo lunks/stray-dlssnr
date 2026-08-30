@@ -619,111 +619,169 @@ inline std::string narrow(const std::wstring &w)
 	return out;
 }
 
-// Loads nvngx_dlssnr.dll from the given directory and resolves the D3D12 surface through
+// ------------------------------------------------------------------------------------------
+// WHICH SNIPPET, AND THROUGH WHICH TRAMPOLINE SLOT.
+//
+// There are now two snippets in play and they must not be crossed:
+//
+//   DLSS-NR   nvngx_dlssnr.dll, NGX feature 18, ships today, the user plays on it.
+//   DLSS-SR   nvngx_dlss.dll,   NGX feature 1.
+//
+// The caller gate is a property of the MODULE a call is ISSUED from, so both go through
+// remix_nvngx.dll - but that module holds ONE set of forwarding pointers per slot, and calling
+// RemixNgxTrampoline_SetSnippet twice would silently re-point DLSS-NR's own calls at the SR
+// snippet. So the trampoline has two independent slots and each snippet claims one:
+//
+//   slot A   RemixNgxTrampoline_SetSnippet    exports NVSDK_NGX_D3D12_*      (DLSS-NR)
+//   slot B   RemixNgxTrampoline_SetSnippetB   exports NVSDK_NGX_D3D12_B_*    (DLSS-SR)
+//
+// The SNIPPET side of the resolve always uses the real "NVSDK_NGX_D3D12_" names - the prefix is a
+// property of the TRAMPOLINE's exports only.
+struct snippet_spec
+{
+    const wchar_t *dll_name           = L"nvngx_dlssnr.dll";
+    const char    *set_snippet_export = "RemixNgxTrampoline_SetSnippet";
+    const char    *trampoline_prefix  = "NVSDK_NGX_D3D12_";
+    // Names the feature in every diagnostic this loader emits, so the two never read alike.
+    const char    *label              = "DLSS-NR";
+};
+
+inline snippet_spec spec_dlssnr()
+{
+    return snippet_spec{};
+}
+
+inline snippet_spec spec_dlsssr()
+{
+    snippet_spec s;
+    s.dll_name           = L"nvngx_dlss.dll";
+    s.set_snippet_export = "RemixNgxTrampoline_SetSnippetB";
+    s.trampoline_prefix  = "NVSDK_NGX_D3D12_B_";
+    s.label              = "DLSS-SR";
+    return s;
+}
+
+// Loads the named snippet from the given directory and resolves the D3D12 surface through
 // remix_nvngx.dll. Returns false with 'not_available_reason' filled in; the caller must treat
 // that as FEATURE ABSENT, never as an error - a stock install has no snippet and must run
 // completely untouched.
-inline bool load_snippet(snippet &s, const std::wstring &directory, bool require_trampoline)
+inline bool load_snippet(snippet &s, const std::wstring &directory, const snippet_spec &spec,
+                         bool require_trampoline)
 {
-	s.directory = directory;
+    s.directory = directory;
 
-	if (directory.empty())
-	{
-		s.not_available_reason = "unable to determine the add-on's own module directory";
-		return false;
-	}
+    if (directory.empty())
+    {
+        s.not_available_reason = "unable to determine the add-on's own module directory";
+        return false;
+    }
 
-	const std::wstring snippet_path = directory + L"nvngx_dlssnr.dll";
-	s.snippet_module = LoadLibraryW(snippet_path.c_str());
-	if (s.snippet_module == nullptr)
-	{
-		s.not_available_reason = "nvngx_dlssnr.dll was not found next to the add-on (" +
-			narrow(directory) + "). This is the expected state for a stock install.";
-		return false;
-	}
+    const std::string dll_name_utf8 = narrow(std::wstring(spec.dll_name));
 
-	// Probe the SNIPPET'S OWN export table, not whatever module the calls end up going through.
-	// The trampoline exports these names unconditionally, so resolving through it would report a
-	// truncated or Vulkan-only nvngx_dlssnr.dll as perfectly fine.
-	static const char *const kRequired[] = {
-		"NVSDK_NGX_D3D12_Init_Ext",
-		"NVSDK_NGX_D3D12_Shutdown1",
-		"NVSDK_NGX_D3D12_CreateFeature",
-		"NVSDK_NGX_D3D12_ReleaseFeature",
-		"NVSDK_NGX_D3D12_EvaluateFeature",
-	};
-	for (const char *name : kRequired)
-	{
-		if (GetProcAddress(s.snippet_module, name) == nullptr)
-		{
-			s.not_available_reason = std::string("nvngx_dlssnr.dll does not export ") + name +
-				". This build of the snippet has no D3D12 backend.";
-			s.unload();
-			return false;
-		}
-	}
+    const std::wstring snippet_path = directory + spec.dll_name;
+    s.snippet_module = LoadLibraryW(snippet_path.c_str());
+    if (s.snippet_module == nullptr)
+    {
+        s.not_available_reason = dll_name_utf8 + " was not found next to the add-on (" +
+            narrow(directory) + "). This is the expected state for a stock install.";
+        return false;
+    }
 
-	const std::wstring trampoline_path = directory + L"remix_nvngx.dll";
-	s.trampoline_module = LoadLibraryW(trampoline_path.c_str());
+    // Probe the SNIPPET'S OWN export table, not whatever module the calls end up going through.
+    // The trampoline exports these names unconditionally, so resolving through it would report a
+    // truncated or Vulkan-only snippet as perfectly fine.
+    static const char *const kRequired[] = {
+        "NVSDK_NGX_D3D12_Init_Ext",
+        "NVSDK_NGX_D3D12_Shutdown1",
+        "NVSDK_NGX_D3D12_CreateFeature",
+        "NVSDK_NGX_D3D12_ReleaseFeature",
+        "NVSDK_NGX_D3D12_EvaluateFeature",
+    };
+    for (const char *name : kRequired)
+    {
+        if (GetProcAddress(s.snippet_module, name) == nullptr)
+        {
+            s.not_available_reason = dll_name_utf8 + std::string(" does not export ") + name +
+                ". This build of the snippet has no D3D12 backend.";
+            s.unload();
+            return false;
+        }
+    }
 
-	HMODULE call_module = s.snippet_module;
-	if (s.trampoline_module != nullptr)
-	{
-		const auto set_snippet = reinterpret_cast<PFN_SetSnippet>(
-			GetProcAddress(s.trampoline_module, "RemixNgxTrampoline_SetSnippet"));
-		if (set_snippet != nullptr)
-		{
-			set_snippet(s.snippet_module);
-			call_module = s.trampoline_module;
-		}
-		else
-		{
-			FreeLibrary(s.trampoline_module);
-			s.trampoline_module = nullptr;
-		}
-	}
+    const std::wstring trampoline_path = directory + L"remix_nvngx.dll";
+    s.trampoline_module = LoadLibraryW(trampoline_path.c_str());
 
-	if (call_module == s.snippet_module && require_trampoline)
-	{
-		s.not_available_reason =
-			"remix_nvngx.dll is missing or does not export RemixNgxTrampoline_SetSnippet. It is "
-			"REQUIRED: every gated snippet export resolves its caller's module from the return "
-			"address and rejects anything whose path does not contain \"nvngx.dll\" with "
-			"0xbad00002, and Init_Ext and CreateFeature are both gated. A resolve-time probe "
-			"cannot detect this, because GetProcAddress succeeds and only the calls fail. Ship "
-			"remix_nvngx.dll next to the add-on, or set require_trampoline=0 to try anyway.";
-		s.unload();
-		return false;
-	}
+    HMODULE call_module = s.snippet_module;
+    bool    slot_missing = false;
+    if (s.trampoline_module != nullptr)
+    {
+        const auto set_snippet = reinterpret_cast<PFN_SetSnippet>(
+            GetProcAddress(s.trampoline_module, spec.set_snippet_export));
+        if (set_snippet != nullptr)
+        {
+            set_snippet(s.snippet_module);
+            call_module = s.trampoline_module;
+        }
+        else
+        {
+            // The trampoline is present but does not carry THIS slot. That is an OUT-OF-DATE
+            // remix_nvngx.dll, not a missing one, and saying so is the difference between a
+            // 30-second fix and an afternoon: slot B was added when DLSS-SR was, so a trampoline
+            // built before that has slot A only and DLSS-NR keeps working while DLSS-SR cannot.
+            slot_missing = true;
+            // Do NOT FreeLibrary here: slot A may already be live in this same module.
+            s.trampoline_module = nullptr;
+        }
+    }
 
-	const auto resolve = [&](const char *name) -> FARPROC {
-		FARPROC a = GetProcAddress(call_module, name);
-		if (a == nullptr && call_module != s.snippet_module)
-			a = GetProcAddress(s.snippet_module, name);
-		return a;
-	};
+    if (call_module == s.snippet_module && require_trampoline)
+    {
+        s.not_available_reason = slot_missing
+            ? (std::string("remix_nvngx.dll is present but does not export ") + spec.set_snippet_export +
+               ", so it is an OUT-OF-DATE trampoline. Rebuild and redeploy remix_nvngx.dll from this "
+               "tree - the second snippet slot was added alongside " + spec.label + ", and a "
+               "trampoline built before that carries slot A (DLSS-NR) only. DLSS-NR is unaffected.")
+            : (std::string("remix_nvngx.dll is missing or does not export ") + spec.set_snippet_export +
+               ". It is REQUIRED: every gated snippet export resolves its caller's module from the "
+               "return address and rejects anything whose path does not contain \"nvngx.dll\" with "
+               "0xbad00002, and Init_Ext and CreateFeature are both gated. A resolve-time probe "
+               "cannot detect this, because GetProcAddress succeeds and only the calls fail. Ship "
+               "remix_nvngx.dll next to the add-on, or set require_trampoline=0 to try anyway.");
+        s.unload();
+        return false;
+    }
 
-	s.init_ext         = reinterpret_cast<PFN_Init_Ext>        (resolve("NVSDK_NGX_D3D12_Init_Ext"));
-	s.shutdown1        = reinterpret_cast<PFN_Shutdown1>       (resolve("NVSDK_NGX_D3D12_Shutdown1"));
-	s.create_feature   = reinterpret_cast<PFN_CreateFeature>   (resolve("NVSDK_NGX_D3D12_CreateFeature"));
-	s.release_feature  = reinterpret_cast<PFN_ReleaseFeature>  (resolve("NVSDK_NGX_D3D12_ReleaseFeature"));
-	s.evaluate_feature = reinterpret_cast<PFN_EvaluateFeature> (resolve("NVSDK_NGX_D3D12_EvaluateFeature"));
+    // The trampoline's export name carries the slot prefix; the snippet's never does.
+    const auto resolve = [&](const char *base) -> FARPROC {
+        FARPROC a = nullptr;
+        if (call_module != s.snippet_module)
+            a = GetProcAddress(call_module, (std::string(spec.trampoline_prefix) + base).c_str());
+        if (a == nullptr)
+            a = GetProcAddress(s.snippet_module, (std::string("NVSDK_NGX_D3D12_") + base).c_str());
+        return a;
+    };
 
-	// Only claimed when the SNIPPET has it: the trampoline exports the name whether or not it
-	// could forward it.
-	if (GetProcAddress(s.snippet_module, "NVSDK_NGX_D3D12_PopulateParameters_Impl") != nullptr)
-		s.populate_params = reinterpret_cast<PFN_PopulateParameters_Impl>(resolve("NVSDK_NGX_D3D12_PopulateParameters_Impl"));
+    s.init_ext         = reinterpret_cast<PFN_Init_Ext>        (resolve("Init_Ext"));
+    s.shutdown1        = reinterpret_cast<PFN_Shutdown1>       (resolve("Shutdown1"));
+    s.create_feature   = reinterpret_cast<PFN_CreateFeature>   (resolve("CreateFeature"));
+    s.release_feature  = reinterpret_cast<PFN_ReleaseFeature>  (resolve("ReleaseFeature"));
+    s.evaluate_feature = reinterpret_cast<PFN_EvaluateFeature> (resolve("EvaluateFeature"));
 
-	if (s.init_ext == nullptr || s.shutdown1 == nullptr || s.create_feature == nullptr ||
-	    s.release_feature == nullptr || s.evaluate_feature == nullptr)
-	{
-		s.not_available_reason = "the resolved module does not export the full NVSDK_NGX_D3D12_* surface";
-		s.unload();
-		return false;
-	}
+    // Only claimed when the SNIPPET has it: the trampoline exports the name whether or not it
+    // could forward it.
+    if (GetProcAddress(s.snippet_module, "NVSDK_NGX_D3D12_PopulateParameters_Impl") != nullptr)
+        s.populate_params = reinterpret_cast<PFN_PopulateParameters_Impl>(resolve("PopulateParameters_Impl"));
 
-	s.available = true;
-	return true;
+    if (s.init_ext == nullptr || s.shutdown1 == nullptr || s.create_feature == nullptr ||
+        s.release_feature == nullptr || s.evaluate_feature == nullptr)
+    {
+        s.not_available_reason = "the resolved module does not export the full NVSDK_NGX_D3D12_* surface";
+        s.unload();
+        return false;
+    }
+
+    s.available = true;
+    return true;
 }
 
 } // namespace ngx

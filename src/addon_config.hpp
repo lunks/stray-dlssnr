@@ -322,6 +322,198 @@ struct config
 	// snippet; this add-on binds no ControlMask, so the two never conflict here.
 	bool     use_auto_mask = true;
 
+	// =======================================================================================
+	// DLSS SUPER RESOLUTION (NGX feature 1, nvngx_dlss.dll). See STAGING-sr.md.
+	// =======================================================================================
+	//
+	// THE MASTER SWITCH, AND WHAT IT COSTS WHEN IT IS 0.
+	//
+	// dlss_sr = 0 is the shipping configuration and it is BIT-IDENTICAL to the build before SR
+	// existed. Exactly this much executes:
+	//   * this key is parsed, and one bool is stored;
+	//   * nr_init_device tests it once and does NOT LoadLibraryW nvngx_dlss.dll;
+	//   * nr_lazy_ngx_init tests it once and does not call Init_Ext on the SR snippet, does not
+	//     allocate the SR parameter block, and does not touch remix_nvngx.dll's slot B - and on
+	//     the DLSS-NR FAILURE path it takes the same early exit it took before SR existed, so
+	//     the HDR-codec and mvec pipelines are not built there either;
+	//   * nr_try_run tests it once per accepted TAA dispatch, before anything else SR-related,
+	//     and takes the DLSS-NR branch unchanged;
+	//   * nr_pick_output_uav tests it once per accepted dispatch and applies the ORIGINAL
+	//     "extent must equal the colour SRV's" rule.
+	// No SR resource is created, no SR event is registered, no SR code runs on the GPU, and the
+	// trampoline's slot B stays entirely null. Five predictable-branch tests per frame is the
+	// whole cost.
+	bool     dlss_sr = false;
+
+	// The DLSS-NR path. 1 is today. Set to 0 alongside dlss_sr=1 to skip the 166 MB
+	// nvngx_dlssnr.dll load entirely when you are only running SR - SR does not need it, and the
+	// two features both want to own the same TAA dispatch.
+	//
+	// NOTE: when dlss_sr=1 the SR pass TAKES the accepted dispatch and the DLSS-NR evaluate does
+	// not run, whether or not the NR snippet is loaded. This key only controls whether the NR
+	// snippet is loaded and initialised at all.
+	bool     dlss_nr = true;
+
+	// ---- identification --------------------------------------------------------------------
+	// THE ONE-LINE HASH RE-PIN. Flipping r.TemporalAA.Upsampling changes TAA_PASS_CONFIG, and
+	// r.ScreenPercentage below 100 changes TAA_SCREEN_PERCENTAGE_RANGE; both are #defines, so the
+	// DXBC and therefore the fnv1a64 change. 0 means "use shader_hash" (the DLSS-NR value). Set
+	// this to the hash the probe reports for the MainUpsampling permutation and nothing else has
+	// to move - in particular DLSS-NR keeps its own pin, so the two can be A/B'd on one install.
+	uint64_t sr_shader_hash = 0;
+
+	// ---- geometry ---------------------------------------------------------------------------
+	// The OUTPUT extent. 0 = derive it from the dispatch's group counts, which is the only source
+	// that is correct by construction: TemporalAA.cpp:958 dispatches
+	// GetGroupCount(PracticableDestRect.Size(), GTemporalAATileSizeX) with tile size 8, and
+	// GetGroupCount is DivideAndRoundUp - so OutW is in (8*gx - 8, 8*gx]. In every configuration
+	// this add-on targets the output view rect IS the secondary resolution (3840x2160), which is a
+	// multiple of 8, so 8*gx is exact. Pin these if the log says the derived value and the chosen
+	// u0 candidate's texture extent disagree.
+	uint32_t sr_out_width  = 0;
+	uint32_t sr_out_height = 0;
+	// GTemporalAATileSizeX/Y. An engine compile-time constant (TemporalAA.cpp:16-17), here so a
+	// licensee edit is an ini change rather than a rebuild.
+	uint32_t sr_group_tile = 8;
+	// Feed DLSS the VIEW RECT recovered from ViewSizeAndInvSize rather than the colour texture's
+	// extent. They differ whenever QuantizeSceneBufferSize rounded up (it rounds to a multiple of
+	// 4), e.g. 1130 vs 1132 at r.ScreenPercentage=58.8. 0 uses the texture extent, which is a
+	// silent ~0.2% mis-scale at those percentages - it is here only as an A/B.
+	bool     sr_use_view_rect = true;
+
+	// ---- the bring-up ladder (STAGING-sr.md walks these in order) ---------------------------
+	// RUNG 6. Stop re-issuing the game's TAA dispatch. With this 0 the game's TAAU still runs and
+	// DLSS writes on top of it, which wastes one dispatch and is completely safe; with it 1 the
+	// dispatch is suppressed and DLSS is the only thing that writes the output. The flag that
+	// tells ReShade "already issued" is set LAST under suppression - after a successful evaluate
+	// AND after the state restore - so any bail or throw leaves it false and ReShade issues the
+	// game's own TAAU, which unconditionally writes every pixel of the output view rect
+	// (TemporalAA.usf:2268-2281). A failed frame is a correct frame with one wasted dispatch.
+	bool     sr_suppress_taa = false;
+
+	// RUNG 7. Bind the game's own TAA output UAV (u0) directly as DLSS's Output, instead of
+	// evaluating into an add-on texture and copying back. Removes a full-extent 4K copy per frame
+	// and both of its barriers. With this 0 the add-on owns the output texture, which is the safer
+	// bring-up shape: nothing the game reads is written until the copy-back.
+	bool     sr_direct_output = false;
+
+	// Write the add-on's SR output back over u0. Inert when sr_direct_output=1 (DLSS wrote u0
+	// itself). 0 is the rung-4 configuration: the whole path runs - create, jitter, decode,
+	// evaluate, state restore - into a texture NOTHING READS, so a frame that still renders
+	// correctly is positive evidence that the state restore is faithful, independent of image
+	// quality. Exactly the role copy_back plays on the DLSS-NR path.
+	bool     sr_copy_back = true;
+
+	// ---- motion vectors ----------------------------------------------------------------------
+	// Reuse mvec_decode.hpp's pass to build DLSS's MotionVectors input. The PIPELINE is shared
+	// with the DLSS-NR path; only the target texture is SR's own, and it is allocated at the
+	// RENDER extent rather than the output extent because SR's colour input is the TAA pass's
+	// INPUT. 0 binds the game's raw encoded velocity, which is README gap 2 unmitigated - for SR
+	// that is worse than for NR, because SR has no second temporal filter behind it.
+	bool     sr_mvec_decode = true;
+	// Reconstruct camera motion from depth through View.ClipToPrevClip wherever UE4 left the
+	// velocity texel invalid. THE SAME KEY mvec_reconstruct is on the DLSS-NR path, and it exists
+	// for the same reason: so that decode-only is only ever reached because someone ASKED for it.
+	// 0 writes EXACTLY ZERO motion for the whole static world, the sky and translucency, which is
+	// a bring-up A/B for isolating the decode from the reconstruction and is worse than
+	// sr_mvec_decode=0 for actual play. A ClipToPrevClip that cannot be located or validated
+	// falls back to the RAW buffer, not to this.
+	bool     sr_mvec_reconstruct = true;
+	// MV.Scale.X / MV.Scale.Y overrides. 0 = derive (exactly 1.0 with the decode on, because the
+	// decode already emits absolute pixels on the render grid; the extent ratio otherwise).
+	// A SINGLE key at -1 tests a per-axis sign error; BOTH at -1 together tests the direction
+	// convention, which no single-axis flip can reach.
+	float    sr_mv_scale_x = 0.0f;
+	float    sr_mv_scale_y = 0.0f;
+
+	// ---- jitter -------------------------------------------------------------------------------
+	// THE SIGN A/B, and it is the most likely bug in this feature. A flipped Y sign makes DLSS run,
+	// report success, and shimmer. The shipped value is the engine's own float with no arithmetic
+	// applied (ue4_jitter.hpp tier `full`), so 1.0/1.0 is the value with evidence behind it -
+	// these exist so the alternative can be tested without a rebuild.
+	float    sr_jitter_scale_x = 1.0f;
+	float    sr_jitter_scale_y = 1.0f;
+	// Accept ue4_jitter's WEAKEST tier (matrix pair only, extent from the caller) when
+	// TemporalAAParams does not validate. The number is still correct; it just has no second
+	// opinion. Off by default - a failure should be diagnosed, not downgraded.
+	bool     sr_jitter_projection_only = false;
+
+	// ---- DLSS.Feature.Create.Flags ------------------------------------------------------------
+	// Bit 0. IsHDR is NOT an exposure gate - it SELECTS A DIFFERENT TRAINED NETWORK, exactly like
+	// DepthInverted and MVLowRes, and the binary says so [SRC nvngx_dlss.dll sha256
+	// c85f971c..0b7e]:
+	//   * the engine ships PAIRED _hdr_/_ldr_ CUDA kernels for every other combination -
+	//     hiluma_engine_{input,output}_depth{inv,reg}_mv{lo,hi}_{hdr,ldr}_v{1,2}_rel and the
+	//     _max_v2_ variants (44 names at file offsets 0x12f9f8-0x1301b8), plus
+	//     cuda_engine_input_kernel_rel_{hdr,ldr}_{colvar,mvdiff}_mv{lo,hi} and
+	//     cuda_engine_output_kernel_rel_{hdr,ldr}_gauss{3x3,5x5} at 0x12f710-0x12f970.
+	//   * the loader registers each one under a descriptor word it stores at [rbp+0x38]
+	//     immediately before passing the name. For the INPUT set the four bytes are, LSB first,
+	//     {v2, IsHDR, MVLowRes, DepthInverted}: depthinv_mvlo_hdr_v2 = 0x01010101,
+	//     depthinv_mvlo_ldr_v2 = 0x01010001, depthreg_mvhi_ldr_v2 = 0x00000001
+	//     [SRC .text 0x18004f87d-0x18004fc2e]. The OUTPUT set spends the low two bytes on
+	//     {max, v2} and carries DepthInverted in the separate byte at [rbp+0x3c] - 1 for every
+	//     depthinv_ name, r12b (zeroed at 0x18004ee0b) for every depthreg_ one - leaving IsHDR
+	//     and MVLowRes as the high two bytes: depthinv_mvlo_hdr_v2 = 0x01010100,
+	//     depthinv_mvhi_hdr_v2 = 0x00010100 [SRC .text 0x18004fc64-0x18005082f].
+	//   * CreateDlssInstance logs the three together: "HDR %d / Motion Vectors LowRes %d /
+	//     Motion Vectors Jittered %d / Depth Inverted %d" [SRC 0x12dfe0-0x12e098].
+	// Two of those three discriminators are already set from STRAY's measured properties, so the
+	// third has to be too. SR binds ed.color = STRAY's t5 SceneColor: r16g16b16a16_float, linear,
+	// unbounded, upstream of bloom, eye adaptation and the film tone curve, with no codec in
+	// front of it. That is the HDR input, so this is 1. Clearing it would run the _ldr_ engine on
+	// out-of-distribution data: EvaluateFeature returns Success, no diagnostic fires anywhere,
+	// and the image comes back wrong in the same way README gap 1 documents.
+	// The key stays so LDR remains A/B-able. Setting it does NOT create an exposure obligation:
+	// with IsHDR set the snippet reads DLSS.Pre.Exposure and DLSS.Exposure.Scale, and this add-on
+	// writes neither - the snippet's own miss-default for both is 1.0f
+	// [SRC 0x18003ca9d / 0x18003cac4], and the <= 0 clamp at 0x18003cc51 is a second net under
+	// that. sr_auto_exposure (bit 6) is meaningful only for HDR input, so the two now agree.
+	bool     sr_hdr = true;
+	// Bit 1. Velocity lives at the render resolution, which under any real upscale is LOWER than
+	// the output - so this is set. At 1:1 (DLAA) it should be cleared.
+	bool     sr_mv_lowres = true;
+	// Bit 2. UE4's velocity buffer is not jitter-compensated. [ASSUMED]; never measured.
+	bool     sr_mv_jittered = false;
+	// Bit 3. UE 4.27 renders reversed-Z. Measured [HW] for STRAY, same value depth_inverted holds
+	// for the DLSS-NR path - kept as its own key so the two features can be A/B'd independently.
+	bool     sr_depth_inverted = true;
+	// Bit 6. Set by default because the alternative is owing DLSS an ExposureTexture or a
+	// calibrated DLSS.Pre.Exposure, and UE's pre-exposure is a real source of silent brightness
+	// error. Note the snippet accepts (AutoExposure clear, ExposureTexture NULL) silently.
+	bool     sr_auto_exposure = true;
+	// Bit 7. Off; nothing in this path needs alpha upscaling.
+	bool     sr_alpha_upscaling = false;
+
+	// DLSS.Use.HW.Depth. NOT a create flag - a separate CREATE-TIME parameter, and setting it at
+	// evaluate is a documented no-op. STRAY's t0 is an r32_g8_typeless hardware depth-stencil, so
+	// 1 is correct; the snippet's default is 0 = Linear and getting it wrong produces NO
+	// diagnostic. Set explicitly, always. Do not confuse it with sr_depth_inverted - one selects
+	// the content convention, the other the sign, and they are unrelated.
+	bool     sr_hw_depth = true;
+
+	// PerfQualityValue. 0 = MaxPerf, 1 = Balanced, 2 = MaxQuality, 3 = UltraPerformance,
+	// 4 = UltraQuality, 5 = DLAA. Recovered from the snippet's own name/value array. NOTE it does
+	// NOT choose the render preset - the snippet picks that slot from Width/OutWidth - and that an
+	// absent value defaults to 0, which is right for 1920->3840 and wrong for DLAA.
+	uint32_t sr_perf_quality = 0;
+	// DLSS.Hint.Render.Preset.* value, written into the ONE slot the ratio selects. 0 = auto.
+	uint32_t sr_render_preset = 0;
+
+	// ---- diagnostics -------------------------------------------------------------------------
+	// Call the snippet's PopulateParameters_Impl on a SCRATCH parameter block and run
+	// DLSS_GetOptimalSettings through the callback it installs, once, purely to LOG the
+	// recommendation. It has no power to make UE render at that resolution - the only lever is
+	// r.ScreenPercentage - so it is never on the critical path. A scratch block is mandatory:
+	// Width/Height/OutWidth/OutHeight have INVERTED meaning in that call.
+	//
+	// This is also where the two researchers disagreed: the task brief said the query cannot work
+	// because DLSSOptimalSettingsCallback is never populated in our own parameter map, and the
+	// disassembly says PopulateParameters_Impl writes it INTO WHATEVER BLOCK IT IS HANDED. The
+	// disassembly is the stronger evidence, so the query is implemented - but defaulted OFF and
+	// kept off every path that matters, which is what the design doc asks for regardless.
+	bool     sr_optimal_settings = false;
+
 	// ---- misc ----------------------------------------------------------------------------
 	// NGX application id. The snippet resolves its weights from its own embedded WEIGHTS_HT
 	// resource, so this only names the log file it writes beside the add-on.
@@ -467,6 +659,33 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		// ---- END overlay_ui hook ----
 		else if (key == "use_auto_mask")            c.use_auto_mask = parse_bool(v, c.use_auto_mask);
 		else if (key == "app_id")                   c.app_id = parse_u64(v, c.app_id);
+		else if (key == "dlss_sr")                  c.dlss_sr = parse_bool(v, c.dlss_sr);
+		else if (key == "dlss_nr")                  c.dlss_nr = parse_bool(v, c.dlss_nr);
+		else if (key == "sr_shader_hash")           c.sr_shader_hash = parse_u64(v, c.sr_shader_hash);
+		else if (key == "sr_out_width")             c.sr_out_width = static_cast<uint32_t>(parse_u64(v, c.sr_out_width));
+		else if (key == "sr_out_height")            c.sr_out_height = static_cast<uint32_t>(parse_u64(v, c.sr_out_height));
+		else if (key == "sr_group_tile")            c.sr_group_tile = static_cast<uint32_t>(parse_u64(v, c.sr_group_tile));
+		else if (key == "sr_use_view_rect")         c.sr_use_view_rect = parse_bool(v, c.sr_use_view_rect);
+		else if (key == "sr_suppress_taa")          c.sr_suppress_taa = parse_bool(v, c.sr_suppress_taa);
+		else if (key == "sr_direct_output")         c.sr_direct_output = parse_bool(v, c.sr_direct_output);
+		else if (key == "sr_copy_back")             c.sr_copy_back = parse_bool(v, c.sr_copy_back);
+		else if (key == "sr_mvec_decode")           c.sr_mvec_decode = parse_bool(v, c.sr_mvec_decode);
+		else if (key == "sr_mvec_reconstruct")      c.sr_mvec_reconstruct = parse_bool(v, c.sr_mvec_reconstruct);
+		else if (key == "sr_mv_scale_x")            c.sr_mv_scale_x = parse_float(v, c.sr_mv_scale_x);
+		else if (key == "sr_mv_scale_y")            c.sr_mv_scale_y = parse_float(v, c.sr_mv_scale_y);
+		else if (key == "sr_jitter_scale_x")        c.sr_jitter_scale_x = parse_float(v, c.sr_jitter_scale_x);
+		else if (key == "sr_jitter_scale_y")        c.sr_jitter_scale_y = parse_float(v, c.sr_jitter_scale_y);
+		else if (key == "sr_jitter_projection_only") c.sr_jitter_projection_only = parse_bool(v, c.sr_jitter_projection_only);
+		else if (key == "sr_hdr")                   c.sr_hdr = parse_bool(v, c.sr_hdr);
+		else if (key == "sr_mv_lowres")             c.sr_mv_lowres = parse_bool(v, c.sr_mv_lowres);
+		else if (key == "sr_mv_jittered")           c.sr_mv_jittered = parse_bool(v, c.sr_mv_jittered);
+		else if (key == "sr_depth_inverted")        c.sr_depth_inverted = parse_bool(v, c.sr_depth_inverted);
+		else if (key == "sr_auto_exposure")         c.sr_auto_exposure = parse_bool(v, c.sr_auto_exposure);
+		else if (key == "sr_alpha_upscaling")       c.sr_alpha_upscaling = parse_bool(v, c.sr_alpha_upscaling);
+		else if (key == "sr_hw_depth")              c.sr_hw_depth = parse_bool(v, c.sr_hw_depth);
+		else if (key == "sr_perf_quality")          c.sr_perf_quality = static_cast<uint32_t>(parse_u64(v, c.sr_perf_quality));
+		else if (key == "sr_render_preset")         c.sr_render_preset = static_cast<uint32_t>(parse_u64(v, c.sr_render_preset));
+		else if (key == "sr_optimal_settings")      c.sr_optimal_settings = parse_bool(v, c.sr_optimal_settings);
 		else                                        known = false;
 
 		char buf[700];

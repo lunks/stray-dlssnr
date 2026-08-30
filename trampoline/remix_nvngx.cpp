@@ -231,6 +231,162 @@ __declspec(dllexport) NgxResult __cdecl NVSDK_NGX_D3D12_DestroyParameters(void *
 
 } // extern "C"
 
+
+// =============================================================================================
+// SLOT B - a SECOND, INDEPENDENT snippet routed through this same module.
+//
+// WHY: the caller gate is a property of the MODULE the call is issued from, and this module's
+// filename is what satisfies it. But the forwarders above hold ONE set of function pointers, so
+// calling RemixNgxTrampoline_SetSnippet twice would silently re-point DLSS-NR's own calls at the
+// SR snippet - the shipping feature would break with no diagnostic whatsoever.
+//
+// So SR gets its own slot, its own pointers and its own exports. Slot A's pointers, exports and
+// generated code are UNTOUCHED, which is what makes "dlss_sr = 0 is bit-identical to today" true
+// on this side of the boundary as well: with SR off, RemixNgxTrampoline_SetSnippetB is never
+// called, every g_b_* stays null, and not one instruction below ever executes.
+//
+// The forwarders are byte-identical in shape to slot A's, INCLUDING the volatile counter store
+// after the call. Same rule, same reason: never `return g_b_xxx(...)`. A tail jump reuses the
+// caller's return address and puts the snippet's "am I being called from nvngx.dll" check straight
+// back on the ReShade add-on. build.sh and the MSVC CI job both disassemble these by name.
+// =============================================================================================
+
+namespace {
+
+PFN_Init_Ext                g_b_init_ext         = nullptr;
+PFN_Shutdown1               g_b_shutdown1        = nullptr;
+PFN_CreateFeature           g_b_create_feature   = nullptr;
+PFN_ReleaseFeature          g_b_release_feature  = nullptr;
+PFN_EvaluateFeature         g_b_evaluate_feature = nullptr;
+PFN_AllocateParameters      g_b_allocate_params  = nullptr;
+PFN_DestroyParameters       g_b_destroy_params   = nullptr;
+PFN_PopulateParameters_Impl g_b_populate_params  = nullptr;
+PFN_GetFeatureRequirements  g_b_feature_reqs     = nullptr;
+
+} // namespace
+
+extern "C" {
+
+__declspec(dllexport) void __cdecl RemixNgxTrampoline_SetSnippetB(void *snippet_module)
+{
+	HMODULE m = static_cast<HMODULE>(snippet_module);
+	if (m == nullptr)
+	{
+		g_b_init_ext = nullptr; g_b_shutdown1 = nullptr; g_b_create_feature = nullptr;
+		g_b_release_feature = nullptr; g_b_evaluate_feature = nullptr;
+		g_b_allocate_params = nullptr; g_b_destroy_params = nullptr;
+		g_b_populate_params = nullptr; g_b_feature_reqs = nullptr;
+		return;
+	}
+
+	g_b_init_ext         = reinterpret_cast<PFN_Init_Ext>               (GetProcAddress(m, "NVSDK_NGX_D3D12_Init_Ext"));
+	g_b_shutdown1        = reinterpret_cast<PFN_Shutdown1>              (GetProcAddress(m, "NVSDK_NGX_D3D12_Shutdown1"));
+	g_b_create_feature   = reinterpret_cast<PFN_CreateFeature>          (GetProcAddress(m, "NVSDK_NGX_D3D12_CreateFeature"));
+	g_b_release_feature  = reinterpret_cast<PFN_ReleaseFeature>         (GetProcAddress(m, "NVSDK_NGX_D3D12_ReleaseFeature"));
+	g_b_evaluate_feature = reinterpret_cast<PFN_EvaluateFeature>        (GetProcAddress(m, "NVSDK_NGX_D3D12_EvaluateFeature"));
+	g_b_allocate_params  = reinterpret_cast<PFN_AllocateParameters>     (GetProcAddress(m, "NVSDK_NGX_D3D12_AllocateParameters"));
+	g_b_destroy_params   = reinterpret_cast<PFN_DestroyParameters>      (GetProcAddress(m, "NVSDK_NGX_D3D12_DestroyParameters"));
+	g_b_populate_params  = reinterpret_cast<PFN_PopulateParameters_Impl>(GetProcAddress(m, "NVSDK_NGX_D3D12_PopulateParameters_Impl"));
+	g_b_feature_reqs     = reinterpret_cast<PFN_GetFeatureRequirements> (GetProcAddress(m, "NVSDK_NGX_D3D12_GetFeatureRequirements"));
+}
+
+__declspec(dllexport) NgxResult __cdecl NVSDK_NGX_D3D12_B_Init_Ext(
+	unsigned long long app_id, const wchar_t *app_data_path, void *device,
+	NgxVersion sdk_version, const void *parameters)
+{
+	if (g_b_init_ext == nullptr)
+		return kNgxResultFailNotInitialized;
+
+	const NgxResult result = g_b_init_ext(app_id, app_data_path, device, sdk_version, parameters);
+	++g_forwarded_call_count;
+	return result;
+}
+
+__declspec(dllexport) NgxResult __cdecl NVSDK_NGX_D3D12_B_Shutdown1(void *device)
+{
+	if (g_b_shutdown1 == nullptr)
+		return kNgxResultFailNotInitialized;
+
+	const NgxResult result = g_b_shutdown1(device);
+	++g_forwarded_call_count;
+	return result;
+}
+
+__declspec(dllexport) NgxResult __cdecl NVSDK_NGX_D3D12_B_CreateFeature(
+	void *cmd_list, NgxFeature feature_id, void *parameters, void **out_handle)
+{
+	if (g_b_create_feature == nullptr)
+		return kNgxResultFailNotInitialized;
+
+	const NgxResult result = g_b_create_feature(cmd_list, feature_id, parameters, out_handle);
+	++g_forwarded_call_count;
+	return result;
+}
+
+__declspec(dllexport) NgxResult __cdecl NVSDK_NGX_D3D12_B_ReleaseFeature(void *handle)
+{
+	if (g_b_release_feature == nullptr)
+		return kNgxResultFailNotInitialized;
+
+	const NgxResult result = g_b_release_feature(handle);
+	++g_forwarded_call_count;
+	return result;
+}
+
+__declspec(dllexport) NgxResult __cdecl NVSDK_NGX_D3D12_B_PopulateParameters_Impl(void *parameters)
+{
+	if (g_b_populate_params == nullptr)
+		return kNgxResultFailNotInitialized;
+
+	const NgxResult result = g_b_populate_params(parameters);
+	++g_forwarded_call_count;
+	return result;
+}
+
+__declspec(dllexport) NgxResult __cdecl NVSDK_NGX_D3D12_B_GetFeatureRequirements(
+	void *adapter, const void *discovery_info, void *out_supported)
+{
+	if (g_b_feature_reqs == nullptr)
+		return kNgxResultFailNotInitialized;
+
+	const NgxResult result = g_b_feature_reqs(adapter, discovery_info, out_supported);
+	++g_forwarded_call_count;
+	return result;
+}
+
+__declspec(dllexport) NgxResult __cdecl NVSDK_NGX_D3D12_B_EvaluateFeature(
+	void *cmd_list, const void *handle, const void *parameters, void *progress_callback)
+{
+	if (g_b_evaluate_feature == nullptr)
+		return kNgxResultFailNotInitialized;
+
+	const NgxResult result = g_b_evaluate_feature(cmd_list, handle, parameters, progress_callback);
+	++g_forwarded_call_count;
+	return result;
+}
+
+__declspec(dllexport) NgxResult __cdecl NVSDK_NGX_D3D12_B_AllocateParameters(void **out_parameters)
+{
+	if (g_b_allocate_params == nullptr)
+		return kNgxResultFailNotInitialized;
+
+	const NgxResult result = g_b_allocate_params(out_parameters);
+	++g_forwarded_call_count;
+	return result;
+}
+
+__declspec(dllexport) NgxResult __cdecl NVSDK_NGX_D3D12_B_DestroyParameters(void *parameters)
+{
+	if (g_b_destroy_params == nullptr)
+		return kNgxResultFailNotInitialized;
+
+	const NgxResult result = g_b_destroy_params(parameters);
+	++g_forwarded_call_count;
+	return result;
+}
+
+} // extern "C"
+
 BOOL APIENTRY DllMain(HMODULE, DWORD, LPVOID)
 {
 	return TRUE;
