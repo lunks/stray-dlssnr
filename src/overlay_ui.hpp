@@ -743,17 +743,26 @@ inline bool save_ini(std::string &err)
 	{
 		for (std::string &line : lines)
 		{
-			// Find the key, exactly as cfg::load does: comment from the first ';' or '#', then
-			// everything before the first '='.
-			std::string body = line;
-			const size_t sc = body.find_first_of(";#");
+			// Peel the line apart into  <head '='> <pad> <value> <gap> <comment> <eol>  and put back
+			// every one of those pieces byte for byte except the value. Anything less exact reflows
+			// a file the user reads as documentation: the shipped stray_dlssnr.ini pads its tuning
+			// block into columns and puts trailing comments after several values, and a writer that
+			// normalised either would rewrite two hundred lines the first time Save was pressed.
+			// (Both of those were real defects here, caught by abi/ini_rewrite_test.cpp.)
+			std::string content = line;
+			std::string eol;
+			if (!content.empty() && content.back() == '\r') { eol = "\r"; content.pop_back(); }
+
+			// Comment from the first ';' or '#', exactly as cfg::load does.
 			std::string comment;
-			if (sc != std::string::npos) { comment = body.substr(sc); body = body.substr(0, sc); }
-			const size_t eq = body.find('=');
+			const size_t sc = content.find_first_of(";#");
+			if (sc != std::string::npos) { comment = content.substr(sc); content = content.substr(0, sc); }
+
+			const size_t eq = content.find('=');
 			if (eq == std::string::npos)
 				continue;
 
-			std::string key_trim = body.substr(0, eq); cfg::trim(key_trim);
+			std::string key_trim = content.substr(0, eq); cfg::trim(key_trim);
 			if (key_trim.empty() || key_trim[0] == '[')
 				continue;
 
@@ -762,25 +771,17 @@ inline bool save_ini(std::string &err)
 			if (!owned_value(kl, l, value))
 				continue;   // not ours: left exactly as it was
 
-			// ONLY THE VALUE CHANGES. Everything up to and including the '=' is re-emitted byte for
-			// byte, and so is the whitespace that followed it, so the shipped ini's column alignment
-			// survives - lines like "local_structure_strength = 1.0" are padded to line up with their
-			// neighbours, and a writer that normalised them to one space would reflow a file the user
-			// reads as documentation.
-			const std::string head = body.substr(0, eq + 1);
-			const std::string vpart = body.substr(eq + 1);
+			const std::string head  = content.substr(0, eq + 1);
+			const std::string vpart = content.substr(eq + 1);
 			const size_t vs = vpart.find_first_not_of(" \t");
+			const size_t ve = vpart.find_last_not_of(" \t");
+			// Whitespace before the value keeps the column alignment; whitespace after it keeps the
+			// distance to a trailing comment.
 			const std::string vpad = (vs == std::string::npos) ? std::string(" ") : vpart.substr(0, vs);
+			const std::string gap  = (vs == std::string::npos || ve == std::string::npos)
+				? std::string() : vpart.substr(ve + 1);
 
-			// A trailing comment is re-emitted verbatim, which also carries this file's '\r' if it
-			// has CRLF endings; when there is no comment the '\r' is at the end of 'body' instead.
-			std::string tail;
-			if (!comment.empty())
-				tail = " " + comment;
-			else if (!body.empty() && body.back() == '\r')
-				tail = "\r";
-
-			line = head + vpad + value + tail;
+			line = head + vpad + value + gap + comment + eol;
 
 			for (size_t i = 0; i < n_keys; ++i)
 			{
