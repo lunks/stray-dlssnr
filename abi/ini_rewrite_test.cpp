@@ -128,7 +128,7 @@ static const char *const kFixture =
     "style = 0\r\n"
     "use_auto_mask = 1\r\n"
     "\r\n"
-    "; ui_correction is deliberately ABSENT, so the append path is exercised too.\r\n"
+    "; ui_correction and hdr_graft are deliberately ABSENT, so the append path is exercised too.\r\n"
     "totally_unknown_key = 42\r\n"
     "\r\n"
     "; DLSS-SR. dlss_sr and sr_perf_quality are PRESENT so the in-place rewrite path is exercised\r\n"
@@ -136,6 +136,9 @@ static const char *const kFixture =
     "; path is exercised for them too. dlss_nr is present and UNCHANGED - it is the launch-time key,\r\n"
     "; and a key that only takes effect next launch is exactly the one a dropped Save would lose\r\n"
     "; without any symptom until the relaunch.\r\n"
+    "; dlss_chain and the DLSS-SR create flags are ABSENT for the same reason hdr_graft is: they\r\n"
+    "; arrived with the chain/graft work and the append path is the one that would silently drop\r\n"
+    "; them.\r\n"
     "dlss_sr = 0\r\n"
     "dlss_nr = 1\r\n"
     "sr_perf_quality  = 0\r\n";
@@ -185,6 +188,20 @@ int main()
     l.sr_perf_quality.store(5u, std::memory_order_relaxed);
     l.sr_shader_hash.store(0x901e041a7cadc9dbull, std::memory_order_relaxed);
     l.sr_suppress_taa.store(true, std::memory_order_relaxed);
+    // The graft selector. Absent from the fixture, so this exercises the append path AND proves
+    // the newest owned key is actually owned - a key the writer forgets is a setting that silently
+    // reverts to its default on the next launch while the panel still shows the user's choice.
+    l.hdr_graft.store(1u, std::memory_order_relaxed);
+    // ---- CHAIN MODE AND THE REST OF DLSS-SR, all of which arrived with the chain/graft merge and
+    // every one of which is appended rather than rewritten. One of each remaining SHAPE is set to
+    // a non-default: a bool, a float and a uint32. The bug this catches is the merge's own most
+    // likely one - a key added to live_block and to a widget, and forgotten in one of the three
+    // places Save reads (OVERLAY_OWNED_FIELDS, owned_value, owned_keys).
+    l.dlss_chain.store(true, std::memory_order_relaxed);
+    l.sr_hdr.store(false, std::memory_order_relaxed);
+    l.sr_jitter_scale_x.store(-1.0f, std::memory_order_relaxed);
+    l.sr_group_tile.store(16u, std::memory_order_relaxed);
+    l.sr_out_width.store(3840u, std::memory_order_relaxed);
 
     check(overlay_ui::dirty(), "dirty() reports the pending edits");
 
@@ -204,8 +221,8 @@ int main()
     check(has_line(out, "[stray_dlssnr]"), "the section header survived");
     check(has_line(out, "app_id = 0x24480451"), "app_id (not an overlay control) was NOT round-tripped");
     check(has_line(out, "totally_unknown_key = 42"), "an unrecognised key survived untouched");
-    check(has_line(out, "; ui_correction is deliberately ABSENT, so the append path is exercised too."),
-          "the comment above the absent key survived");
+    check(has_line(out, "; ui_correction and hdr_graft are deliberately ABSENT, so the append path is exercised too."),
+          "the comment above the absent keys survived");
 
     // --- what we do own must change, without reflowing ---
     check(has_line(out, "intensity                = 1.25"), "intensity took the new value AND kept its column alignment");
@@ -220,6 +237,7 @@ int main()
     check(out.find("color_strength = ") == std::string::npos,
           "no duplicate American-spelling key was appended alongside it");
     check(has_line(out, "ui_correction = 1"), "the absent owned key was appended");
+    check(has_line(out, "hdr_graft = 1"), "hdr_graft was appended");
 
     // --- the reconfigure ladder's keys ---
     check(has_line(out, "srv_velocity = 3"), "a CHANGED identification pin reached the file");
@@ -241,6 +259,13 @@ int main()
           "the appended sr_shader_hash is hex, zero-padded, like shader_hash");
     check(has_line(out, "sr_suppress_taa = 1"), "the appended sr_suppress_taa took the new value");
     check(has_line(out, "sr_mvec_decode = 1"), "an untouched DLSS-SR default was appended");
+    check(has_line(out, "dlss_chain = 1"), "the appended dlss_chain took the new value");
+    check(has_line(out, "sr_hdr = 0"), "an appended DLSS-SR create flag took the new value");
+    check(has_line(out, "sr_jitter_scale_x = -1"), "an appended DLSS-SR float round-trips as -1");
+    check(has_line(out, "sr_group_tile = 16"), "an appended DLSS-SR uint32 took the new value");
+    check(has_line(out, "sr_out_width = 3840"), "the appended output-width pin took the new value");
+    check(has_line(out, "sr_copy_back = 1"), "an untouched DLSS-SR default was appended");
+    check(has_line(out, "sr_optimal_settings = 0"), "the arm-time DLSS-SR key was appended too");
 
     check(out.find("\r\n") != std::string::npos, "CRLF line endings survived on the lines we rewrote");
 
@@ -256,6 +281,7 @@ int main()
         check(back.style == 2u,                       "reparse: style");
         check(back.mvec_scale_x == 1.5f,              "reparse: mvec_scale_x");
         check(back.ui_correction == 1u,               "reparse: ui_correction");
+        check(back.hdr_graft == 1u,                   "reparse: hdr_graft");
         // The pins must be exactly what the fixture said, not what the overlay's defaults are.
         check(back.shader_hash == 0x1708ec956099e259ull, "reparse: shader_hash round-tripped exactly");
         check(back.srv_velocity == 3u,                   "reparse: the changed srv_velocity pin");
@@ -270,6 +296,13 @@ int main()
         check(back.sr_shader_hash == 0x901e041a7cadc9dbull, "reparse: sr_shader_hash in hex");
         check(back.sr_suppress_taa == true,              "reparse: sr_suppress_taa");
         check(back.sr_mvec_decode == true,               "reparse: the appended sr_mvec_decode");
+        check(back.dlss_chain == true,                   "reparse: dlss_chain");
+        check(back.sr_hdr == false,                      "reparse: the sr_hdr create flag");
+        check(back.sr_jitter_scale_x == -1.0f,           "reparse: sr_jitter_scale_x sign A/B");
+        check(back.sr_group_tile == 16u,                 "reparse: sr_group_tile");
+        check(back.sr_out_width == 3840u,                "reparse: sr_out_width");
+        check(back.sr_copy_back == true,                 "reparse: the appended sr_copy_back default");
+        check(back.sr_optimal_settings == false,         "reparse: the appended sr_optimal_settings");
     }
 
     // ---------------------------------------------------------------- case B: no file at all
@@ -290,6 +323,7 @@ int main()
         check(back.transfer_strength == 0.0f,     "reparse: transfer_strength = 0 (the exact-bypass value)");
         check(back.intensity == 1.25f,            "reparse: intensity survived into the new file");
         check(back.style == 2u,                   "reparse: style survived into the new file");
+        check(back.hdr_graft == 1u,               "reparse: hdr_graft survived into the new file");
     }
 
     // ---------------------------------------------------------------- case C: unwritable target

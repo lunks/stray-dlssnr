@@ -125,10 +125,38 @@
 // enabled=0, or with the feature wedged, begin_pass never runs at all, and those are exactly the
 // cases where the user most needs a reconfigure to land.
 //
-//   PER KEY (34 keys; the render-path read site for each is cited in stray_dlssnr.cpp):
+//   PER KEY (62 keys; the render-path read site for each is cited in stray_dlssnr.cpp):
 //     R0        intensity, local_tone_strength, local_structure_strength, skin_structure_strength,
 //               style, use_auto_mask, ui_correction, paper_white_scale, transfer_strength,
-//               color_strength, restore_graphics_root
+//               color_strength, restore_graphics_root, hdr_graft,
+//               sr_direct_output, sr_copy_back
+//               hdr_graft is R0 and nothing more because it is a ROOT CONSTANT in the decode's own
+//               constant block - it replaced a pad word, so the constant count, the root signature,
+//               the pipeline layout and both PSOs are unchanged and there is nothing to rebuild
+//               when it moves. Its two read sites - nr_codec_decode on the NR-alone path and on the
+//               chained one - are both downstream of the snapshot.
+//     R1        sr_use_view_rect, sr_jitter_scale_x, sr_jitter_scale_y,
+//               sr_jitter_projection_only, sr_mv_scale_x, sr_mv_scale_y
+//     R1+auto   sr_out_width, sr_out_height, sr_group_tile. These three feed want_out_w/h, and
+//               sr_try_run compares that against sr_seen_out_w/h on EVERY pass - so a change makes
+//               key_moved true and queues kTeardown through the same seam the recreate button uses,
+//               with no action bit from the control at all. Raising one here as well would cost a
+//               teardown per pixel of slider drag for no extra effect.
+//     CREATE    sr_hdr, sr_mv_lowres, sr_mv_jittered, sr_depth_inverted, sr_auto_exposure,
+//               sr_alpha_upscaling, sr_hw_depth, sr_perf_quality, sr_render_preset. Snapshotted for
+//               COHERENCE - the create-params block reads six of them in one expression - but
+//               latched at CreateFeature with no evaluate-time equivalent, and nothing in the
+//               render path compares them against what the live feature was created with. The
+//               "Recreate the SR feature" button is the mechanism and every tooltip says so.
+//     R4+R5     dlss_chain - a_teardown | a_reconcile. 1 -> 0 is fully live; 0 -> 1 needs the SR
+//               snippet, which is a launch-time LoadLibraryW, on exactly the terms dlss_sr states.
+//               It has TWO read sites and therefore two mechanisms: chain_ok in nr_try_run is
+//               downstream of begin_pass and rides the snapshot, while want_hash runs BEFORE it and
+//               is served by read_ident() - chain only upscales in the MainUpsampling permutation,
+//               so it re-pins the hash exactly as dlss_sr does.
+//     ARM-ONLY  sr_optimal_settings, dlss_nr. Owned, saved and reverted; read once each in
+//               nr_lazy_ngx_init / nr_init_device, so there is no second read a live value could
+//               reach. Both controls say exactly that.
 //     R1        depth_inverted, mvec_scale_x, mvec_scale_y, mvec_dilate, mvec_reconstruct
 //     R1+latch  mvec_clip_row, mvec_clip_transpose - these two can PERMANENTLY latch
 //               view_layout_failed / clip_ok=false (stray_dlssnr.cpp:2589-2593, :2604-2612,
@@ -307,6 +335,9 @@ struct live_block
 	std::atomic<float>    paper_white_scale{ 1.0f };
 	std::atomic<float>    transfer_strength{ 1.0f };
 	std::atomic<float>    color_strength{ 1.0f };
+	// cfg::hdr_graft. Live at tier 0: it is a root constant in the decode's own constant block,
+	// snapshotted with the rest of the pass, so nothing is rebuilt when it changes.
+	std::atomic<uint32_t> hdr_graft{ 0 };
 
 	std::atomic<bool>     depth_inverted{ true };
 	std::atomic<float>    mvec_scale_x{ 0.0f };
@@ -386,6 +417,51 @@ struct live_block
 	// on the next accepted dispatch by itself, from the values the snapshot has already committed.
 	std::atomic<uint32_t> sr_perf_quality{ 0 };
 	std::atomic<uint32_t> sr_render_preset{ 0 };
+
+	// ---- dlss_chain. The SECOND network on ONE accepted dispatch: DLSS-NR denoises at the render
+	// extent and its result becomes DLSS-SR's colour input. It is snapshotted because its ONE
+	// functional read site - chain_ok, where nr_try_run decides whether to enter the chain - is
+	// downstream of begin_pass, and it is ALSO in ident_view because want_hash() has to treat it
+	// exactly like dlss_sr: chain only upscales in the MainUpsampling permutation, which is a
+	// different #define set, therefore different DXBC and a different fnv1a64. Two read sites, two
+	// mechanisms, one value - the same shape dlss_sr already has.
+	std::atomic<bool>     dlss_chain{ false };
+
+	// ---- DLSS-SR, TIER 0. Every read site is inside sr_try_run or nr_try_run's geometry block,
+	// both downstream of begin_pass, so the snapshot is the whole mechanism.
+	std::atomic<bool>     sr_copy_back{ true };
+	std::atomic<bool>     sr_direct_output{ false };
+	std::atomic<bool>     sr_use_view_rect{ true };
+	std::atomic<bool>     sr_jitter_projection_only{ false };
+	std::atomic<float>    sr_jitter_scale_x{ 1.0f };
+	std::atomic<float>    sr_jitter_scale_y{ 1.0f };
+	std::atomic<float>    sr_mv_scale_x{ 0.0f };
+	std::atomic<float>    sr_mv_scale_y{ 0.0f };
+
+	// ---- DLSS-SR, TIER 1. All seven are latched into the DLSS create-params at CreateFeature -
+	// cd.flags and cd.hw_depth - and there is no evaluate-time equivalent, so the snapshot makes
+	// the value COHERENT but only a feature release makes it TAKE. Their controls say exactly that
+	// and point at the recreate button, which is the same contract sr_perf_quality already ships.
+	std::atomic<bool>     sr_hdr{ true };
+	std::atomic<bool>     sr_mv_lowres{ true };
+	std::atomic<bool>     sr_mv_jittered{ false };
+	std::atomic<bool>     sr_depth_inverted{ true };
+	std::atomic<bool>     sr_auto_exposure{ true };
+	std::atomic<bool>     sr_alpha_upscaling{ false };
+	std::atomic<bool>     sr_hw_depth{ true };
+
+	// ---- DLSS-SR, TIER 2. These three decide the OUTPUT EXTENT, which picks the output UAV and
+	// then goes into CreateFeature, so a change is a geometry change: their controls raise
+	// a_teardown | a_reconcile at k_rebuild rather than asking the user to press anything.
+	std::atomic<uint32_t> sr_group_tile{ 8 };
+	std::atomic<uint32_t> sr_out_width{ 0 };
+	std::atomic<uint32_t> sr_out_height{ 0 };
+
+	// ---- ARM-TIME, and its control says so. sr_optimal_settings has exactly ONE read site, in
+	// nr_lazy_ngx_init, which runs once per process; it is a DIAGNOSTIC query that returns a
+	// recommended render resolution and has no power to make UE render at it. Owned so that a Save
+	// keeps it, wired to no action bit because there is no second read for one to reach.
+	std::atomic<bool>     sr_optimal_settings{ false };
 
 	// ---- R1, and two of them also need the clip latches cleared.
 	std::atomic<bool>     mvec_reconstruct{ true };
@@ -537,6 +613,19 @@ struct status_block
 	std::atomic<bool>         codec_failed{ false };
 	std::atomic<bool>         codec_pipelines_ok{ false };
 	std::atomic<bool>         orig_ok{ false };
+
+	// Whether the DECODE IN HAND can actually do hdr_graft = 1. Two separate ways it cannot, and
+	// in both the combo would otherwise be a control wired to nothing while every status line
+	// reported the mode as active - the exact defect this panel exists to prevent.
+	//   codec_graft_available   false when the decode was built from the survival source, i.e.
+	//                           the compile WITH the reference graft failed on this machine and
+	//                           hdr_codec::build fell back so the default would survive.
+	//   codec_decode_overridden true when the decode came from a user-supplied
+	//                           stray_dlssnr_decode.dxbc. That blob is whatever the user built;
+	//                           it may predate g_hdrGraft entirely and read the constant not at
+	//                           all. We cannot know, so we say we cannot know.
+	std::atomic<bool>         codec_graft_available{ true };
+	std::atomic<bool>         codec_decode_overridden{ false };
 
 	std::atomic<float>        auto_scale_x{ 0.0f }, auto_scale_y{ 0.0f };
 	std::atomic<uint64_t>     hist_applied{ 0 }, hist_dropped{ 0 };
@@ -719,9 +808,17 @@ inline void bump(uint32_t kind);   // fwd
 	X(mvec_clip_row) X(mvec_clip_transpose) \
 	X(populate_parameters) X(require_trampoline) \
 	X(rt_census) X(rt_census_frames) \
-	X(dlss_sr) X(dlss_nr) X(sr_shader_hash) X(sr_suppress_taa) \
+	X(hdr_graft) \
+	X(dlss_sr) X(dlss_nr) X(dlss_chain) X(sr_shader_hash) X(sr_suppress_taa) \
 	X(sr_mvec_decode) X(sr_mvec_reconstruct) \
-	X(sr_perf_quality) X(sr_render_preset)
+	X(sr_perf_quality) X(sr_render_preset) \
+	X(sr_copy_back) X(sr_direct_output) X(sr_use_view_rect) \
+	X(sr_jitter_projection_only) X(sr_jitter_scale_x) X(sr_jitter_scale_y) \
+	X(sr_mv_scale_x) X(sr_mv_scale_y) \
+	X(sr_hdr) X(sr_mv_lowres) X(sr_mv_jittered) X(sr_depth_inverted) \
+	X(sr_auto_exposure) X(sr_alpha_upscaling) X(sr_hw_depth) \
+	X(sr_group_tile) X(sr_out_width) X(sr_out_height) \
+	X(sr_optimal_settings)
 
 inline void live_to_config(const live_block &l, cfg::config &c)
 {
@@ -753,7 +850,7 @@ inline void seed_from_config(const cfg::config &c, const std::wstring &directory
 {
 	live_block &l = live();
 	// The seqlock's other writer. draw_controls has ui_edit_guard; this is the only other place
-	// that stores into live_block, and it stores FORTY-ONE fields, so it is bracketed the same
+	// that stores into live_block, and it stores SIXTY-TWO fields, so it is bracketed the same
 	// way. On a single device it is provably uncontended - it runs from nr_init_device, before any
 	// dispatch on that device - but that is an argument about a device, not about the process, and
 	// this block is process-wide.
@@ -799,6 +896,16 @@ inline void seed_from_config(const cfg::config &c, const std::wstring &directory
 // on_present by nr_service_reconfigure, which reads take_reconfigure() below. This function only
 // ever writes memory it was handed.
 // ---------------------------------------------------------------------------------------------
+// Published ONCE, from the codec build site in nr_lazy_ngx_init, rather than through begin_pass:
+// it is settled before the first dispatch and never changes for the run, and threading it through
+// begin_pass would widen a signature that other work is editing.
+inline void publish_codec_build(bool graft_available, bool decode_overridden)
+{
+	status_block &s = status();
+	s.codec_graft_available.store(graft_available, std::memory_order_relaxed);
+	s.codec_decode_overridden.store(decode_overridden, std::memory_order_relaxed);
+}
+
 inline bool begin_pass(cfg::config &c,
                        cfg::config &scratch,
                        seen_epochs &seen,
@@ -922,6 +1029,40 @@ inline bool begin_pass(cfg::config &c,
 		tmp.sr_mvec_reconstruct      = l.sr_mvec_reconstruct.load(std::memory_order_relaxed);
 		tmp.sr_perf_quality          = l.sr_perf_quality.load(std::memory_order_relaxed);
 		tmp.sr_render_preset         = l.sr_render_preset.load(std::memory_order_relaxed);
+		// dlss_chain: the chain_ok test in nr_try_run is downstream of this call. Its OTHER read
+		// site - want_hash - is not, and is served by read_ident() instead, exactly as
+		// sr_shader_hash is.
+		tmp.dlss_chain               = l.dlss_chain.load(std::memory_order_relaxed);
+		// ---- the rest of DLSS-SR, tier 0. Read inside sr_try_run, downstream of this call.
+		tmp.sr_copy_back             = l.sr_copy_back.load(std::memory_order_relaxed);
+		tmp.sr_direct_output         = l.sr_direct_output.load(std::memory_order_relaxed);
+		tmp.sr_use_view_rect         = l.sr_use_view_rect.load(std::memory_order_relaxed);
+		tmp.sr_jitter_projection_only = l.sr_jitter_projection_only.load(std::memory_order_relaxed);
+		tmp.sr_jitter_scale_x        = l.sr_jitter_scale_x.load(std::memory_order_relaxed);
+		tmp.sr_jitter_scale_y        = l.sr_jitter_scale_y.load(std::memory_order_relaxed);
+		tmp.sr_mv_scale_x            = l.sr_mv_scale_x.load(std::memory_order_relaxed);
+		tmp.sr_mv_scale_y            = l.sr_mv_scale_y.load(std::memory_order_relaxed);
+		// ---- tier 1. Snapshotted for COHERENCE - the create-params block reads six of them in one
+		// expression - and made to TAKE by the feature release their controls ask for.
+		tmp.sr_hdr                   = l.sr_hdr.load(std::memory_order_relaxed);
+		tmp.sr_mv_lowres             = l.sr_mv_lowres.load(std::memory_order_relaxed);
+		tmp.sr_mv_jittered           = l.sr_mv_jittered.load(std::memory_order_relaxed);
+		tmp.sr_depth_inverted        = l.sr_depth_inverted.load(std::memory_order_relaxed);
+		tmp.sr_auto_exposure         = l.sr_auto_exposure.load(std::memory_order_relaxed);
+		tmp.sr_alpha_upscaling       = l.sr_alpha_upscaling.load(std::memory_order_relaxed);
+		tmp.sr_hw_depth              = l.sr_hw_depth.load(std::memory_order_relaxed);
+		// ---- tier 2. The output extent, read in nr_try_run AFTER this call (the group-count
+		// derivation and the output-UAV pick) and then again inside sr_try_run.
+		tmp.sr_group_tile            = l.sr_group_tile.load(std::memory_order_relaxed);
+		tmp.sr_out_width             = l.sr_out_width.load(std::memory_order_relaxed);
+		tmp.sr_out_height            = l.sr_out_height.load(std::memory_order_relaxed);
+		// sr_optimal_settings is DELIBERATELY ABSENT for the same reason dlss_nr is: its only read
+		// site is in nr_lazy_ngx_init, which has already run by the time this does. Writing it here
+		// would look correct to a reader and reach nothing.
+		// hdr_graft rides the snapshot too - it is a ROOT CONSTANT in the decode's own constant
+		// block, read by nr_codec_decode on both the NR-alone and the chained path, both of which
+		// are downstream of this call.
+		tmp.hdr_graft                = l.hdr_graft.load(std::memory_order_relaxed);
 		// shader_hash is DELIBERATELY ABSENT from this list. Its read site runs before this
 		// function does; read_ident() serves it instead. Writing it here would be worse than
 		// useless - it would look correct to a reader and reach nothing.
@@ -1057,6 +1198,11 @@ struct ident_view
 	// from the same panel while the game runs. Putting the choice in the view rather than at the
 	// call site is what keeps it a single coherent read: all three come from inside one acquire.
 	bool     dlss_sr = false;
+	// CHAIN MODE IS TREATED EXACTLY LIKE dlss_sr HERE, and it has to be: the chain only upscales in
+	// the MainUpsampling permutation, which is a different #define set and therefore a different
+	// DXBC and a different fnv1a64. It rides the SAME acquire as the other three, so a user who
+	// retypes the hash and flips the mode cannot be observed half way.
+	bool     dlss_chain = false;
 	uint64_t sr_shader_hash = 0;
 };
 
@@ -1069,6 +1215,7 @@ inline ident_view read_ident()
 	v.epoch          = l.ident_epoch.load(std::memory_order_acquire);
 	v.shader_hash    = l.shader_hash.load(std::memory_order_relaxed);
 	v.dlss_sr        = l.dlss_sr.load(std::memory_order_relaxed);
+	v.dlss_chain     = l.dlss_chain.load(std::memory_order_relaxed);
 	v.sr_shader_hash = l.sr_shader_hash.load(std::memory_order_relaxed);
 	return v;
 }
@@ -1082,7 +1229,7 @@ inline ident_view read_ident()
 /// out of one acquire, so a user who retypes both hashes cannot be observed half way.
 inline uint64_t want_hash(const ident_view &v)
 {
-	return (v.dlss_sr && v.sr_shader_hash != 0) ? v.sr_shader_hash : v.shader_hash;
+	return ((v.dlss_sr || v.dlss_chain) && v.sr_shader_hash != 0) ? v.sr_shader_hash : v.shader_hash;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1279,6 +1426,11 @@ inline bool live_diagnostics()      { return live().diagnostics.load(std::memory
 /// ONE reader and the overlay's copy is authoritative for both the UI and the arm decision.
 inline bool live_enabled()          { return live().enabled.load(std::memory_order_relaxed); }
 inline bool live_hdr_codec()        { return live().hdr_codec.load(std::memory_order_relaxed); }
+// hdr_graft rides the per-pass snapshot at its two render-path read sites; this accessor exists
+// for the ARM BANNER, which is printed from nr_lazy_ngx_init BEFORE begin_pass has ever run on
+// this device - so g_cfg there still holds whatever the ini said even when the user has already
+// changed it and re-armed from the panel. Exactly why live_hdr_codec() above exists.
+inline uint32_t live_hdr_graft()    { return live().hdr_graft.load(std::memory_order_relaxed); }
 inline bool live_require_trampoline() { return live().require_trampoline.load(std::memory_order_relaxed); }
 inline bool live_populate_parameters() { return live().populate_parameters.load(std::memory_order_relaxed); }
 inline bool     live_rt_census()        { return live().rt_census.load(std::memory_order_relaxed); }
@@ -1295,6 +1447,13 @@ inline bool     live_sr_suppress_taa()     { return live().sr_suppress_taa.load(
 inline uint32_t live_sr_perf_quality()     { return live().sr_perf_quality.load(std::memory_order_relaxed); }
 inline uint32_t live_sr_render_preset()    { return live().sr_render_preset.load(std::memory_order_relaxed); }
 inline uint64_t live_sr_shader_hash()      { return live().sr_shader_hash.load(std::memory_order_relaxed); }
+// dlss_chain has read sites on BOTH sides of begin_pass, so like dlss_sr it needs an accessor as
+// well as a snapshot line: nr_init_device and nr_lazy_ngx_init decide whether to LoadLibraryW
+// nvngx_dlss.dll and whether to Init_Ext through slot B, and both of those run before any pass.
+inline bool     live_dlss_chain()           { return live().dlss_chain.load(std::memory_order_relaxed); }
+// Read at arm time only - nr_lazy_ngx_init's optimal-settings query - which is exactly why it has
+// an accessor and no snapshot line.
+inline bool     live_sr_optimal_settings()  { return live().sr_optimal_settings.load(std::memory_order_relaxed); }
 
 // =============================================================================================
 // PERSISTENCE
@@ -1344,7 +1503,7 @@ inline void fmt_float(char *buf, size_t n, float v)
 	std::snprintf(buf, n, "%.9g", static_cast<double>(v));
 }
 
-/// The 41 keys the overlay owns - the OVERLAY_OWNED_FIELDS list, spelling aliases included.
+/// The 62 keys the overlay owns - the OVERLAY_OWNED_FIELDS list, spelling aliases included.
 /// Returns false for anything else, which is what leaves app_id and unrecognised keys alone.
 inline bool owned_value(const std::string &key_lower, const live_block &l, std::string &out)
 {
@@ -1364,6 +1523,7 @@ inline bool owned_value(const std::string &key_lower, const live_block &l, std::
 	if (key_lower == "local_tone_strength")      { fmt_float(buf, sizeof(buf), l.local_tone_strength.load(std::memory_order_relaxed)); out = buf; return true; }
 	if (key_lower == "local_structure_strength") { fmt_float(buf, sizeof(buf), l.local_structure_strength.load(std::memory_order_relaxed)); out = buf; return true; }
 	if (key_lower == "skin_structure_strength")  { fmt_float(buf, sizeof(buf), l.skin_structure_strength.load(std::memory_order_relaxed)); out = buf; return true; }
+	if (key_lower == "hdr_graft")                { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.hdr_graft.load(std::memory_order_relaxed)); out = buf; return true; }
 	if (key_lower == "style")                    { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.style.load(std::memory_order_relaxed)); out = buf; return true; }
 	if (key_lower == "ui_correction")            { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.ui_correction.load(std::memory_order_relaxed)); out = buf; return true; }
 	// ---- the keys that became live controls with the reconfigure ladder. They are round-tripped
@@ -1403,6 +1563,29 @@ inline bool owned_value(const std::string &key_lower, const live_block &l, std::
 	if (key_lower == "sr_render_preset")         { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.sr_render_preset.load(std::memory_order_relaxed)); out = buf; return true; }
 	// Hex for the same reason shader_hash is hex: it is copied out of ReShade.log by eye.
 	if (key_lower == "sr_shader_hash")           { std::snprintf(buf, sizeof(buf), "0x%016llx", (unsigned long long)l.sr_shader_hash.load(std::memory_order_relaxed)); out = buf; return true; }
+	// ---- chain mode, and the rest of DLSS-SR. Every key in OVERLAY_OWNED_FIELDS has to appear
+	// here and in owned_keys() below, or Save writes the panel's other edits and silently drops
+	// this one - which is the failure the ini round-trip test in abi/ exists to catch.
+	if (key_lower == "dlss_chain")               { out = l.dlss_chain.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "sr_copy_back")             { out = l.sr_copy_back.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "sr_direct_output")         { out = l.sr_direct_output.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "sr_use_view_rect")         { out = l.sr_use_view_rect.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "sr_jitter_projection_only"){ out = l.sr_jitter_projection_only.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "sr_hdr")                   { out = l.sr_hdr.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "sr_mv_lowres")             { out = l.sr_mv_lowres.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "sr_mv_jittered")           { out = l.sr_mv_jittered.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "sr_depth_inverted")        { out = l.sr_depth_inverted.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "sr_auto_exposure")         { out = l.sr_auto_exposure.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "sr_alpha_upscaling")       { out = l.sr_alpha_upscaling.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "sr_hw_depth")              { out = l.sr_hw_depth.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "sr_optimal_settings")      { out = l.sr_optimal_settings.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "sr_jitter_scale_x")        { fmt_float(buf, sizeof(buf), l.sr_jitter_scale_x.load(std::memory_order_relaxed)); out = buf; return true; }
+	if (key_lower == "sr_jitter_scale_y")        { fmt_float(buf, sizeof(buf), l.sr_jitter_scale_y.load(std::memory_order_relaxed)); out = buf; return true; }
+	if (key_lower == "sr_mv_scale_x")            { fmt_float(buf, sizeof(buf), l.sr_mv_scale_x.load(std::memory_order_relaxed)); out = buf; return true; }
+	if (key_lower == "sr_mv_scale_y")            { fmt_float(buf, sizeof(buf), l.sr_mv_scale_y.load(std::memory_order_relaxed)); out = buf; return true; }
+	if (key_lower == "sr_group_tile")            { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.sr_group_tile.load(std::memory_order_relaxed)); out = buf; return true; }
+	if (key_lower == "sr_out_width")             { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.sr_out_width.load(std::memory_order_relaxed)); out = buf; return true; }
+	if (key_lower == "sr_out_height")            { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.sr_out_height.load(std::memory_order_relaxed)); out = buf; return true; }
 	return false;
 }
 
@@ -1411,7 +1594,7 @@ inline const char *const *owned_keys(size_t &n)
 {
 	static const char *const keys[] = {
 		"copy_back", "history_restore", "restore_graphics_root",
-		"paper_white_scale", "transfer_strength", "color_strength",
+		"paper_white_scale", "transfer_strength", "color_strength", "hdr_graft",
 		"depth_inverted", "mvec_scale_x", "mvec_scale_y",
 		"intensity", "local_tone_strength", "local_structure_strength",
 		"skin_structure_strength", "style", "use_auto_mask", "ui_correction",
@@ -1423,9 +1606,16 @@ inline const char *const *owned_keys(size_t &n)
 		"populate_parameters", "require_trampoline",
 		"rt_census", "rt_census_frames",
 		// DLSS-SR and the two feature master switches.
-		"dlss_nr", "dlss_sr", "sr_shader_hash", "sr_suppress_taa",
+		"dlss_nr", "dlss_sr", "dlss_chain", "sr_shader_hash", "sr_suppress_taa",
 		"sr_mvec_decode", "sr_mvec_reconstruct",
 		"sr_perf_quality", "sr_render_preset",
+		"sr_copy_back", "sr_direct_output", "sr_use_view_rect",
+		"sr_jitter_projection_only", "sr_jitter_scale_x", "sr_jitter_scale_y",
+		"sr_mv_scale_x", "sr_mv_scale_y",
+		"sr_hdr", "sr_mv_lowres", "sr_mv_jittered", "sr_depth_inverted",
+		"sr_auto_exposure", "sr_alpha_upscaling", "sr_hw_depth",
+		"sr_group_tile", "sr_out_width", "sr_out_height",
+		"sr_optimal_settings",
 	};
 	n = sizeof(keys) / sizeof(keys[0]);
 	return keys;
@@ -2588,7 +2778,89 @@ inline void draw_controls(const host_facts &f)
 		slider_f("Color Strength", l.color_strength, 0.0f, 1.0f, "%.2f", k_plain,
 			"Live. 0.0 keeps the original's chromaticity exactly and transfers only the network's "
 			"luminance change; 1.0 takes the network's colour too. Lower it if the image picks up a "
-			"colour cast.");
+			"colour cast.\n\n"
+			"NOT ORTHOGONAL TO THE GRAFT BELOW, BUT NOT A CONTROL FOR IT EITHER. At 0.0 both grafts "
+			"reduce to \"rescale the original to the new luminance\" and their new luminances are the "
+			"same number, so on ORDINARY pixels the two modes agree to well under one 8-bit code "
+			"value. They do NOT agree in SHADOWS: mode 0 has a chroma floor that hands a near-black "
+			"pixel over to the network's own colour below Y = 0.001/s, and mode 1 has no such floor "
+			"at all, so it keeps the original's chromaticity and rescales it by an unbounded ratio. "
+			"Measured over 400,000 dark chromatic pixels at 0.0: worst 27.6 code values, 42.5%% of "
+			"them differing by 2 or more.\n\n"
+			"So A/B the grafts at 1.0 for the HIGHLIGHT difference and at 0.0 on a DARK, COLOURED "
+			"area - shadowed alley walls, unlit interiors - for the shadow difference. Neither "
+			"setting shows both.");
+
+		{
+			// The graft-back selector. Both items are REAL and both are exercised by the same
+			// dispatch - this is a root constant the decode reads, not a second code path that
+			// could be left uncalled.
+			//
+			// TWO WAYS THE DECODE IN HAND CANNOT HONOUR IT, both said out loud rather than left
+			// for the user to discover by seeing nothing change. Neither is hypothetical: the
+			// first is what keeps a compiler that cannot build the OkLab matrices from taking the
+			// DEFAULT graft down with it, and the second is the documented workflow for a machine
+			// with no working D3DCompile at all.
+			const bool graft_avail   = s.codec_graft_available.load(std::memory_order_relaxed);
+			const bool decode_overri = s.codec_decode_overridden.load(std::memory_order_relaxed);
+			if (!graft_avail)
+				overlay_imgui::textf_colored(col::amber,
+					"The decode was built WITHOUT the reference graft (it did not compile here), so "
+					"hdr_graft is pinned to 0 for this run. Mode 0 is unaffected - see ReShade.log.");
+			else if (decode_overri)
+				overlay_imgui::textf_colored(col::amber,
+					"A user-supplied stray_dlssnr_decode.dxbc is in use. If it was not built from "
+					"this add-on's shader source it does not read hdr_graft at all, and this control "
+					"will do nothing however it reads. Delete the .dxbc to be sure.");
+
+			static const char *const graft_items[] = {
+				"0 - Additive residual (ours, default)",
+				"1 - renodx UpgradeToneMap (OkLab hue lock)",
+			};
+			ImGui::BeginDisabled(!graft_avail);
+			combo_u32("HDR Graft", l.hdr_graft, graft_items, 2, k_plain,
+				"Live, and free: it is one root constant in the decode's constant block, so the very "
+				"next frame uses the other graft. Nothing is recreated.\n\n"
+				"THE ENCODE IS THE SAME EITHER WAY. Same exact piecewise sRGB, same soft-clip knee "
+				"0.75 and shoulder 5.770780, so the network is shown the same proxy and returns the "
+				"same answer. Only the graft-back differs.\n\n"
+				"0 - ADDITIVE. result = original + (neural - proxy) / s. A scene-linear residual, "
+				"exactly +0.0 when the network asked for nothing - which is what makes "
+				"transfer_strength=0 a BIT-EXACT no-op at every paper_white_scale. RGB is scaled "
+				"uniformly, so the original's hue cannot drift.\n\n"
+				"1 - RENODX. Rebuilds the pixel from the network's answer: ratio = (neural_y + "
+				"max(0, original_y - proxy_y)) / neural_y, then HueOkLab(neural * ratio, neural) "
+				"with an AP1 negative clamp. Recovered verbatim from renodx-reference.addon64's own "
+				"embedded HLSL.\n\n"
+				"WHAT THE TRADE ACTUALLY IS - measured, not assumed. Luminance is linear, so their "
+				"headroom term max(0, original_y - proxy_y) is ALGEBRAICALLY our additive residual: "
+				"both modes deliver the SAME luminance gain at every source magnitude. The entire "
+				"difference is CHROMA. Where the soft clip has crushed the proxy to white the "
+				"network's answer is neutral, so mode 1 hue-locks to that neutral and drags a "
+				"clipped highlight toward the white point; mode 0 leaves its chromaticity exactly "
+				"alone. On a bright neon sign that is the difference between keeping its colour and "
+				"washing it out.\n\n"
+				"THE OTHER HALF OF THE DIFFERENCE IS IN THE SHADOWS, and it shows at Color Strength "
+				"0.0 rather than 1.0. Mode 0's chroma floor hands a near-black pixel over to the "
+				"network's colour below Y = 0.001/s; mode 1 has no floor and rescales the "
+				"original's chromaticity by an unbounded ratio. 400,000 dark chromatic pixels at "
+				"0.0: worst 27.6 code values, 42.5%% of them 2 or more.\n\n"
+				"SO THIS IS A COLOUR EXPERIMENT, NOT A HIGHLIGHT FIX. Neither mode recovers a "
+				"bright highlight, and the ceiling is LOWER than the soft clip suggests because "
+				"the proxy is stored in an FP16 surface: the encoded proxy quantises to exactly "
+				"1.0 at 1.81x paper white (the 3.47x figure is FP32 and is not the one that "
+				"governs), and of a requested +30%% gain the decode already delivers only ~50%% at "
+				"1.15x and ~5%% at 1.86x. Those are ratios TO paper white and do not move with "
+				"Scene Paper-White Scale - what moves is the scene-linear magnitude they land at, "
+				"in proportion (at 4.0, full gain reaches magnitude 3.17 instead of 0.79). If "
+				"highlights are being lost, the knee is in the wrong place, and that slider above "
+				"is exactly the right thing to raise.\n\n"
+				"Mode 1 is also NOT an exact bypass at transfer_strength=0: it works display-"
+				"referred throughout, so the result is (original * s) / s, exact only when s is a "
+				"power of two. Mode 0 is exact at every value, which is why it is the default and "
+				"why the identity A/B should be run on it.");
+			ImGui::EndDisabled();
+		}
 
 		ImGui::EndDisabled();
 	}
@@ -2857,8 +3129,48 @@ inline void draw_controls(const host_facts &f)
 			overlay_imgui::textf_colored(col::dim,
 				"    armed but not selected - the dispatch is going to DLSS-NR. Re-ticking is live.");
 
-		// Everything below only means anything while SR is actually taking the dispatch.
-		ImGui::BeginDisabled(!(want_sr && sr_armed));
+		// ---- CHAIN MODE ------------------------------------------------------------------------
+		// Its own control, and NOT inside the "SR is taking the dispatch" scope below: chain mode is
+		// the configuration in which dlss_sr is 0 and DLSS-SR still runs, so gating it on want_sr
+		// would grey out the one box that turns it on.
+		const bool want_chain = l.dlss_chain.load(std::memory_order_relaxed);
+		const bool nr_armed   = f.valid && f.armed;
+		checkbox_action("Chain DLSS-NR into DLSS-SR on one dispatch (dlss_chain)", l.dlss_chain,
+			a_teardown | a_reconcile, "dlss_chain", k_rebuild,
+			"BOTH NETWORKS, ONE ACCEPTED DISPATCH. DLSS-NR denoises at the RENDER extent and its "
+			"denoised result becomes DLSS-SR's colour input; DLSS-SR then upscales that. It is not "
+			"dlss_nr and dlss_sr both being 1 - that configuration hands the dispatch to SR and the "
+			"NR evaluate never runs at all.\n\n"
+			"IT NEEDS BOTH SNIPPETS ARMED. nvngx_dlssnr.dll (dlss_nr=1) AND nvngx_dlss.dll, and the "
+			"second is a 59 MB LoadLibraryW that happens at LAUNCH - so 0 -> 1 is save-and-relaunch "
+			"on exactly the terms dlss_sr is, for exactly the same measured reason (Init_Ext is "
+			"called once per process and its one recorded failure mode is a hang). 1 -> 0 is fully "
+			"live: the next frame runs whichever single feature is selected.\n\n"
+			"IT ALSO RE-PINS THE SHADER. The chain upscales, so it targets the MainUpsampling "
+			"permutation - a different #define set, therefore different DXBC and a different "
+			"fnv1a64. sr_shader_hash below is used for chain exactly as it is for dlss_sr; with it "
+			"at 0 the DLSS-NR pin is used and the chain will simply never see an accepted dispatch.\n\n"
+			"The proof it RAN is \"DLSS-CHAIN: CHAINED EVALUATE #1 OK\" in ReShade.log and the "
+			"chained= counter on the periodic DLSS-CHAIN census line. Nothing here infers success "
+			"from the absence of an error.");
+
+		if (want_chain && nr_armed && sr_armed)
+			overlay_imgui::textf_colored(col::green,
+				"    BOTH features are armed - the chain is reachable now.");
+		else if (want_chain && !sr_armed)
+			overlay_imgui::textf_colored(col::amber,
+				"    DLSS-SR is NOT armed, so the chain will NOT run. Save and relaunch (see the "
+				"dlss_sr line above for which of the two reasons applies).");
+		else if (want_chain && !nr_armed)
+			overlay_imgui::textf_colored(col::amber,
+				"    DLSS-NR is NOT armed, so the chain will NOT run - it is the FIRST network in "
+				"the chain. Set dlss_nr=1 below and relaunch.");
+
+		// Everything below only means anything while DLSS-SR is actually going to run, and CHAIN
+		// MODE IS ONE OF THE TWO WAYS IT DOES. Gating this on want_sr alone would have greyed out
+		// every create flag, the jitter scales and the output geometry on the dlss_sr=0,
+		// dlss_chain=1 configuration - in which sr_try_run reads every one of them.
+		ImGui::BeginDisabled(!((want_sr || want_chain) && sr_armed));
 
 		// a_reconcile, not 0u, and it is not decoration: the render path prints a one-shot ERROR
 		// when this is 1 while sr_direct_output and sr_copy_back are both 0, because that
@@ -2923,6 +3235,143 @@ inline void draw_controls(const host_facts &f)
 			"static world, the sky, translucency and every movable that did not move. It is a "
 			"bring-up A/B, not a setting to ship.");
 		ImGui::EndDisabled();
+
+		// ---- THE LADDER: what the frame actually does with the evaluate's result ----------------
+		checkbox_b("Evaluate straight into the game's TAA output (sr_direct_output)",
+			l.sr_direct_output, k_plain,
+			"Live, per dispatch, free - the branch that reads it is inside sr_try_run, downstream of "
+			"the per-pass snapshot.\n\n"
+			"ON binds the game's own u0 as DLSS's output and no add-on texture is allocated at all. "
+			"OFF evaluates into our own texture and then copies it back if sr_copy_back is on. OFF + "
+			"sr_copy_back is the bring-up shape: a failed evaluate leaves the game's own TAAU result "
+			"in place instead of whatever was last in u0.");
+
+		checkbox_b("Copy our result back over the TAA output (sr_copy_back)", l.sr_copy_back, k_plain,
+			"Live, per dispatch. Only consulted when sr_direct_output is OFF - with direct output "
+			"there is nothing to copy, because DLSS wrote into u0 itself.\n\n"
+			"WITH BOTH OFF the SR pass evaluates into a texture NOTHING READS and the frame looks "
+			"exactly like stock TAA. That is a legitimate bring-up rung - a correct frame is then "
+			"positive evidence the state restore is faithful - but it is also the combination that "
+			"makes sr_suppress_taa above be REFUSED rather than obeyed.");
+
+		checkbox_b("Take the render extent from ViewSizeAndInvSize (sr_use_view_rect)",
+			l.sr_use_view_rect, k_reset,
+			"Live, one Reset frame - and it needs no button, because changing it moves the RENDER "
+			"extent and sr_try_run's own geometry test notices that and queues the feature rebuild "
+			"itself, exactly as a resolution change does.\n\n"
+			"ON uses the view rect the View uniform buffer reports, which is the sub-texture region "
+			"UE actually rendered. OFF uses the whole colour TEXTURE extent, which with a pooled "
+			"render target can be larger than the frame - and then DLSS is told to upscale from an "
+			"extent containing pixels the game never wrote.");
+
+		// ---- jitter ------------------------------------------------------------------------------
+		slider_f("Jitter scale X (sr_jitter_scale_x)", l.sr_jitter_scale_x, -4.0f, 4.0f, "%.3f",
+			k_reset,
+			"Live, one Reset frame. 1.0 is the shipping value and means \"send the jitter exactly as "
+			"UE reports it\". This is the SIGN A/B: DLSS and UE disagree about the sign convention on "
+			"some titles, and -1.0 here is how that is tested without rebuilding anything. Anything "
+			"other than 1.0 is flagged as OVERRIDDEN on the arm banner.");
+		slider_f("Jitter scale Y (sr_jitter_scale_y)", l.sr_jitter_scale_y, -4.0f, 4.0f, "%.3f",
+			k_reset, "Live, one Reset frame. See Jitter scale X - the two are independent so the "
+			"sign A/B can be run one axis at a time.");
+
+		checkbox_b("Accept a projection-only jitter read (sr_jitter_projection_only)",
+			l.sr_jitter_projection_only, k_reset,
+			"Live, one Reset frame. The jitter read has three tiers of confidence; OFF is STRICT and "
+			"accepts only the full or no-params layouts. ON additionally accepts a match found from "
+			"the projection matrix alone.\n\n"
+			"THERE IS NO \"RUN WITHOUT JITTER\" CONFIGURATION - sending (0,0) would be worse than "
+			"refusing, because zero is a legitimate value (r.TemporalAASamples=1) the snippet cannot "
+			"tell apart from a failed read, and the result is a silent shimmer. This widens what "
+			"counts as a read, never what happens when there is none.");
+
+		// ---- the motion guide's grid --------------------------------------------------------------
+		slider_f("MVec scale X for SR (sr_mv_scale_x, 0 = auto)", l.sr_mv_scale_x, -4096.0f, 4096.0f,
+			"%.3f", k_reset,
+			"Live, one Reset frame. 0 means DERIVED - render extent over velocity extent, which is "
+			"right whenever the guide is on its own grid. A non-zero value overrides that derivation "
+			"outright and is flagged OVERRIDDEN on the arm banner.\n\n"
+			"Note it cannot fix UE4's velocity ENCODING, which carries a bias as well as a scale: "
+			"that is what sr_mvec_decode is for. A scale alone can rescale a grid and can never "
+			"remove a bias.");
+		slider_f("MVec scale Y for SR (sr_mv_scale_y, 0 = auto)", l.sr_mv_scale_y, -4096.0f, 4096.0f,
+			"%.3f", k_reset, "Live, one Reset frame. See MVec scale X.");
+
+		// ---- the output geometry ------------------------------------------------------------------
+		// k_reset and no action bit, and that is not an oversight. All three feed want_out_w/h, and
+		// sr_try_run compares that against sr_seen_out_w/h on every pass: a change makes key_moved
+		// true, which queues kTeardown through the SAME seam the recreate button uses. Raising the
+		// bits here as well would mean a teardown per pixel of slider drag for no extra effect.
+		slider_u32("Output width (sr_out_width, 0 = from the group counts)", l.sr_out_width,
+			0, 7680, 0u, "sr_out_width", k_reset,
+			"Live, and it rebuilds the feature BY ITSELF: sr_try_run compares the output extent it "
+			"derives against the one it used last pass, and a move queues the same release the "
+			"recreate button below asks for. Dragging this is therefore safe but not free - each "
+			"landing value the pass sees costs one CreateFeature.\n\n"
+			"0 means \"derive it from the dispatch group counts\", which is what a normal run wants. "
+			"Pin it only when the derivation is provably wrong for this title.");
+		slider_u32("Output height (sr_out_height, 0 = from the group counts)", l.sr_out_height,
+			0, 4320, 0u, "sr_out_height", k_reset,
+			"Live on the same terms as Output width above - the geometry test rebuilds the feature "
+			"itself. 0 derives it from the dispatch group counts.");
+		slider_u32("Group tile size (sr_group_tile)", l.sr_group_tile, 1, 32,
+			0u, "sr_group_tile", k_reset,
+			"Live on the same terms as the two above. This is the shader's [numthreads] tile edge, "
+			"and it is what turns the dispatch's GROUP counts into an output extent: out = tile * "
+			"groups. 8 matches UE 4.27's TAA pass. Getting it wrong does not crash anything - it "
+			"derives the wrong output extent, the output-UAV pick then rejects every candidate, and "
+			"the pass simply stops running.");
+
+		// ---- THE CREATE FLAGS. Tier 1: latched at CreateFeature, no evaluate-time equivalent. -----
+		// These do NOT auto-rebuild the way the geometry above does, because nothing in the render
+		// path compares them against what the live feature was created with. The recreate button
+		// below is the mechanism, and every tooltip here says so rather than leaving the user to
+		// discover it - a control that silently needs a button is the failure this panel exists to
+		// remove, and saying which is the difference between that and an honest one.
+		ImGui::SeparatorText("DLSS-SR create flags - press \"Recreate the SR feature\" to apply");
+
+		checkbox_b("IsHDR (sr_hdr)", l.sr_hdr, k_plain,
+			"CREATE-TIME. Stored live and coherently; it TAKES on the next feature create, so press "
+			"\"Recreate the SR feature\" below.\n\n"
+			"It selects the HDR-TRAINED KERNEL. It is NOT an exposure gate and it does not change "
+			"what is bound - the colour input is whatever the pass already had.");
+		checkbox_b("MVLowRes - the guide is on the render grid (sr_mv_lowres)", l.sr_mv_lowres, k_plain,
+			"CREATE-TIME - press \"Recreate the SR feature\" below.\n\n"
+			"ON tells DLSS the motion vectors are at the RENDER extent, which is what UE 4.27 "
+			"produces and what our own decode writes. OFF claims they are at the display extent; "
+			"with a render-grid guide that is a mis-declaration, not an option.");
+		checkbox_b("MVJittered - the guide carries the jitter (sr_mv_jittered)", l.sr_mv_jittered,
+			k_plain,
+			"CREATE-TIME - press \"Recreate the SR feature\" below. OFF is correct for UE 4.27: the "
+			"velocity pass writes unjittered motion and the jitter is delivered separately through "
+			"Jitter.Offset.X/Y.");
+		checkbox_b("DepthInverted (sr_depth_inverted)", l.sr_depth_inverted, k_plain,
+			"CREATE-TIME - press \"Recreate the SR feature\" below. ON is correct for UE 4.27, which "
+			"uses reversed-Z. This is the SR feature's own flag and is independent of the DLSS-NR "
+			"depth_inverted above; they are two features being told about the same buffer.");
+		checkbox_b("AutoExposure (sr_auto_exposure)", l.sr_auto_exposure, k_plain,
+			"CREATE-TIME - press \"Recreate the SR feature\" below. ON lets the snippet compute "
+			"exposure itself, which is what a run that does not bind an exposure texture wants - and "
+			"this add-on does not bind one.");
+		checkbox_b("AlphaUpscaling (sr_alpha_upscaling)", l.sr_alpha_upscaling, k_plain,
+			"CREATE-TIME - press \"Recreate the SR feature\" below. OFF is the default and is right "
+			"unless the colour input's alpha is meaningful coverage rather than whatever the render "
+			"target happened to leave there.");
+		checkbox_b("DLSS.Use.HW.Depth (sr_hw_depth)", l.sr_hw_depth, k_plain,
+			"CREATE-TIME - press \"Recreate the SR feature\" below. It tells the snippet the depth "
+			"SRV is a hardware depth buffer rather than a linearised copy. ON is correct here: the "
+			"resource bound is the game's own depth target.");
+
+		checkbox_b("Run the optimal-settings query at arm (sr_optimal_settings)",
+			l.sr_optimal_settings, k_plain,
+			"ARM-TIME ONLY, AND THAT IS THE WHOLE OF IT - the same shape dlss_nr has. Its one read "
+			"site is in the deferred initialiser, which runs once per process on the first accepted "
+			"dispatch, so there is no second read a live value could reach. It is saved and reverted "
+			"like every other key and it takes effect next launch.\n\n"
+			"It is a DIAGNOSTIC. It asks the snippet for a RECOMMENDED render resolution and prints "
+			"it; it has no power whatsoever to make UE render at it - the only lever for that is "
+			"r.ScreenPercentage. Off by default because it runs on a scratch parameter block whose "
+			"Width/Height have inverted meaning, which is a footgun worth not arming by default.");
 
 		if (ImGui::Button("Recreate the SR feature (apply create-time settings)"))
 			request(a_teardown | a_reconcile, "sr create-time settings", k_rebuild);

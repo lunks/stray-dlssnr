@@ -163,6 +163,67 @@ struct config
 	// cast.
 	float    color_strength = 1.0f;
 
+	// ---- which GRAFT-BACK the decode uses --------------------------------------------------
+	// The ENCODE is the same either way: same exact piecewise sRGB, same soft-clip knee 0.75 and
+	// shoulder 5.770780, so the network is shown the same proxy and returns the same answer. Only
+	// the way that answer is carried back onto the untouched HDR original differs.
+	//
+	//   0  ADDITIVE (ours, the DEFAULT, and the only mode whose identity is bit-exact)
+	//        transferred = original + (neural - proxy) / s
+	//      A scene-linear residual. Exactly +0.0 when the network asked for nothing, which is what
+	//      makes transfer_strength=0 an EXACT no-op at every paper_white_scale. RGB is scaled
+	//      uniformly, so the original's hue cannot drift.
+	//
+	//   1  RENODX UpgradeToneMap, reproduced from the reference add-on's own embedded HLSL
+	//      (renodx-reference.addon64, .rdata RVA 0x42f90..0x440bd, contiguous plaintext).
+	//        original_y < proxy_y : ratio = original_y / proxy_y
+	//        else                 : ratio = (neural_y + max(0, original_y - proxy_y)) / neural_y
+	//        result = lerp(original, HueOkLab(neural * ratio, neural), transfer_strength)
+	//      It REBUILDS the pixel from the network's answer and then locks the hue to the NEURAL's
+	//      hue in OkLab, with an AP1 gamut clamp.
+	//
+	// WHAT ACTUALLY DIFFERS, MEASURED, NOT ASSUMED (tools/hdr_codec_selftest.cpp).
+	// Luminance is linear, so their "headroom term" max(0, original_y - proxy_y) is ALGEBRAICALLY
+	// our additive residual:
+	//     neural_y + max(0, original_y - proxy_y)  ==  Y(original + (neural - proxy))
+	// The two modes therefore deliver the SAME luminance gain at every source magnitude. The whole
+	// difference is CHROMA, and it has TWO halves that show at OPPOSITE ends of color_strength:
+	//   * HIGHLIGHTS, at color_strength = 1. Where the soft clip has crushed the proxy to white the
+	//     network's answer is neutral, so mode 1 drags a clipped highlight toward the white point
+	//     while mode 0 leaves its chromaticity alone.
+	//   * SHADOWS, at color_strength = 0. Mode 0 has a chroma floor - it crossfades to the
+	//     network's own colour below Y = 0.001/s - and mode 1, faithfully to renodx, has none at
+	//     all, so it keeps the original's chromaticity and rescales it by an unbounded ratio.
+	//     Measured over 400,000 dark chromatic pixels: worst 27.6 8-bit code values, 42.5 % of them
+	//     differing by 2 or more. Forcing mode 0's valve open collapses that to 0.0, which is what
+	//     pins the cause on the valve. So color_strength = 0 is NOT a control that cancels the
+	//     graft difference; it swaps which half of it you are looking at.
+	//
+	// Mode 1 is a colour experiment, NOT a highlight-recovery fix. Neither mode recovers a bright
+	// highlight, and the ceiling is lower than the soft clip suggests because the proxy is stored
+	// in an r16g16b16a16_float surface: the encoded proxy quantises to exactly 1.0 at 1.81x paper
+	// white (3.47x is the FP32 figure and is not the one that governs), and of a requested +30 %
+	// gain the decode already delivers only ~50 % at 1.15x and ~5 % at 1.86x. Those ratios are to
+	// PAPER WHITE and do not move with paper_white_scale; the scene-linear magnitude they land at
+	// moves in proportion. That is what paper_white_scale is for.
+	//
+	// Mode 1 is also NOT an exact bypass at transfer_strength=0: it works in display-referred space
+	// throughout, so the result is (original * s) / s, which is exact only when s is a power of two
+	// (i.e. paper_white_scale 1.0, 2.0, 0.5, ...). Mode 0 is exact at every value. That is why 0 is
+	// the default.
+	//
+	// LIVE: this is a shader constant in the decode's root-constant block, snapshotted with the
+	// rest of the pass. No feature recreate, no pipeline rebuild - flip it in the overlay and the
+	// very next frame uses the other graft.
+	//
+	// NORMALISED TO {0, 1} AT PARSE, not left as the user typed it. The shader branch is
+	// `g_hdrGraft == 0u ? ours : theirs`, so there is no third behaviour for a third value to
+	// name - and an unlisted value made the overlay drop the combo entirely and print
+	// "2  (not a listed value - sent as-is)", leaving no way back to either mode without editing
+	// this file and restarting. Contrast DLSSNR.Style, where an unlisted value really does reach
+	// NGX with a meaning of its own and is therefore preserved.
+	uint32_t hdr_graft = 0;
+
 	// ---- temporal feedback ----------------------------------------------------------------
 	// Break the loop documented in README gap 5.
 	//
@@ -313,6 +374,50 @@ struct config
 	// not run, whether or not the NR snippet is loaded. This key only controls whether the NR
 	// snippet is loaded and initialised at all.
 	bool     dlss_nr = true;
+
+	// =======================================================================================
+	// CHAIN MODE - DLSS-NR *then* DLSS-SR, on ONE accepted TAA dispatch.
+	// =======================================================================================
+	//
+	// dlss_sr=1 and dlss_nr=1 do not chain: the SR pass TAKES the accepted dispatch and the NR
+	// evaluate never runs. That is an implementation choice, not a limitation - both snippets
+	// already load side by side through the trampoline's two slots, DLSS-NR already evaluates
+	// into its OWN texture rather than writing the frame, and DLSS-SR's colour input is a
+	// parameter. This key wires the one to the other:
+	//
+	//     game TAA dispatch (suppressed)
+	//       -> [codec encode]  render-res linear HDR -> display-referred proxy
+	//       -> DLSS-NR         proxy -> out_tex, at the RENDER extent
+	//       -> [codec decode]  the denoised answer grafted back onto the linear original
+	//       -> DLSS-SR         COLOUR = the denoised render-res image -> u0 at 4K
+	//
+	// Denoise first, THEN upscale. The other order - which is what dlss_sr=0/dlss_nr=1 does
+	// today - denoises at 1920x1080 and then lets a spatial filter magnify whatever noise is
+	// left into 3840x2160.
+	//
+	// WHAT IT COSTS WHEN IT IS 0, which is the default and the shipping configuration: one bool
+	// is parsed and stored, and it is read in a handful of `&&`/`||` chains that short-circuit
+	// false. Nothing is loaded, nothing is allocated, no GPU work changes, and the
+	// "dlss_sr=0 is BIT-IDENTICAL to the build before SR existed" contract above extends to it
+	// verbatim. With dlss_chain=0 the branch at the end of nr_try_run is exactly the one that
+	// ships today.
+	//
+	// REQUIREMENTS, and the add-on says so in the log rather than degrading silently:
+	//   * BOTH snippets must load and arm - nvngx_dlssnr.dll AND nvngx_dlss.dll. If either does
+	//     not, chain mode is refused once, by name, and the run falls back to whichever single
+	//     feature did arm. It never half-runs.
+	//   * UE4 must be in the MainUpsampling permutation (r.TemporalAA.Upsampling=1,
+	//     r.SecondaryScreenPercentage=100, r.ScreenPercentage=50), because otherwise the TAA
+	//     pass's output UAV is the same size as its colour input and there is nothing to upscale
+	//     into. That permutation has DIFFERENT DXBC, so sr_shader_hash must be re-pinned - the
+	//     want-hash selector below treats dlss_chain exactly like dlss_sr.
+	//   * hdr_codec=1 is effectively mandatory. With it off, DLSS-SR is handed the network's raw
+	//     DISPLAY-REFERRED answer as if it were linear HDR - README gap 1, magnified by the
+	//     upscaler. The add-on warns once and runs anyway.
+	//
+	// The DLSS-NR copy-back does not happen in chain mode and CANNOT: its result is at the render
+	// extent and u0 is at the output extent. DLSS-SR's write is the only write to u0.
+	bool     dlss_chain = false;
 
 	// ---- identification --------------------------------------------------------------------
 	// THE ONE-LINE HASH RE-PIN. Flipping r.TemporalAA.Upsampling changes TAA_PASS_CONFIG, and
@@ -596,6 +701,7 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "transfer_strength")        c.transfer_strength = parse_float(v, c.transfer_strength);
 		else if (key == "color_strength" || key == "colour_strength")
 		                                            c.color_strength = parse_float(v, c.color_strength);
+		else if (key == "hdr_graft")                c.hdr_graft = (parse_u64(v, c.hdr_graft) != 0ull) ? 1u : 0u;
 		else if (key == "history_restore")          c.history_restore = parse_bool(v, c.history_restore);
 		else if (key == "restore_graphics_root")    c.restore_graphics_root = parse_bool(v, c.restore_graphics_root);
 		else if (key == "populate_parameters")      c.populate_parameters = parse_bool(v, c.populate_parameters);
@@ -620,6 +726,7 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "app_id")                   c.app_id = parse_u64(v, c.app_id);
 		else if (key == "dlss_sr")                  c.dlss_sr = parse_bool(v, c.dlss_sr);
 		else if (key == "dlss_nr")                  c.dlss_nr = parse_bool(v, c.dlss_nr);
+		else if (key == "dlss_chain")               c.dlss_chain = parse_bool(v, c.dlss_chain);
 		else if (key == "sr_shader_hash")           c.sr_shader_hash = parse_u64(v, c.sr_shader_hash);
 		else if (key == "sr_out_width")             c.sr_out_width = static_cast<uint32_t>(parse_u64(v, c.sr_out_width));
 		else if (key == "sr_out_height")            c.sr_out_height = static_cast<uint32_t>(parse_u64(v, c.sr_out_height));
