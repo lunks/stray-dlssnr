@@ -5943,15 +5943,37 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 				// denoise, and all the >= 1.0 branch turns off is the optional attenuation pass
 				// that has nothing left to attenuate [see addon_config.hpp; the false at
 				// 0x18001f51a is stored to a flag at 0x1800191bd, not returned as an abort].
+				//
+				// THE TEST FOR "SHOULD THIS NOTE EXIST" IS NOT "is the claim true" - it is "does
+				// it fire at a value the user did not choose, to report a fault that is not
+				// there". A note that fires at a default to report a REAL inertness (Style=0
+				// below) passes that test; one that fires at a default to report a fault it
+				// invented does not.
 				if (g_cfg.intensity > 1.0f)
 					LOGI("DLSS-NR:   NOTE Intensity=%.3f behaves exactly as 1.0. Above 1.0 the "
 					     "snippet takes the same branch [comiss/ja at 0x18001d50a], which is "
 					     "FULL denoise with no attenuation pass - not 'off'. Lower it below 1.0 "
-					     "to attenuate.", g_cfg.intensity);
+					     "to attenuate: that moves the selector from mode 0 to mode 1 (the "
+					     "ControlMask at [rcx+0x60] is null here, so the cmovne at 0x18001d53d "
+					     "cannot force mode 3). Whether mode 1 then RUNS is a backend capability "
+					     "bit we cannot read [bt eax,0 at 0x1800295ff]; judge it by eye.",
+					     g_cfg.intensity);
 				if (g_cfg.local_tone_strength > 1.0f)
 					LOGI("DLSS-NR:   NOTE LocalTone=%.3f behaves exactly as 1.0. The snippet "
 					     "clamps it to [0,1] itself at 0x18001d603, so this is byte-identical to "
 					     "the 1.0 default.", g_cfg.local_tone_strength);
+				// THE ONE NOTE THAT FIRES AT A SHIPPED DEFAULT ON PURPOSE, because at that default
+				// the control genuinely is inert and the user is entitled to know BEFORE they spend
+				// an evening dragging it. This is the opposite of the old ">= 1.0 INERT" note, which
+				// fired at the default to report a problem that was not there.
+				if (g_cfg.style == 0)
+					LOGI("DLSS-NR:   NOTE Style=0: LocalTone=%.3f MOVES NOTHING. Each of the 14 "
+					     "lerps at 0x18001d617.. is gated by the per-style bitmask loaded at "
+					     "0x18001d606, and this build's default mask [0x1800b0da8] is 0x00000000, "
+					     "so every gate is taken and no parameter is written. The only enabled "
+					     "sub-entries are key 1 (mask 0x34, 3 of 14) and key 2 (mask 0x20, 1 of "
+					     "14). Try Style 1 or 2 if you want this slider to do anything.",
+					     g_cfg.local_tone_strength);
 				if (!g_cfg.use_auto_mask)
 					LOGI("DLSS-NR:   NOTE UseAutoMask=0, so the snippet substitutes -1.0f for "
 					     "BOTH structure strengths at 0x18001aa84 and neither knob can matter.");

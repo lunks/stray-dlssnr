@@ -2683,71 +2683,150 @@ inline void draw_controls(const host_facts &f)
 	{
 		// The three NAMES are genuinely the reference add-on's - all three are in
 		// renodx-reference.addon64's string table. What is NOT established is that styles 1 and 2
-		// exist in THIS snippet build: stray_dlssnr.ini and README.md both record "only 0 is known
-		// to exist", and nothing in this tree has ever measured 1 or 2. So the labels carry that
-		// on their face. They are not hidden, because DLSSNR.Style itself is real, live and
+		// exist in THIS snippet build: nothing in this tree has ever MEASURED 1 or 2. The binary
+		// does now show two enabled keyed sub-entries carrying keys 1 and 2 with non-zero local-tone
+		// masks (0x1800b0de4 / 0x1800b0e28), which is a reason to try them and NOT a measurement of
+		// them - the labels say exactly that much and no more. They are not hidden, because DLSSNR.Style itself is real, live and
 		// written every evaluate - the INDEX is what is unverified, not the parameter - but a user
 		// who picks one and sees nothing must be able to tell "this build has no such style" from
 		// "the add-on is broken", and only the label can tell them that at the moment they click.
 		static const char *const style_items[] = {
-			"0 - Default",
-			"1 - Natural (UNVERIFIED in this snippet build)",
-			"2 - Cinematic (UNVERIFIED in this snippet build)",
+			"0 - Default (local tone mask 0x00000000 - moves nothing)",
+			"1 - Natural (a keyed sub-entry with mask 0x34 exists; UNMEASURED)",
+			"2 - Cinematic (a keyed sub-entry with mask 0x20 exists; UNMEASURED)",
 		};
 		combo_u32("NR Style", l.style, style_items, 3, k_plain,
-			"Live: DLSSNR.Style is written on every evaluate and is NOT baked at CreateFeature, so "
-			"the parameter itself is real. Only the INDEX reaches the snippet. ONLY STYLE 0 IS KNOWN "
-			"TO EXIST IN THIS SNIPPET BUILD - that is what stray_dlssnr.ini and README.md both say, "
-			"and nobody here has measured 1 or 2. What the snippet does with an index it does not "
-			"have is UNKNOWN and is deliberately not guessed at here: it may clamp, it may alias, or "
-			"the Get may simply fail its guard and fall back. None of those can crash, so trying one "
-			"is safe - just do not read \"no visible change\" as a measurement of that style.");
+			"DLSSNR.Style is written on every evaluate and is NOT baked at CreateFeature, so the "
+			"parameter itself is real. Only the INDEX reaches the snippet, and nobody here has "
+			"MEASURED 1 or 2 on hardware.\n"
+			"WHAT THE BINARY SAYS. There is exactly one style RECORD: 0x180023bb0 is cmp rcx,1 / jae "
+			"-> xor eax,eax, so an index of 1 or 2 into that table returns NULL. But inside the one "
+			"record there are eight KEYED SUB-ENTRIES, and two of them are enabled: key 1 at "
+			"0x1800b0de4 (local-tone mask 0x34) and key 2 at 0x1800b0e28 (mask 0x20). The record's "
+			"own default mask, at 0x1800b0da8, is 0x00000000.\n"
+			"THIS IS WHY LOCAL TONE STRENGTH DOES NOTHING AT STYLE 0 - read its tooltip. If any "
+			"index makes that slider bite, it is 1 or 2. NOT ESTABLISHED: that DLSSNR.Style is the "
+			"value compared against those sub-entry keys rather than the separate record-id compare "
+			"at 0x18001d8b3. Trying one is safe - none of the paths can crash - but do not read "
+			"\"no visible change\" as a measurement of that style.");
 	}
 
 	// THE SLIDER RANGE IS [0,1], AND IT IS NOT A FIX - IT IS HONESTY ABOUT THE DOMAIN.
 	// A previous revision narrowed these from 0..2 and called the range "the bug". It was not:
 	// narrowing a slider removes reachable values and adds none, so it cannot make a dead control
 	// live. What [0,1] buys is that no position on these sliders is indistinguishable from its
-	// neighbour. Every claim below is cited to the deployed snippet; addon_config.hpp carries the
-	// full disassembly. The ini is NOT clamped, so any value remains reachable by hand.
+	// neighbour. The ini is NOT clamped, so any value remains reachable by hand.
+	//
+	// NOT ONE OF THE FIVE CONTROLS IN THIS SECTION IS LABELLED "Live", AND THAT IS DELIBERATE.
+	// Three rounds of analysis each proved REACHABILITY and shipped it as LIVENESS, and each was
+	// caught by the next round's verifier. What is actually proven for each is spelled out in its
+	// own tooltip, in the text the user reads, with the disassembly it rests on. Where a gate
+	// cannot be observed from this side of the NGX call, the tooltip says so and tells the user to
+	// trust the image instead. "Conditional" is the correct label for a control whose consumer we
+	// have located but never watched execute. addon_config.hpp carries the long-form derivation.
 	slider_f("NR Intensity", l.intensity, 0.0f, 1.0f, "%.2f", k_plain,
-		"Live. An ATTENUATION, not a gain - and 1.0 (the default, the top of this slider) is FULL "
-		"denoise, not 'off'. Below 1.0 the snippet enables an extra attenuation pass to blend the "
-		"denoised result back toward the input [comiss xmm0,[rbx+0xe0] / ja at 0x18001d50a "
-		"selecting mode 1 or 3 at 0x18001d53d]. At 1.0 and above that pass is simply not needed, "
-		"so it is not enabled - the DENOISE ITSELF IS UNAFFECTED. The false at 0x18001f51a is "
-		"stored to a flag at 0x1800191bd and the evaluate falls straight through it; it is not an "
-		"abort. Values above 1.0 are indistinguishable from 1.0, which is why the slider stops "
-		"there. DRAG DOWN to reduce denoising.");
+		"An ATTENUATION, not a gain - and 1.0 (the default, the top of this slider) is FULL "
+		"denoise, not 'off'. DRAG DOWN to reduce denoising.\n"
+		"PROVEN: every value AT OR ABOVE 1.0 drives byte-identical code, which is the only reason "
+		"this slider stops at 1.0. fn 0x18001d4d0 is a MODE SELECTOR returning 0, 1 or 3 - NOT a "
+		"boolean - and it reads the value at [rcx+0xe0]:\n"
+		"    0001d50a  comiss xmm0, dword [rbx+0xe0]   ; 1.0 vs Intensity\n"
+		"    0001d511  ja     0x18001d521              ; taken iff Intensity < 1.0\n"
+		"    0001d513  add    rbx, 0x60\n"
+		"    0001d517  cmp    qword [rbx], 0           ; the ControlMask pointer\n"
+		"    0001d51b  jne    0x18001d525\n"
+		"    0001d51d  xor    al, al                   ; >=1.0 AND no ControlMask -> mode 0\n"
+		"    0001d521  add    rbx, 0x60                ; <1.0 -> al = 1 unconditionally\n"
+		"    0001d525  mov    al, 1\n"
+		"    0001d52f  cmp    qword [rbx], 0\n"
+		"    0001d53d  cmovne eax, ecx                 ; ControlMask bound -> 3 for EVERY value\n"
+		"PROVEN HERE: qword [rcx+0x60] is the ControlMask pointer - 0x18001aa4b tests the same "
+		"slot to force UseAutoMask off - and it is NULL on this deployment, because this add-on "
+		"writes DLSSNR.ControlMask as an explicit NULL and a null simply lands. So the cmovne's "
+		"non-null branch cannot be taken here, and dragging below 1.0 really does move the mode "
+		"from 0 to 1.\n"
+		"NOT CONFIRMED: that mode 1 changes the image. 0x18001f500 puts the mode through a BACKEND "
+		"CAPABILITY QUERY before anything runs - 0x18001f522 call 0x1800295e0, which does "
+		"lea ecx,[rbx-1] / bt eax, mode-1 against a bitmask fetched through a vtable at "
+		"0x1800295ef. If the backend does not advertise bit 0, the query returns false, the flag "
+		"at 0x1800191bd stays clear, and the one extra dispatch it gates [0x18001978c je, skipping "
+		"call 0x180023080 at 0x1800197d9] never issues. That false is NOT an abort - an earlier "
+		"revision read it as one and called this control dead. Nothing on this side of the NGX "
+		"call can read that capability bit, so drag down and TRUST YOUR EYES.");
+
+	ImGui::SeparatorText("Local tone - style-gated, inert at the default style");
 
 	slider_f("Local Tone Strength", l.local_tone_strength, 0.0f, 1.0f, "%.2f", k_plain,
-		"Live, and this range is PROVEN rather than conventional. A blend coefficient the snippet "
-		"clamps to [0,1] itself [0x18001d603-0x18001d614] before using it to lerp 14 network "
-		"parameters into [rcx+0x124..0x158], so every value at or above 1.0 is byte-identical to "
-		"1.0. 1.0 = full local tone and is the default; DRAG DOWN to reduce it.");
+		"INERT AT THE SHIPPED DEFAULT STYLE. Expect no image change from this slider until Style "
+		"selects a keyed sub-entry, and even then it moves at most 3 of its 14 parameters.\n"
+		"The snippet does clamp the value to [0,1] itself [0x18001d603 comiss / 0x18001d60a "
+		"movaps / 0x18001d614 xorps], so anything at or above 1.0 is byte-identical to 1.0. But "
+		"THE CLAMP IS NOT THE POINT. Every one of the 14 lerps it feeds is gated by a per-style "
+		"BITMASK, loaded by the instruction an earlier revision quoted around:\n"
+		"    0001d603  comiss xmm2, xmm3\n"
+		"    0001d606  mov    eax, dword [rdx]   ; <- THE MASK\n"
+		"    0001d608  jbe    0x18001d60f\n"
+		"and then tested bit by bit - test al,1 / test al,2 / test al,4 ... bt eax,0xd - before "
+		"each store into [rcx+0x124..0x158]. A ZERO MASK STORES NOTHING.\n"
+		"There is exactly ONE style record. 0x180023bb0 is cmp rcx,1 / jae -> xor eax,eax, so "
+		"every index above 0 returns NULL, and 0x1800239a0 scans 0x1800b0d80..0x1800b1008 at "
+		"stride 0x288 - one iteration. Its DEFAULT mask block, used whenever no keyed sub-entry "
+		"matches at 0x18001d8d6-0x18001d8e9, is dword [0x1800b0da8] = 0x00000000.\n"
+		"Of its eight sub-entries only TWO are enabled (flag byte non-zero at 0x18001d8db): key 1 "
+		"at 0x1800b0de4 carries mask 0x34 (bits 2,4,5 -> [rcx+0x12c], [rcx+0x134], [rcx+0x138] - "
+		"three of the fourteen) and key 2 at 0x1800b0e28 carries mask 0x20 (bit 5 -> [rcx+0x138] "
+		"- one of the fourteen). The other six carry flag byte 0 and are skipped.\n"
+		"NOT ESTABLISHED: that DLSSNR.Style is the value compared against those sub-entry keys. "
+		"The key is r9d at the call site 0x18001d8f2 and the record id is a separate compare "
+		"against [record+8] at 0x18001d8b3; which of the two DLSSNR.Style drives has not been "
+		"traced. What IS established is that the default path stores 0 of 14.\n"
+		"A previous revision called this range 'PROVEN' and the control 'Live'. It had proven the "
+		"CLAMP and reported it as LIVENESS.");
 
 	const bool mask_on = l.use_auto_mask.load(std::memory_order_relaxed);
 
 	// THE THREE CONTROLS BELOW SHARE ONE UNRESOLVED GATE. See addon_config.hpp: the only code
-	// that consumes the effective structure pair sits behind two dynamic_cast null tests - the
-	// network must be an HNetCpp::CCNetwork [0x180021cc8, tested 0x18002253f] and the layer a
-	// CCTinlayoutFusedPreBlockSwin1HLayer [0x18003f5e8, tested 0x18003f5f3]. If either cast
-	// fails, all three are inert together and no value of any of them does anything. Whether the
-	// shipped model satisfies them is not settled from the binary alone, so say so here rather
-	// than label these "Live" the way the two above are.
+	// that consumes the effective structure pair sits behind two dynamic_cast null tests. Both
+	// were re-read instruction by instruction against the deployed binary:
+	//
+	//   GATE 1  0021cb4  lea  r9, [0x1811412d8]     ; dst .?AVCCNetwork@HNetCpp@@
+	//           0021cbb  lea  r8, [0x1811412b0]     ; src .?AVNetwork@HNetCpp@@
+	//           0021cc2  xor  edx, edx
+	//           0021cc4  mov  rcx, qword [rdi+0x48]
+	//           0021cc8  call 0x18007f5cc           ; __RTDynamicCast
+	//           0021ccd  mov  rbx, rax
+	//           0021cd0  mov  qword [rsp+0xe0], rax
+	//           0022537  mov  rcx, qword [rsp+0xe0]
+	//           002253f  test rcx, rcx
+	//           0022542  je   0x18002263b           ; skips the whole consumer block
+	//           0022548  movss xmm5, dword [r14+0xfc]
+	//
+	//   GATE 2  003f5d0  lea  r9, [0x1811414b0]     ; dst .?AVCCTinlayoutFusedPreBlockSwin1HLayer
+	//           003f5df  lea  r8, [0x181141300]     ; src .?AVLayer@HNetCpp@@
+	//           003f5e8  call 0x18007f5cc           ; __RTDynamicCast
+	//           003f5ed  mov  rsi, rax
+	//           003f5f0  test rax, rax
+	//           003f5f3  je   0x18003f68e           ; skips the call to the store at 0x180061700
+	//
+	// If either cast returns null, all three controls are inert TOGETHER and no value of any of
+	// them does anything. Whether the shipped model satisfies them is not settled from the binary
+	// alone, so these stay "conditional". Mechanism identified; firing NOT confirmed.
 	ImGui::SeparatorText("Structure - conditional, see tooltips");
 
 	ImGui::BeginDisabled(!mask_on);
 	slider_f("Local Structure Strength", l.local_structure_strength, 0.0f, 1.0f, "%.2f", k_plain,
-		"CONDITIONAL, not confirmed live. Two things must hold for this to do anything.\n"
+		"CONDITIONAL - MECHANISM IDENTIFIED, FIRING NOT CONFIRMED. Two things must hold for this "
+		"to do anything, and only the first is observable from here.\n"
 		"(1) Automatic Mask must be on: with it off the snippet substitutes -1.0f for BOTH "
 		"structure strengths [0x18001aa60 je -> 0x18001aa84] and neither knob matters.\n"
 		"(2) THE LOADED MODEL MUST MATCH. The only site that reads the effective value is behind "
 		"two dynamic_cast null tests - dst .?AVCCNetwork@HNetCpp@@ at 0x180021cc8, tested at "
 		"0x18002253f, and dst .?AVCCTinlayoutFusedPreBlockSwin1HLayer@HNetCpp@@ at 0x18003f5e8, "
-		"tested at 0x18003f5f3. If either returns null the store at layer+0x9c never happens. "
-		"That is the leading explanation for this control being reported dead from hardware, and "
-		"it is NOT something a slider can fix.\n"
+		"tested at 0x18003f5f3 (both type names read out of the descriptors at 0x1811412d8 and "
+		"0x1811414b0). If either returns null, the je skips the store outright. That is the "
+		"leading explanation for this control being reported dead from hardware, and it is NOT "
+		"something a slider can fix. THE EXACT DESTINATION SLOT IS UNCONFIRMED - do not trust any "
+		"claim about which of skin/local lands where until an A/B says so.\n"
 		"RANGE: [0,1] is convention, not a measured clamp - 0x180061710 stores the value raw. "
 		"-1.0f is the snippet's own disabled sentinel and out-of-range conditioning of a trained "
 		"network is undefined rather than 'more'. The ini is unclamped if you want to test that.");
@@ -2769,7 +2848,8 @@ inline void draw_controls(const host_facts &f)
 
 		ImGui::BeginDisabled(inherit);
 		slider_f("Skin Structure Strength", l.skin_structure_strength, 0.0f, 1.0f, "%.2f", k_plain,
-			"CONDITIONAL, on exactly the same two gates as Local Structure Strength - read that "
+			"CONDITIONAL - MECHANISM IDENTIFIED, FIRING NOT CONFIRMED, on exactly the same two "
+			"gates as Local Structure Strength - read that "
 			"tooltip first. 0.0 flattens skin structure; it is not a bypass. Untick \"inherit\" to "
 			"reach it. Same range note: [0,1] by convention, not by a clamp measured in the "
 			"snippet.");
@@ -2778,7 +2858,8 @@ inline void draw_controls(const host_facts &f)
 	ImGui::EndDisabled();
 
 	checkbox_b("Automatic Mask", l.use_auto_mask, k_plain,
-		"CONDITIONAL. On its own this only CHOOSES what the two structure strengths are set to: "
+		"CONDITIONAL - MECHANISM IDENTIFIED, FIRING NOT CONFIRMED. On its own this only CHOOSES "
+		"what the two structure strengths are set to: "
 		"off substitutes -1.0f for both [0x18001aa59 cmp / 0x18001aa60 je -> 0x18001aa84], on "
 		"passes them through with the negative-skin inherit rule. Both outcomes are written to "
 		"the same two slots, so if the model gates described in the Local Structure tooltip do "
@@ -2805,12 +2886,15 @@ inline void draw_controls(const host_facts &f)
 			bump(k_plain);
 		}
 		ImGui::SetItemTooltip(
-			"Live: written into the parameter block on every evaluate, alongside Style. "
-			"DLSSNR.UICorrection is a genuine parameter of THIS snippet build - it is in its string "
-			"table and it is read with a failure guard, defaulting to 0. What it looks like on STRAY "
-			"has NOT been verified, so treat it as a diagnostic knob rather than a tuning one - but "
-			"it does reach the network, so what you see IS the answer. It is nothing to do with this "
-			"settings panel, despite the name.");
+			"DELIVERED - which is not the same as live. It is written into the parameter block on "
+			"every evaluate, alongside Style, and DLSSNR.UICorrection is a genuine parameter of THIS "
+			"snippet build: it is in the string table and the snippet reads it with a failure guard, "
+			"defaulting to 0. Both of those are MEASURED.\n"
+			"What has NOT been traced is the consumer - nobody here has followed the value from that "
+			"read to anything that touches the image, and nobody has verified what it looks like on "
+			"STRAY. Treat it as a diagnostic knob rather than a tuning one, and do not read \"no "
+			"visible change\" as proof it is broken. It is nothing to do with this settings panel, "
+			"despite the name.");
 	}
 
 	// ---- colour transfer ---------------------------------------------------------------------

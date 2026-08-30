@@ -323,7 +323,28 @@ int main()
 				if (0.0f > t) t = 0.0f;
 				return t;
 			}
+			// ...AND THEN THE COEFFICIENT IS THROWN AWAY UNLESS A BIT IS SET. This is the half a
+			// previous revision skipped: it quoted 0x18001d603 -> 0x18001d608 and omitted
+			//   0001d606  mov eax, dword ptr [rdx]      ; the per-style bitmask
+			// then concluded the control was "Live" with a "PROVEN" range. The clamp was proven;
+			// liveness was not. Each of the 14 stores into [rcx+0x124..0x158] is gated by its own
+			// bit - test al,1 / test al,2 / test al,4 / ... / bt eax,0xd - so the number of
+			// parameters this control moves is popcount(mask), and popcount(0) is 0.
+			static int tone_params_written(unsigned mask)
+			{
+				int n = 0;
+				for (int bit = 0; bit < 14; ++bit)      // bits 0..13 -> +0x124..+0x158
+					if (mask & (1u << bit)) ++n;
+				return n;
+			}
 		};
+
+		// THE MASKS, READ OUT OF THE DEPLOYED IMAGE. There is exactly ONE style record: 0x180023bb0
+		// is `cmp rcx,1 / jae -> xor eax,eax`, so every index above 0 returns NULL, and 0x1800239a0
+		// scans 0x1800b0d80..0x1800b1008 at stride 0x288 - one iteration. rdi+0x28 = 0x1800b0da8.
+		const unsigned k_mask_default = 0x00000000u;  // dword [0x1800b0da8]
+		const unsigned k_mask_key1    = 0x00000034u;  // sub-entry 0x1800b0de4, key 1, flag byte 1
+		const unsigned k_mask_key2    = 0x00000020u;  // sub-entry 0x1800b0e28, key 2, flag byte 1
 
 		// THE DEFAULT IS FULL DENOISE. This is the assertion that would have caught the log note
 		// which fired "Intensity is INERT" on every stock install: mode 0 at the 1.0 default is
@@ -344,7 +365,21 @@ int main()
 		   && G::tone_coeff(1.0f) == G::tone_coeff(2.0f),
 		      "LocalTone above 1.0 was not identical to 1.0");
 		CHECK(G::tone_coeff(0.5f) != G::tone_coeff(1.0f), "LocalTone 0.5 collapsed onto 1.0");
-		std::printf("     LocalTone: 1.0 == 1.55 == 2.0; 0.5 differs ....................... ok\n");
+		std::printf("     LocalTone coefficient: 1.0 == 1.55 == 2.0; 0.5 differs .......... ok\n");
+
+		// ...BUT A DIFFERENT COEFFICIENT IS NOT A DIFFERENT IMAGE. This is the assertion that
+		// would have caught the "Live, and this range is PROVEN" tooltip: at the shipped default
+		// style the mask is zero, so the coefficient - however distinct - reaches no parameter.
+		CHECK(G::tone_params_written(k_mask_default) == 0,
+		      "the default style mask must write 0 of 14 - if this fires, re-read 0x1800b0da8");
+		CHECK(G::tone_params_written(k_mask_key1) == 3,
+		      "key 1 mask 0x34 should write 3 of 14 (bits 2,4,5)");
+		CHECK(G::tone_params_written(k_mask_key2) == 1,
+		      "key 2 mask 0x20 should write 1 of 14 (bit 5)");
+		CHECK(G::tone_params_written(k_mask_default) < G::tone_params_written(k_mask_key2),
+		      "the default style must move strictly fewer parameters than any enabled sub-entry");
+		std::printf("     LocalTone params written: default=0/14, key1=3/14, key2=1/14 ..... ok\n");
+		std::printf("     -> LocalTone is INERT at the shipped default style ............... ok\n");
 
 		// THE RANGE REGRESSION GUARD, stated as what the sliders must expose rather than as a
 		// claim about the hardware report. Everything strictly inside [0,1) must be reachable and
@@ -371,6 +406,11 @@ int main()
 		const cfg::config d;
 		CHECK(d.intensity == 1.0f,                "default intensity moved off 1.0");
 		CHECK(d.local_tone_strength == 1.0f,      "default local_tone_strength moved off 1.0");
+		// NOT a "this works" assertion. Style 0 is the shipped default and its local-tone mask is
+		// zero, so local_tone_strength moves nothing until Style selects a keyed sub-entry. Pinned
+		// here so that a future edit which starts claiming otherwise has to change a test.
+		CHECK(d.style == 0,
+		      "default style moved off 0 - re-derive the local-tone mask before shipping that");
 		CHECK(d.local_structure_strength == 1.0f, "default local_structure_strength moved off 1.0");
 		CHECK(d.skin_structure_strength < 0.0f,
 		      "default skin_structure_strength must stay negative - it is the inherit sentinel");
