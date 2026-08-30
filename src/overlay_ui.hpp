@@ -137,8 +137,13 @@
 //     R2        copy_back, history_restore, and the master bypass
 //     R3        shader_hash, srv_depth, srv_velocity, srv_colour, uav_output
 //     R4        hdr_codec (BOTH directions), mvec_decode off, enabled off
-//     R4+R5     mvec_decode on (a_rebuild_mvec), enabled on (a_arm_snippet),
-//               populate_parameters (a_populate_params on; a_rebuild_params off)
+//     R4+R5     mvec_decode on, enabled on - both a_teardown | a_reconcile; the service works out
+//               what actually needs building from st->codec.ok / st->mvec.ok / g_snippet.available
+//     R4+R5     populate_parameters - a_teardown | a_apply_populate, raised by its Apply button and
+//               by Revert and by NOTHING ELSE. It is the one action with a dedicated bit rather
+//               than a reconcile, because it is the one whose work cannot be derived from "make
+//               reality match the live values": the user's decision to APPLY it is itself part of
+//               the input. See the a_apply_populate declaration.
 //     ATOMIC AT ITS OWN SITE, never through the g_cfg snapshot:
 //               shader_hash  - read at :2722, BEFORE st->mutex (:2744) and BEFORE begin_pass
 //                              (:2760). A snapshot cannot reach it, so it goes through
@@ -348,13 +353,40 @@ struct live_block
 	std::atomic<bool>     rt_census{ false };
 	std::atomic<uint32_t> rt_census_frames{ 600 };
 
-	// MULTI-FIELD CHANGES GO THROUGH AN EPOCH, NOT THROUGH THE VALUES. The overlay stores the
-	// value relaxed and then bumps an epoch with RELEASE; every reader loads an epoch with
-	// ACQUIRE before reading any value. That pair is the only ordering anything depends on -
-	// every field is a single scalar whose stale value is at most one frame old and, because of
-	// the snapshot, always self-consistent within the pass. It is also what makes a MULTI-FIELD
-	// edit atomic: a user who retypes shader_hash and srv_colour together can never be observed
-	// half way, because the reader acquires the epoch before it reads either value.
+	// ---- THE WRITE SEQUENCE. THIS, NOT THE EPOCH, IS WHAT MAKES A SNAPSHOT ATOMIC. --------------
+	//
+	// The epochs below are CONSEQUENCE counters, and an earlier revision of this header claimed
+	// they were also the tearing guard: "a user who retypes shader_hash and srv_colour together
+	// can never be observed half way, because the reader acquires the epoch before it reads
+	// either value." THAT WAS NOT TRUE, and the reason it was not is worth keeping, because it is
+	// the same mistake anyone would make twice.
+	//
+	// Every widget STORES ITS VALUE AND THEN BUMPS. An acquire load of `epoch` orders a reader
+	// against a release that has ALREADY HAPPENED; it says nothing about a store whose release is
+	// still to come. So a render thread that ran its snapshot between the value store and the
+	// bump read the NEW value with the OLD epoch - i.e. applied a change without its consequence.
+	// For srv_colour that is precisely the "last frame's image on this frame's scene-colour input"
+	// hazard the ident rung exists to prevent; for hdr_codec it is one frame where the copy-back's
+	// format guard fires and the frame silently gets no denoise. And revert_to_baseline widens the
+	// hole from one store to thirty, because config_to_live writes every field before the single
+	// bump at the end.
+	//
+	// ui_seq is a plain seqlock counter and it closes both. draw_controls - the ONLY function that
+	// writes this block after seeding - brackets itself with ui_edit_guard: ODD while it may be
+	// mutating anything, EVEN otherwise. begin_pass reads it before and after its snapshot and
+	// keeps the snapshot only if it was even and did not move, so a torn read is DISCARDED rather
+	// than applied, and the multi-field guarantee is one the code actually provides.
+	//
+	// It is deliberately separate from `epoch` rather than folded into it: `epoch` is bumped by
+	// bump() in the MIDDLE of a draw, which would destroy the odd/even parity, and the consumers
+	// that compare epochs need a value that counts changes rather than one that counts entries
+	// into the panel.
+	std::atomic<uint32_t> ui_seq{ 0 };
+
+	// The consequence epochs. The overlay stores the value relaxed and then bumps one of these
+	// with RELEASE; every reader loads one with ACQUIRE before reading any value, which is what
+	// makes the values stored BEFORE that bump visible. Each field is a single scalar whose stale
+	// value is at most one frame old and, because of the snapshot, self-consistent within the pass.
 	std::atomic<uint32_t> epoch{ 0 };           // R0: any change at all
 	std::atomic<uint32_t> reset_epoch{ 0 };     // R1: needs one DLSSNR.Reset frame
 	std::atomic<uint32_t> flush_epoch{ 0 };     // R2: needs st->pending_res dropped as well
@@ -390,8 +422,25 @@ enum : uint32_t {
 	a_clear_failed = 1u << 1,   // clear the latched create-failure (the Reset button)
 	a_clear_clip   = 1u << 2,   // clear view_layout_failed / clip_ok, re-arm their latches
 	a_apply_census = 1u << 3,   // push rt_census / rt_census_frames into rt_census's own atomics
-	a_reconcile    = 1u << 4,   // make the codec / mvec / snippet / parameter block match the
-	                            // live values, building or arming whatever is now wanted
+	a_reconcile    = 1u << 4,   // make the codec / mvec / snippet match the live values,
+	                            // building or arming whatever is now wanted
+	// populate_parameters, AND IT IS THE ONE ACTION THAT MUST NOT RIDE a_reconcile.
+	//
+	// It used to. The service derived the work from live_populate_parameters() inside the
+	// a_reconcile block, so EVERY control that raised a_reconcile - enabled, hdr_codec,
+	// mvec_decode, require_trampoline, Reset, Revert - applied whatever the PopulateParameters
+	// checkbox happened to say, including a value the user had ticked and deliberately not
+	// Applied. The checkbox's own tooltip promises the opposite in as many words ("only when you
+	// press Apply beside it - deliberately not on the click"), and one of those six
+	// (require_trampoline) raises a_reconcile at k_plain - no teardown - which reached the
+	// ON->OFF branch with the NGX feature still alive and freed the parameter block CreateFeature
+	// had been handed.
+	//
+	// So it is its own bit, raised only by the Apply button and by Revert, both of which raise
+	// a_teardown with it. The service additionally REFUSES the ON->OFF direction unless the
+	// feature really is released, so the invariant is enforced where it can be checked rather
+	// than assumed from the caller's rung.
+	a_apply_populate = 1u << 5,
 };
 
 // The per-consumer, PER-DEVICE seen-epoch state. Deliberately NOT function-local statics: those
@@ -482,6 +531,13 @@ struct status_block
 	// published and the pass correctly stays skipped rather than running against state that is one
 	// present away from being destroyed.
 	std::atomic<uint32_t>     serviced_rebuild_epoch{ 0 };
+
+	// What the SERVICE has actually done about populate_parameters, so the panel can say when the
+	// checkbox and reality disagree. The checkbox alone changes nothing - by design, because
+	// PopulateParameters_Impl is a gated export whose signature is unverified against this snippet
+	// build - and a ticked box beside an un-applied value is a control that lies unless the panel
+	// says so. Published by nr_lazy_ngx_init and by nr_service_reconfigure.
+	std::atomic<bool>         populate_applied{ false };
 };
 
 inline status_block &status()
@@ -526,6 +582,18 @@ struct host_facts
 	bool     armed = false;
 	bool     abi_thunks_active = false;
 	char     snippet_reason[256] = {};
+
+	// DID NVSDK_NGX_D3D12_Init_Ext ALREADY FAIL IN THIS SESSION, and with what.
+	//
+	// Without this the STANDBY rung tells a provable lie. `armed` false has TWO causes: the
+	// deferred initialiser has not run yet (which clears itself on the next dispatch, which is
+	// what STANDBY says), or it ran and FAILED - and in that case it can never run again, because
+	// nr_try_run's one-shot latch is per-process (stray_dlssnr.cpp: s_init_running is set and
+	// never cleared). Re-ticking `enabled` in that state reaches nothing, so the panel must say
+	// so rather than promise that STANDBY "clears itself as soon as the game renders".
+	bool        ngx_init_failed = false;
+	uint32_t    ngx_init_result = 0;
+	const char *ngx_init_result_name = nullptr;   // a string literal from ngx::result_to_string
 };
 
 using facts_fn = void (*)(host_facts &);
@@ -629,6 +697,12 @@ inline bool same_owned(const cfg::config &a, const cfg::config &b)
 inline void seed_from_config(const cfg::config &c, const std::wstring &directory)
 {
 	live_block &l = live();
+	// The seqlock's other writer. draw_controls has ui_edit_guard; this is the only other place
+	// that stores into live_block, and it stores THIRTY-THREE fields, so it is bracketed the same
+	// way. On a single device it is provably uncontended - it runs from nr_init_device, before any
+	// dispatch on that device - but that is an argument about a device, not about the process, and
+	// this block is process-wide.
+	l.ui_seq.fetch_add(1, std::memory_order_release);
 	config_to_live(c, l);
 	l.bypass.store(false, std::memory_order_relaxed);
 
@@ -642,6 +716,8 @@ inline void seed_from_config(const cfg::config &c, const std::wstring &directory
 	ini_dir() = directory;
 	seeded().store(true, std::memory_order_release);
 	l.epoch.fetch_add(1, std::memory_order_release);
+	// Back to even, and AFTER the epoch bump, so a reader that accepts the snapshot has seen both.
+	l.ui_seq.fetch_add(1, std::memory_order_release);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -669,6 +745,7 @@ inline void seed_from_config(const cfg::config &c, const std::wstring &directory
 // ever writes memory it was handed.
 // ---------------------------------------------------------------------------------------------
 inline bool begin_pass(cfg::config &c,
+                       cfg::config &scratch,
                        seen_epochs &seen,
                        bool &need_reset,
                        uint64_t &pending_res,
@@ -688,28 +765,22 @@ inline bool begin_pass(cfg::config &c,
 	s.orig_ok.store(orig_ok, std::memory_order_relaxed);
 
 	// ACQUIRE, and it is the FIRST thing read. Pairs with the RELEASE in bump(), so every value
-	// stored by the overlay before that bump is visible to the snapshot below. Its numeric value
-	// is not otherwise used - the snapshot is unconditional - so it is discarded deliberately
-	// rather than kept in a variable nothing compares.
+	// stored by the overlay before that bump is visible to the snapshot below.
 	(void)l.epoch.load(std::memory_order_acquire);
-	const uint32_t reset_e = l.reset_epoch.load(std::memory_order_relaxed);
-	const uint32_t flush_e = l.flush_epoch.load(std::memory_order_relaxed);
-	const uint32_t ident_e = l.ident_epoch.load(std::memory_order_relaxed);
+	uint32_t reset_e = 0, flush_e = 0, ident_e = 0, rebuild_e = 0;
 
-	if (seen.first)
-	{
-		// Adopt the current epochs on the very first pass rather than treating "the overlay has
-		// been seeded" as a user edit; a reset frame on the first evaluate is initialisation
-		// anyway, and pending_res is 0 there.
-		seen.reset = reset_e; seen.flush = flush_e; seen.ident = ident_e;
-		seen.first = false;
-	}
-
-	// ---- THE REBUILD GATE ----------------------------------------------------------------------
-	// BEFORE the snapshot, and before anything is written to the caller's state. While a rebuild is
-	// outstanding this pass must not run at all: the values are new and the textures are still the
-	// old ones, which for hdr_codec is the difference between "a hitch" and "a silently skipped
-	// copy-back". See status_block::serviced_rebuild_epoch for the full argument.
+	// ---- THE REBUILD GATE, EARLY-OUT HALF ------------------------------------------------------
+	// While a rebuild is outstanding this pass must not run at all: the values are new and the
+	// textures are still the old ones, which for hdr_codec is the difference between "a hitch"
+	// and "a silently skipped copy-back". See status_block::serviced_rebuild_epoch.
+	//
+	// THIS TEST ALONE IS NOT THE GATE, and the second half below is not belt and braces. Read
+	// here, the epoch is read BEFORE the snapshot - so a user who clicks HDR codec in the window
+	// between this load and the snapshot would pass the gate on the OLD epoch and then be handed
+	// the NEW value, which is precisely the frame this gate exists to prevent. The authoritative
+	// test therefore takes rebuild_epoch from INSIDE the seqlock window, next to the values it
+	// governs. This one stays because it is free and it skips the snapshot work in the common
+	// case where a rebuild really is outstanding.
 	//
 	// pending_res is dropped on the way out for the same reason every other skip drops it: the arm
 	// names a raw resource address, and the resource it names is about to be destroyed.
@@ -721,39 +792,119 @@ inline bool begin_pass(cfg::config &c,
 		return false;
 	}
 
-	// ---- THE SNAPSHOT ------------------------------------------------------------------------
-	// Unconditional, not gated on the epoch: it is what makes every read inside this pass
-	// coherent, and it is a few dozen relaxed loads and stores once a frame.
-	c.copy_back                = l.copy_back.load(std::memory_order_relaxed);
-	c.history_restore          = l.history_restore.load(std::memory_order_relaxed);
-	c.restore_graphics_root    = l.restore_graphics_root.load(std::memory_order_relaxed);
-	c.paper_white_scale        = l.paper_white_scale.load(std::memory_order_relaxed);
-	c.transfer_strength        = l.transfer_strength.load(std::memory_order_relaxed);
-	c.color_strength           = l.color_strength.load(std::memory_order_relaxed);
-	c.depth_inverted           = l.depth_inverted.load(std::memory_order_relaxed);
-	c.mvec_scale_x             = l.mvec_scale_x.load(std::memory_order_relaxed);
-	c.mvec_scale_y             = l.mvec_scale_y.load(std::memory_order_relaxed);
-	c.intensity                = l.intensity.load(std::memory_order_relaxed);
-	c.local_tone_strength      = l.local_tone_strength.load(std::memory_order_relaxed);
-	c.local_structure_strength = l.local_structure_strength.load(std::memory_order_relaxed);
-	c.skin_structure_strength  = l.skin_structure_strength.load(std::memory_order_relaxed);
-	c.style                    = l.style.load(std::memory_order_relaxed);
-	c.use_auto_mask            = l.use_auto_mask.load(std::memory_order_relaxed);
-	c.ui_correction            = l.ui_correction.load(std::memory_order_relaxed);
-	// ---- newly live. Every read site of each of these is downstream of this call.
-	c.srv_depth                = l.srv_depth.load(std::memory_order_relaxed);
-	c.srv_velocity             = l.srv_velocity.load(std::memory_order_relaxed);
-	c.srv_colour               = l.srv_colour.load(std::memory_order_relaxed);
-	c.uav_output               = l.uav_output.load(std::memory_order_relaxed);
-	c.hdr_codec                = l.hdr_codec.load(std::memory_order_relaxed);
-	c.mvec_decode              = l.mvec_decode.load(std::memory_order_relaxed);
-	c.mvec_reconstruct         = l.mvec_reconstruct.load(std::memory_order_relaxed);
-	c.mvec_dilate              = l.mvec_dilate.load(std::memory_order_relaxed);
-	c.mvec_clip_transpose      = l.mvec_clip_transpose.load(std::memory_order_relaxed);
-	c.mvec_clip_row            = l.mvec_clip_row.load(std::memory_order_relaxed);
-	// shader_hash is DELIBERATELY ABSENT from this list. Its read site runs before this function
-	// does; read_ident() serves it instead. Writing it here would be worse than useless - it
-	// would look correct to a reader and reach nothing.
+	// ---- THE SNAPSHOT, UNDER THE SEQLOCK -------------------------------------------------------
+	// What makes every read inside this pass coherent - and, now, what makes a MULTI-FIELD edit
+	// atomic rather than merely claimed to be. See live_block::ui_seq for why the epoch alone
+	// never provided that: the widgets store the value and bump AFTERWARDS, so an acquire on the
+	// epoch orders a reader against a release that has already happened and says nothing about the
+	// one still to come.
+	//
+	// The snapshot is built into a scratch config and only COMMITTED when ui_seq was even
+	// throughout, so a torn read is discarded instead of applied. The scratch is OWNED BY THE
+	// CALLER - it lives in nr_state, beside seen_pass, for two reasons. cfg::config holds a
+	// std::string (ini_path), so a fresh local per pass would be a heap allocation on the render
+	// thread every frame; assigning into a long-lived object reuses its capacity and allocates
+	// nothing after the first. And per-DEVICE rather than per-thread or process-wide puts it on
+	// exactly the same footing as seen_pass, under the same mutex, and needs no TLS.
+	//
+	// IF IT NEVER SETTLES WE KEEP THE PREVIOUS SNAPSHOT AND RUN ANYWAY - we do NOT skip the pass.
+	// The previous snapshot is a fully coherent one, and the overlay is drawn on the present
+	// thread once a frame while this runs on a recording thread, so a persistent collision is not
+	// a state that occurs; skipping would trade a theoretical tear for a real dropped denoise
+	// frame every time the user has the panel open, which is exactly when they are looking at the
+	// image. The epochs are read inside the verified window too, so a rejected snapshot leaves
+	// `seen` untouched and the change is picked up whole on the next pass.
+	cfg::config &tmp = scratch;
+	bool snapshot_ok = false;
+	for (int attempt = 0; attempt < 8 && !snapshot_ok; ++attempt)
+	{
+		const uint32_t seq0 = l.ui_seq.load(std::memory_order_acquire);
+		if ((seq0 & 1u) != 0u)
+			continue;   // draw_controls is mid-edit; look again
+
+		tmp = c;
+		tmp.copy_back                = l.copy_back.load(std::memory_order_relaxed);
+		tmp.history_restore          = l.history_restore.load(std::memory_order_relaxed);
+		tmp.restore_graphics_root    = l.restore_graphics_root.load(std::memory_order_relaxed);
+		tmp.paper_white_scale        = l.paper_white_scale.load(std::memory_order_relaxed);
+		tmp.transfer_strength        = l.transfer_strength.load(std::memory_order_relaxed);
+		tmp.color_strength           = l.color_strength.load(std::memory_order_relaxed);
+		tmp.depth_inverted           = l.depth_inverted.load(std::memory_order_relaxed);
+		tmp.mvec_scale_x             = l.mvec_scale_x.load(std::memory_order_relaxed);
+		tmp.mvec_scale_y             = l.mvec_scale_y.load(std::memory_order_relaxed);
+		tmp.intensity                = l.intensity.load(std::memory_order_relaxed);
+		tmp.local_tone_strength      = l.local_tone_strength.load(std::memory_order_relaxed);
+		tmp.local_structure_strength = l.local_structure_strength.load(std::memory_order_relaxed);
+		tmp.skin_structure_strength  = l.skin_structure_strength.load(std::memory_order_relaxed);
+		tmp.style                    = l.style.load(std::memory_order_relaxed);
+		tmp.use_auto_mask            = l.use_auto_mask.load(std::memory_order_relaxed);
+		tmp.ui_correction            = l.ui_correction.load(std::memory_order_relaxed);
+		// ---- newly live. Every read site of each of these is downstream of this call.
+		tmp.srv_depth                = l.srv_depth.load(std::memory_order_relaxed);
+		tmp.srv_velocity             = l.srv_velocity.load(std::memory_order_relaxed);
+		tmp.srv_colour               = l.srv_colour.load(std::memory_order_relaxed);
+		tmp.uav_output               = l.uav_output.load(std::memory_order_relaxed);
+		tmp.hdr_codec                = l.hdr_codec.load(std::memory_order_relaxed);
+		tmp.mvec_decode              = l.mvec_decode.load(std::memory_order_relaxed);
+		tmp.mvec_reconstruct         = l.mvec_reconstruct.load(std::memory_order_relaxed);
+		tmp.mvec_dilate              = l.mvec_dilate.load(std::memory_order_relaxed);
+		tmp.mvec_clip_transpose      = l.mvec_clip_transpose.load(std::memory_order_relaxed);
+		tmp.mvec_clip_row            = l.mvec_clip_row.load(std::memory_order_relaxed);
+		// shader_hash is DELIBERATELY ABSENT from this list. Its read site runs before this
+		// function does; read_ident() serves it instead. Writing it here would be worse than
+		// useless - it would look correct to a reader and reach nothing.
+
+		// The consequence epochs belong INSIDE the window: a value and the rung that carries its
+		// consequence must be taken from the same instant, which is the whole point.
+		reset_e   = l.reset_epoch.load(std::memory_order_relaxed);
+		flush_e   = l.flush_epoch.load(std::memory_order_relaxed);
+		ident_e   = l.ident_epoch.load(std::memory_order_relaxed);
+		rebuild_e = l.rebuild_epoch.load(std::memory_order_relaxed);
+
+		if (l.ui_seq.load(std::memory_order_acquire) == seq0)
+		{
+			c = tmp;
+			snapshot_ok = true;
+		}
+	}
+
+	if (!snapshot_ok)
+	{
+		// The previous g_cfg is untouched and coherent. Run the pass on it; the edit lands next
+		// frame. Nothing below may run, because reset_e / flush_e / ident_e were never taken - so
+		// the two switches are re-tested here, verbatim, rather than fallen through to.
+		if (!l.enabled.load(std::memory_order_relaxed) || l.bypass.load(std::memory_order_relaxed))
+		{
+			pending_res = 0;
+			return false;
+		}
+		return true;
+	}
+
+	// ---- THE REBUILD GATE, AUTHORITATIVE HALF --------------------------------------------------
+	// rebuild_e came from inside the verified window, so it belongs to the SAME instant as the
+	// values just committed. serviced_rebuild_epoch is loaded here, after it: if the service has
+	// caught up in the meantime the pass runs with new values against new textures, which is
+	// correct; if it has not, the pass is skipped. Either way there is no frame in which a value
+	// is applied ahead of the resources it needs.
+	//
+	// `seen` is deliberately not touched before this: a skipped pass must leave every rung
+	// unconsumed, or the consequence would be lost with the frame.
+	if (rebuild_e != s.serviced_rebuild_epoch.load(std::memory_order_acquire))
+	{
+		pending_res = 0;
+		need_reset  = true;
+		return false;
+	}
+
+	if (seen.first)
+	{
+		// Adopt the current epochs on the very first pass rather than treating "the overlay has
+		// been seeded" as a user edit; a reset frame on the first evaluate is initialisation
+		// anyway, and pending_res is 0 there.
+		seen.reset = reset_e; seen.flush = flush_e; seen.ident = ident_e;
+		seen.first = false;
+	}
 
 	// ---- consequences ------------------------------------------------------------------------
 	// Strictly nesting, strongest first. R3 implies R2 implies R1, so one `else if` chain is
@@ -859,6 +1010,25 @@ struct reconfig_request
 	uint32_t    rebuild_epoch = 0;
 };
 
+/// Adopt the CURRENT epochs into a seen-state without treating them as an edit.
+///
+/// Called once from nr_lazy_ngx_init, on the state it has just created, BEFORE it does any of its
+/// work. Without it, nr_state::seen_service adopts lazily on the first present AFTER init - and
+/// nr_lazy_ngx_init is hundreds of milliseconds long (Init_Ext plus up to two D3DCompile calls),
+/// so a rebuild the user asked for DURING that window was adopted rather than serviced: the one
+/// control that depends on the epoch alone to imply its teardown would then run its ON->OFF branch
+/// against a live feature. Seeding at the start of init closes the window; the cost of the values
+/// having been read after the bump is one redundant teardown, which is the harmless direction.
+inline void adopt_epochs(seen_epochs &seen)
+{
+	const live_block &l = live();
+	seen.reset   = l.reset_epoch.load(std::memory_order_acquire);
+	seen.flush   = l.flush_epoch.load(std::memory_order_relaxed);
+	seen.ident   = l.ident_epoch.load(std::memory_order_relaxed);
+	seen.rebuild = l.rebuild_epoch.load(std::memory_order_relaxed);
+	seen.first   = false;
+}
+
 inline reconfig_request take_reconfigure(seen_epochs &seen)
 {
 	live_block &l = live();
@@ -928,6 +1098,13 @@ inline void publish_reconfig_pending(bool pending)
 inline void publish_teardown()
 {
 	status().teardown_ms.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_relaxed);
+}
+
+/// Mirrors nr_state::serviced_populate_parameters out to the panel. Written by the render thread
+/// at arm time and by the service on every change; read only by the overlay.
+inline void publish_populate(bool applied)
+{
+	status().populate_applied.store(applied, std::memory_order_relaxed);
 }
 
 /// Opens the render thread's rebuild gate. RELEASE, and it must be the LAST thing the service
@@ -1035,10 +1212,23 @@ inline uint32_t live_rt_census_frames() { return live().rt_census_frames.load(st
 //     unrecognised line, every blank line and the original key order and spelling survive.
 //   * TEMP FILE + MoveFileExW(REPLACE_EXISTING). A half-written ini is worse than none: per
 //     addon_config.hpp:226-230 every key after the cut silently takes its built-in default.
-//   * NEVER round-trip a key the UI does not own. shader_hash, srv_*, uav_output, app_id,
-//     require_trampoline, populate_parameters, enabled, diagnostics and hdr_codec are read-only
-//     here and are not touched by the writer - clobbering a hand-measured identification pin is
-//     how a working config gets lost.
+//   * EVERY KEY THE PANEL OWNS IS ROUND-TRIPPED, AND THAT IS NOW ALL 33 OF THEM - the
+//     identification pins (shader_hash, srv_depth/velocity/colour, uav_output) included, along
+//     with enabled, diagnostics, hdr_codec, populate_parameters and require_trampoline. This
+//     bullet used to say the exact opposite, and it was left behind when the reconfigure ladder
+//     made those keys live: a control that applies live but silently forgets on relaunch is still
+//     a control that lies, just more slowly, so owned_value() and owned_keys() below write them
+//     all. The single source of truth is OVERLAY_OWNED_FIELDS; if a key is in that list, Save
+//     writes it.
+//   * app_id IS THE ONE EXCEPTION, and it is the only one. It has no live control at all (see the
+//     header and draw_load_only), so the overlay neither owns it nor writes it and the ini keeps
+//     whatever the user put there. Unrecognised keys, comments, blank lines and key order are
+//     likewise untouched.
+//   * WHAT THAT MEANS FOR A HAND-MEASURED CONFIG: the pins are safe from Save only in the sense
+//     that Save writes what the PANEL currently shows. Drag srv_velocity while chasing an artefact
+//     and then press Save, and the dragged value is what lands on disk. Use "Revert to
+//     stray_dlssnr.ini" to get the measured values back before saving; the Save tooltip says this
+//     too, because that is where it is read.
 // =============================================================================================
 
 inline void fmt_float(char *buf, size_t n, float v)
@@ -1047,7 +1237,8 @@ inline void fmt_float(char *buf, size_t n, float v)
 	std::snprintf(buf, n, "%.9g", static_cast<double>(v));
 }
 
-/// The 16 keys the overlay owns. Returns nullptr for anything else.
+/// The 33 keys the overlay owns - the OVERLAY_OWNED_FIELDS list, spelling aliases included.
+/// Returns false for anything else, which is what leaves app_id and unrecognised keys alone.
 inline bool owned_value(const std::string &key_lower, const live_block &l, std::string &out)
 {
 	char buf[64];
@@ -1697,7 +1888,13 @@ inline void revert_to_baseline()
 	// Raising the strongest rung is correct here even when nothing at that rung moved - one
 	// rebuild costs a couple of frames, and the alternative is a Revert button that silently
 	// restores some settings and not others.
-	request(a_teardown | a_clear_failed | a_clear_clip | a_apply_census | a_reconcile,
+	// a_apply_populate is in the list for the same reason the rest of it is: Revert promises to
+	// put EVERY control back, and populate_parameters is the one key whose value alone changes
+	// nothing. A Revert that restored the checkbox and not the state it stands for would be the
+	// "restores some settings and not others" the comment above rules out. It is a deliberate
+	// press, like Apply, and it carries a_teardown, which is what the ON->OFF direction needs.
+	request(a_teardown | a_clear_failed | a_clear_clip | a_apply_census | a_reconcile |
+	        a_apply_populate,
 	        "Revert to stray_dlssnr.ini", k_rebuild);
 }
 
@@ -1709,6 +1906,8 @@ inline void revert_to_baseline()
 //   enabled=0 in the ini ......................... DISABLED (this session)
 //   the snippet did not load ..................... WAITING FOR NGX + the reason
 //   NGX not initialised yet ...................... STANDBY
+//   Init_Ext ran and failed ...................... NGX INITIALISATION FAILED + the result code
+//                                                  and the one thing this panel cannot fix
 //   the TAA pass has never been reached .......... WAITING FOR GAME DLSS
 //   the overlay's own master switch is off ....... BYPASSED
 //   a feature reset is pending ................... REBUILDING
@@ -1817,6 +2016,44 @@ inline void draw_status(reshade::api::effect_runtime *rt, const host_facts &f)
 	}
 	if (!f.armed)
 	{
+		// TWO SITUATIONS WEAR THIS RUNG TOO, and the old text described only the recoverable one.
+		//
+		// If Init_Ext has already run and FAILED, it can never run again in this process: the
+		// deferred initialiser is behind a one-shot latch that is set before the attempt and never
+		// cleared. So "this clears itself as soon as the game renders" was a promise the code
+		// could not keep, and re-ticking `enabled` reaches nothing. THE HONEST ANSWER IS A
+		// RELAUNCH, and the reason and the NGX result code are given with it. This is the one
+		// place in the panel where "you must restart" is the truth, and it is said plainly rather
+		// than left as a spinner that never resolves.
+		if (f.ngx_init_failed)
+		{
+			overlay_imgui::textf_colored(col::red,
+				"NGX INITIALISATION FAILED - A RELAUNCH IS REQUIRED");
+			// A result of 0 means the initialiser died BEFORE Init_Ext was reached (a null native
+			// device, or the parameter block allocation). Printing "returned 0x00000000" there
+			// would name a call that never happened.
+			if (f.ngx_init_result == 0)
+				ImGui::TextWrapped("NGX initialisation failed BEFORE NVSDK_NGX_D3D12_Init_Ext was "
+				                   "reached - the device or the parameter block could not be "
+				                   "prepared. ReShade.log has the line.");
+			else
+				ImGui::TextWrapped("NVSDK_NGX_D3D12_Init_Ext returned 0x%08X %s. It is attempted ONCE "
+				                   "per process, on the first render-thread dispatch, behind a one-shot "
+				                   "latch that is not cleared on failure - so nothing in this panel can "
+				                   "retry it, and unticking and re-ticking \"Load the snippet and arm "
+				                   "NGX\" will not either. That latch is deliberate: the only thing this "
+				                   "project has measured about Init_Ext's fragility is that it HANGS "
+				                   "when called at a moment the snippet does not tolerate, and a hang is "
+				                   "not a failure that degrades.\n\n"
+				                   "Fix the cause and restart the game. The two causes seen here are a "
+				                   "missing or tail-jumping remix_nvngx.dll (FAIL_PlatformError - the "
+				                   "gated export rejected the caller) and an add-on directory the "
+				                   "process cannot write to (FAIL_UnableToWriteToAppDataPath - the "
+				                   "snippet wants to put its log there). ReShade.log has the full line.",
+				                   (unsigned)f.ngx_init_result,
+				                   f.ngx_init_result_name != nullptr ? f.ngx_init_result_name : "");
+			return;
+		}
 		overlay_imgui::textf_colored(col::amber, "STANDBY - NGX has not been initialised yet");
 		ImGui::TextWrapped("The snippet is loaded. NVSDK_NGX_D3D12_Init_Ext is deliberately deferred "
 		                   "to the first render-thread dispatch (calling it from init_device hangs "
@@ -1930,11 +2167,40 @@ inline void draw_status(reshade::api::effect_runtime *rt, const host_facts &f)
 }
 
 // ---------------------------------------------------------------------------------------------
+// THE SEQLOCK'S WRITE SIDE. Held for the whole of draw_controls, which is the only function that
+// mutates live_block after seeding.
+//
+// ODD means "a value in the block may be mid-change"; even means the block is settled.
+// begin_pass reads the counter before and after its snapshot and discards a snapshot taken across
+// an edit, which is what makes a multi-field change - a Revert, or a retyped shader_hash and
+// srv_colour together - impossible to observe half way. See live_block::ui_seq for the argument,
+// and for why the epoch alone never gave that guarantee.
+//
+// RAII, because draw() catches exceptions from ImGui and the counter must return to even on that
+// path too - an odd counter left behind would make every later snapshot spin its eight attempts
+// and fall back to the previous configuration, i.e. it would freeze the whole panel silently.
+// RELEASE on both edges: the entry so the reader cannot hoist its loads above it, the exit so
+// every value stored inside is visible to a reader that sees the even count.
+// ---------------------------------------------------------------------------------------------
+struct ui_edit_guard
+{
+	ui_edit_guard()  { live().ui_seq.fetch_add(1, std::memory_order_release); }
+	~ui_edit_guard() { live().ui_seq.fetch_add(1, std::memory_order_release); }
+	ui_edit_guard(const ui_edit_guard &) = delete;
+	ui_edit_guard &operator=(const ui_edit_guard &) = delete;
+};
+
+// ---------------------------------------------------------------------------------------------
 // THE CONTROLS. Layout and labels mimic renodx's "DLSS 5 Neural Rendering" panel; the section
 // headings are its own strings where they still describe what we do.
+//
+// EVERY STORE INTO live_block BELOW IS INSIDE THE SEQLOCK. The guard is the first statement, so a
+// future control added anywhere in this function is covered without its author having to know.
 // ---------------------------------------------------------------------------------------------
 inline void draw_controls(const host_facts &f)
 {
+	ui_edit_guard edit_guard;
+
 	live_block &l = live();
 	const status_block &s = status();
 
@@ -1974,7 +2240,13 @@ inline void draw_controls(const host_facts &f)
 			"VRAM goes back. The snippet module itself stays loaded: this tree has no in-process "
 			"unload path (stray_dlssnr.cpp:4339-4341 declines to FreeLibrary even at device "
 			"teardown), and unloading a module that may still hold worker threads to save address "
-			"space would be a bad trade. Nothing on the render path reads it once it is off.");
+			"space would be a bad trade. Nothing on the render path reads it once it is off.\n\n"
+			"THE ONE CASE WHERE ON REACHES NOTHING, and the panel says so above rather than "
+			"pretending: if Init_Ext has already been attempted and FAILED in this session, the "
+			"deferred initialiser is behind a one-shot latch that is not cleared on failure, so it "
+			"cannot run again. The status block shows NGX INITIALISATION FAILED with the result "
+			"code, the reconfigure is reported as FAILED rather than APPLIED, and a relaunch is "
+			"the only fix.");
 
 		if (!f.snippet_loaded && f.snippet_reason[0] != '\0')
 		{
@@ -2451,11 +2723,41 @@ inline void draw_controls(const host_facts &f)
 			"full rebuild, and it is what Apply does.");
 		ImGui::SameLine();
 		if (ImGui::Button("Apply PopulateParameters"))
-			request(a_reconcile, "populate_parameters", k_rebuild);
+			// a_apply_populate, NOT a_reconcile, and a_teardown SPELLED OUT rather than left to
+			// the rebuild epoch.
+			//
+			// Its own bit, because deriving the work from the checkbox inside a_reconcile meant
+			// every other control that raises a_reconcile applied a value the user had not
+			// Applied - see the a_apply_populate declaration for what that reached.
+			//
+			// a_teardown explicitly, because the ON->OFF direction needs the feature released
+			// before the parameter block can be replaced, and relying on the k_rebuild epoch to
+			// imply it has a hole: take_reconfigure ADOPTS the epochs on its first call for a
+			// given seen-state, so on that one present the edge is swallowed while the drained
+			// action bits still arrive. Every other k_rebuild control already raises a_teardown
+			// itself; this was the only one that did not.
+			request(a_teardown | a_apply_populate, "populate_parameters", k_rebuild);
 		ImGui::SetItemTooltip(
-			"Applies the checkbox to the left. Off-to-on calls PopulateParameters_Impl once. "
-			"On-to-off releases the NGX feature and allocates a fresh parameter block, because the "
-			"call cannot be undone on the block it was made against.");
+			"Applies the checkbox to the left, and nothing else applies it - no other control in "
+			"this panel can call PopulateParameters_Impl or swap the parameter block.\n\n"
+			"Off-to-on calls PopulateParameters_Impl once. On-to-off releases the NGX feature and "
+			"allocates a fresh parameter block, because the call cannot be undone on the block it "
+			"was made against. If the release does not happen the swap is REFUSED rather than "
+			"done anyway, and the panel says so in red.");
+
+		// The checkbox and reality can disagree, by design - so say when they do, at the moment
+		// the user is looking at the control, rather than leaving a ticked box standing for
+		// something that has not happened.
+		if (f.armed && on != s.populate_applied.load(std::memory_order_relaxed))
+		{
+			ImGui::Indent();
+			overlay_imgui::textf_colored(col::amber,
+				"checked but NOT APPLIED - the snippet is still %s. Press Apply.",
+				s.populate_applied.load(std::memory_order_relaxed)
+					? "running against a populated parameter block"
+					: "running against the plain parameter block");
+			ImGui::Unindent();
+		}
 	}
 
 	ImGui::EndDisabled();   // !usable
@@ -2543,8 +2845,13 @@ inline void draw_controls(const host_facts &f)
 			"your own spelling all survive, and only the values of the settings this panel owns are "
 			"replaced. Written to a temp file and renamed, because a half-written ini is worse than "
 			"none - every key after the cut would silently take its built-in default.\n\n"
-			"The identification pins (shader_hash, srv_*, uav_output, app_id) and the load-only keys "
-			"are NEVER round-tripped, so a hand-measured config cannot be clobbered from here.\n\n"
+			"EVERY setting this panel can change is written, INCLUDING the identification pins "
+			"(shader_hash, srv_depth, srv_velocity, srv_colour, uav_output) - they became live "
+			"controls, and a control that applies now but forgets on relaunch is still a control "
+			"that lies. So if you have dragged a pin while chasing an artefact, press \"Revert to "
+			"stray_dlssnr.ini\" before saving, or the dragged value is what lands on disk.\n\n"
+			"app_id is the ONE key never written, along with every comment, blank line and key this "
+			"panel does not know about.\n\n"
 			"Saving is a file write on the present thread. It happens only when you press this, never "
 			"during a drag.");
 

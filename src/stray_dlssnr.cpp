@@ -1426,6 +1426,23 @@ static ngx::snippet g_snippet;
 static std::atomic<bool> g_nr_armed{ false };
 // Set once the snippet module is loaded; cleared by the first render-thread pass.
 static std::atomic<bool> g_nr_pending_init{ false };
+
+// ---- DID Init_Ext ALREADY RUN AND FAIL? ------------------------------------------------------
+// nr_try_run's deferred initialiser is a ONE-SHOT PER PROCESS: s_init_running is set before the
+// attempt and is never cleared, on failure or otherwise. That is deliberate - the only thing this
+// project has measured about Init_Ext's fragility is that it HANGS when called at a moment the
+// snippet does not tolerate (see nr_lazy_ngx_init's header), and a hang is not a failure that
+// degrades, so retrying it in-process is not a trade this add-on makes.
+//
+// The consequence has to be VISIBLE rather than silent. Without these two the panel showed
+// "STANDBY - NGX has not been initialised yet ... this clears itself as soon as the game renders"
+// for ever, and re-ticking `enabled` logged "reconfigure APPLIED" for a request that reached
+// nothing at all. With them, the status block says NGX INITIALISATION FAILED with the NGX result
+// code and that a relaunch is required, and the service reports the reconfigure as FAILED.
+// Written once on the render thread before g_nr_armed could ever be set; read on the present
+// thread. Atomics because of that crossing, relaxed because nothing is ordered against them.
+static std::atomic<bool>     g_nr_init_failed{ false };
+static std::atomic<uint32_t> g_nr_init_result{ 0 };
 static bool nr_lazy_ngx_init(device *dev);
 
 // Bring-up diagnostic: the run path has a dozen silent early-returns, and "the pass simply does
@@ -1462,6 +1479,31 @@ enum : uint32_t { kTeardown = overlay_ui::a_teardown };
 struct nr_state
 {
 	std::mutex mutex;
+
+	// ---- IS THIS OBJECT SAFE FOR ANOTHER THREAD TO TOUCH YET? ----------------------------------
+	//
+	// probe::pd_create PUBLISHES through set_private_data on its FIRST statement
+	// (descriptor_shadow.hpp:892-901), so nr_lazy_ngx_init hands this object to the whole process
+	// before it has initialised a single field of it - and it then spends hundreds of milliseconds
+	// in Init_Ext and in up to two runtime D3DCompile calls, on a command-list RECORDING thread,
+	// filling params / codec / mvec / serviced_populate_parameters.
+	//
+	// That used to be safe by construction rather than by design: the present-thread servicer
+	// acted only on a `pending_teardown` bool that could only be raised from inside an accepted
+	// pass, i.e. strictly after lazy init had returned. nr_service_reconfigure acts on ANY overlay
+	// request, so that exclusion is gone - and the overlay is exactly what the user is touching
+	// while a from-the-panel arm is initialising. The unguarded window let the service run
+	// nr_release_feature_and_output over fields the recording thread was writing, and reach
+	// nr_build_codec_pipelines concurrently with the same call on the other thread: two threads
+	// resizing the same std::vector<uint8_t> blob and assigning the same five-field pipelines
+	// struct, which is heap corruption in the user's game rather than an error return.
+	//
+	// RELEASE-stored as the LAST act of a successful nr_lazy_ngx_init; ACQUIRE-loaded by
+	// nr_service_reconfigure, which treats a state that is not ready EXACTLY as it treats a state
+	// that does not exist. nr_lazy_ngx_init additionally holds `mutex` for everything after
+	// pd_create, so a service call that arrives one instruction after the flag is set still
+	// serialises rather than interleaves.
+	std::atomic<bool> init_complete{ false };
 
 	ID3D12Device         *d3d12  = nullptr;
 	ngx::parameter_block *params = nullptr;
@@ -1523,6 +1565,14 @@ struct nr_state
 	// reset frame; at five it costs a whole rebuild.
 	overlay_ui::seen_epochs seen_pass;      // begin_pass, on the recording thread
 	overlay_ui::seen_epochs seen_service;   // nr_service_reconfigure, on the present thread
+
+	// The scratch buffer begin_pass builds its snapshot in before committing it to g_cfg. It
+	// lives here, beside seen_pass, for the same per-device reason and under the same mutex: the
+	// snapshot is taken under the overlay's seqlock and DISCARDED if the panel moved underneath
+	// it, which needs somewhere to build that is not g_cfg itself. A local would heap-allocate
+	// cfg::config's std::string on the render thread every frame; this one is assigned into and
+	// reuses its capacity.
+	cfg::config cfg_scratch;
 
 	// What the service has actually DONE, so it can tell an edge from a steady state. Set to the
 	// value that was in force when NGX was armed, and updated by the service on each change.
@@ -1761,6 +1811,19 @@ static void nr_log_ngx(reshade::log::level lvl, const char *what, ngx::Result r)
 // moving avoids the leak AND means a failed build leaves the previous pipelines running, logs
 // once, and reports the reason - never a half-applied state.
 // --------------------------------------------------------------------------------------------
+// The compiled shader blobs, built once per process and then read-only.
+//
+// TWO THREADS REACH THESE, which is why they have a lock of their own. nr_build_codec_pipelines
+// and nr_build_mvec_pipeline are called from nr_lazy_ngx_init on a command-list RECORDING thread
+// and from nr_service_reconfigure on the PRESENT thread. nr_state::init_complete already stops
+// those two overlapping for one device; g_blob_mutex removes the single-device assumption from the
+// argument entirely, because it is these FILE-SCOPE objects - not anything in nr_state - that a
+// second device would collide on. hdr_codec::build resizes two std::vector<uint8_t> and writes a
+// .dxbc cache file; a plain bool guard around that was a data race, not a one-shot.
+//
+// LOCK ORDER: taken while st->mutex is held, never the other way round, and nothing under it takes
+// any other lock. It is a leaf.
+static std::mutex           g_blob_mutex;
 static hdr_codec::blobs     g_codec_blobs;
 static bool                 g_codec_blobs_tried = false;
 static std::vector<uint8_t> g_mvec_dxbc;
@@ -1781,9 +1844,15 @@ static std::wstring nr_addon_dir()
 }
 
 /// Build (or rebuild) the HDR codec's two pipelines into st.codec. Returns false and leaves
-/// st.codec exactly as it was on any failure. MUST run on the main/present thread: hdr_codec::build
-/// LoadLibraryW's d3dcompiler_47.dll and runs D3DCompile to cs_5_0, which has no business on a
-/// command-list recording thread on demand.
+/// st.codec exactly as it was on any failure.
+///
+/// TWO CALLERS, TWO THREADS, and the contract is about WHEN rather than about which thread. It
+/// LoadLibraryW's d3dcompiler_47.dll and runs D3DCompile to cs_5_0, so it may only be called at a
+/// point where a multi-hundred-millisecond stall is acceptable: nr_lazy_ngx_init (once, on a
+/// recording thread, during the arm the overlay's tooltip already promises will cost a frame) and
+/// nr_service_reconfigure (on the present thread). It must NEVER be called from the steady-state
+/// dispatch path. The caller must hold st->mutex; the file-scope blobs have g_blob_mutex of their
+/// own, because those are shared across devices and st->mutex is not.
 static bool nr_build_codec_pipelines(device *dev, nr_state &st, const std::wstring &dir)
 {
 	if (dev == nullptr || st.codec_failed)
@@ -1791,14 +1860,21 @@ static bool nr_build_codec_pipelines(device *dev, nr_state &st, const std::wstri
 	if (st.codec.ok)
 		return true;   // already built; nothing to do and nothing to leak
 
-	if (!g_codec_blobs_tried)
+	bool blobs_ok = false;
 	{
-		g_codec_blobs_tried = true;
-		hdr_codec::build(dir, g_codec_blobs, &nr_pipeline_log);
+		std::lock_guard<std::mutex> blob_lock(g_blob_mutex);
+		if (!g_codec_blobs_tried)
+		{
+			g_codec_blobs_tried = true;
+			hdr_codec::build(dir, g_codec_blobs, &nr_pipeline_log);
+		}
+		blobs_ok = g_codec_blobs.ok;
 	}
 
+	// create() only READS the blobs, and nothing ever writes them again once tried is set, so the
+	// lock is not held across it - it creates D3D12 objects and can be slow.
 	hdr_codec::pipelines fresh;
-	if (!g_codec_blobs.ok || !hdr_codec::create(dev, g_codec_blobs, fresh, &nr_pipeline_log))
+	if (!blobs_ok || !hdr_codec::create(dev, g_codec_blobs, fresh, &nr_pipeline_log))
 	{
 		// create() has already destroyed whatever it managed to make of `fresh`, so there is
 		// nothing to clean up here and st.codec is untouched.
@@ -1830,14 +1906,19 @@ static bool nr_build_mvec_pipeline(device *dev, nr_state &st, const std::wstring
 	if (st.mvec.ok)
 		return true;
 
-	if (!g_mvec_dxbc_tried)
+	bool dxbc_ok = false;
 	{
-		g_mvec_dxbc_tried = true;
-		mvec_decode::build(dir, g_mvec_dxbc, &nr_pipeline_log);
+		std::lock_guard<std::mutex> blob_lock(g_blob_mutex);
+		if (!g_mvec_dxbc_tried)
+		{
+			g_mvec_dxbc_tried = true;
+			mvec_decode::build(dir, g_mvec_dxbc, &nr_pipeline_log);
+		}
+		dxbc_ok = !g_mvec_dxbc.empty();
 	}
 
 	mvec_decode::pipelines fresh;
-	if (g_mvec_dxbc.empty() || !mvec_decode::create(dev, g_mvec_dxbc, fresh, &nr_pipeline_log))
+	if (!dxbc_ok || !mvec_decode::create(dev, g_mvec_dxbc, fresh, &nr_pipeline_log))
 	{
 		st.mvec_failed = true;
 		LOGW("DLSS-NR: the motion-vector decode could not be built (see the error above). "
@@ -3008,8 +3089,8 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	// nr_service_reconfigure instead - which runs from on_present UNCONDITIONALLY, so it works in
 	// the one case the button exists for and the old routing could not reach: the pass has wedged
 	// and begin_pass is no longer being called at all.
-	if (!overlay_ui::begin_pass(g_cfg, st->seen_pass, st->need_reset, st->pending_res,
-	                            st->codec.ok, st->codec_failed, st->orig_ok))
+	if (!overlay_ui::begin_pass(g_cfg, st->cfg_scratch, st->seen_pass, st->need_reset,
+	                            st->pending_res, st->codec.ok, st->codec_failed, st->orig_ok))
 		return;
 	// ---- END overlay_ui hook ----
 
@@ -4316,10 +4397,42 @@ static bool nr_lazy_ngx_init(device *dev)
 	if (st == nullptr)
 		return false;
 
+	// EVERYTHING BELOW IS UNDER st->mutex, AND NOTHING BELOW IS SAFE WITHOUT IT.
+	//
+	// pd_create published `st` to the whole process on the line above (set_private_data, which is
+	// the first thing it does), and this function then writes ~25 fields of it over hundreds of
+	// milliseconds. nr_service_reconfigure runs on the present thread from on_present, takes this
+	// same mutex, and calls nr_release_feature_and_output and the pipeline builders over exactly
+	// those fields. Before the reconfigure ladder the servicer could only act on a flag raised
+	// from inside an accepted pass - i.e. never during this function - so the exclusion existed
+	// without a lock. It no longer does: the overlay is what the user is touching while a
+	// from-the-panel arm initialises. See nr_state::init_complete.
+	//
+	// No recursion risk: nr_try_run takes this mutex only AFTER this function has returned, and
+	// nothing called from here takes it.
+	std::lock_guard<std::mutex> init_lock(st->mutex);
+
+	// Belt to init_complete's braces: a failure leaves the flag false for the life of the process,
+	// which is also what the panel and the service key off. `r` is 0 for a failure that happened
+	// BEFORE Init_Ext was reached, and the panel prints a result code only when there is one -
+	// printing "Init_Ext returned 0x00000000" for an allocation failure would be the small kind of
+	// lie this log exists not to tell.
+	const auto record_init_failure = [](uint32_t r) {
+		g_nr_init_result.store(r, std::memory_order_relaxed);
+		g_nr_init_failed.store(true, std::memory_order_relaxed);
+	};
+
+	// The service's seen-epochs, seeded HERE rather than lazily on the first present after this
+	// returns. This function is long, the user is in the overlay while it runs (that is how a
+	// from-the-panel arm gets here at all), and take_reconfigure's first-call adoption would
+	// otherwise swallow any rung raised in that window.
+	overlay_ui::adopt_epochs(st->seen_service);
+
 	st->d3d12 = reinterpret_cast<ID3D12Device *>(dev->get_native());
 	if (st->d3d12 == nullptr)
 	{
 		LOGE("DLSS-NR: device::get_native() returned null; cannot initialise NGX.");
+		record_init_failure(0u);
 		return false;
 	}
 
@@ -4338,7 +4451,12 @@ static bool nr_lazy_ngx_init(device *dev)
 		if (r == ngx::Result_FAIL_UnableToWriteToAppDataPath)
 			LOGE("DLSS-NR: the add-on's own directory is not writable, which is where the snippet "
 			     "wants to put its log.");
-		LOGE("DLSS-NR stays OFF. The game is untouched.");
+		LOGE("DLSS-NR stays OFF, and it stays off for THIS PROCESS: the deferred initialiser is a "
+		     "one-shot and is not cleared on failure, deliberately - the only measured fact about "
+		     "Init_Ext's fragility is that it can HANG, and a hang is not a failure that degrades. "
+		     "The overlay says so in the status block and reports any re-tick of `enabled` as "
+		     "FAILED rather than APPLIED. Fix the cause and relaunch. The game is untouched.");
+		record_init_failure(static_cast<uint32_t>(r));
 		return false;
 	}
 
@@ -4349,7 +4467,9 @@ static bool nr_lazy_ngx_init(device *dev)
 	st->params = new (std::nothrow) ngx::parameter_block();
 	if (st->params == nullptr)
 	{
-		LOGE("DLSS-NR: out of memory allocating the NGX parameter block. The pass stays off.");
+		LOGE("DLSS-NR: out of memory allocating the NGX parameter block. The pass stays off for "
+		     "this process; the deferred initialiser does not retry.");
+		record_init_failure(0u);
 		return false;
 	}
 
@@ -4413,6 +4533,10 @@ static bool nr_lazy_ngx_init(device *dev)
 	{
 		st->serviced_populate_parameters = false;
 	}
+	// Mirrored to the panel so the checkbox can say "checked but NOT APPLIED" when the two
+	// disagree. The checkbox is deliberately inert on its own click; a ticked box standing for
+	// something that has not happened is a control that lies unless the panel says which.
+	overlay_ui::publish_populate(st->serviced_populate_parameters);
 
 	LOGI("==================================================================");
 	LOGI("DLSS-NR ARMED. feature id %u, preset %u (the only network in this snippet build).",
@@ -4441,11 +4565,12 @@ static bool nr_lazy_ngx_init(device *dev)
 	     (int)g_cfg.copy_back, (int)g_cfg.depth_inverted, (int)g_cfg.restore_graphics_root);
 	LOGI("  hdr codec       hdr_codec=%d paper_white_scale=%.4f (UNCALIBRATED) "
 	     "transfer_strength=%.3f color_strength=%.3f",
-	     (int)(g_cfg.hdr_codec && !st->codec_failed), g_cfg.paper_white_scale,
+	     (int)(overlay_ui::live_hdr_codec() && !st->codec_failed), g_cfg.paper_white_scale,
 	     g_cfg.transfer_strength, g_cfg.color_strength);
 	LOGI("  mvec decode     mvec_decode=%d mvec_reconstruct=%d mvec_dilate=%d clip_row=%s "
 	     "transpose=%d scale=%s/%s",
-	     (int)(g_cfg.mvec_decode && !st->mvec_failed), (int)g_cfg.mvec_reconstruct,
+	     (int)(overlay_ui::live_mvec_decode() && !st->mvec_failed),
+	     (int)overlay_ui::live_mvec_reconstruct(),
 	     (int)g_cfg.mvec_dilate,
 	     g_cfg.mvec_clip_row != 0 ? "PINNED in the ini" : "discovered + cross-checked",
 	     (int)g_cfg.mvec_clip_transpose,
@@ -4468,7 +4593,18 @@ static bool nr_lazy_ngx_init(device *dev)
 	// the pass and neither one shows up as an NGX error: they degrade the picture silently, which
 	// is precisely why they are shouted about here rather than left in the README alone.
 	// GAP 1 is now fixed when the codec is running, and only then. The message says which.
-	if (!st->codec_failed)
+	// GATED ON THE CODEC ACTUALLY BEING ON, not merely on the absence of a build failure.
+	//
+	// This used to read `if (!st->codec_failed)`, which was correct only while hdr_codec=0 latched
+	// codec_failed as a side effect. Making hdr_codec live deleted that assignment - it had to, it
+	// was the whole reason the codec could not be turned on at runtime - and left this line
+	// printing "GAP 1 ADDRESSED - the HDR codec is ON" for a user who ships hdr_codec=0 and never
+	// opens the panel, contradicting the configuration line printed two entries above it and
+	// inverting the meaning of this add-on's primary diagnostic for the darkening symptom.
+	// live_hdr_codec(), not g_cfg.hdr_codec, for the same reason the identification block above
+	// reads the overlay's atomics: begin_pass has not run yet on this first dispatch, so g_cfg
+	// still holds what the ini said even when the user has already changed it and re-armed.
+	if (overlay_ui::live_hdr_codec() && !st->codec_failed && st->codec.ok)
 		LOGI("DLSS-NR: GAP 1 ADDRESSED - the HDR codec is ON. DLSSNR.Color will be the "
 		     "display-referred PROXY, not raw UE4 SceneColor: proxy = SrgbEncode(SoftClip(colour * "
 		     "s)), and the network's answer comes back as an ADDITIVE RESIDUAL onto the untouched "
@@ -4487,7 +4623,7 @@ static bool nr_lazy_ngx_init(device *dev)
 	// actually ran - locating View.ClipToPrevClip needs a real dispatch. The per-dispatch line
 	// (\"GAP 2 ADDRESSED\" / \"KNOWN GAP 2\") is the one that reports the outcome, and it is
 	// printed once from nr_try_run.
-	if (g_cfg.mvec_decode && !st->mvec_failed && st->mvec.ok)
+	if (overlay_ui::live_mvec_decode() && !st->mvec_failed && st->mvec.ok)
 		LOGI("DLSS-NR: GAP 2 ADDRESSED - the motion-vector decode is ARMED. DLSSNR.MVec will be "
 		     "OUR r16g16_float texture on the colour grid, not the game's encoded velocity: a "
 		     "compute pass applies UE 4.27's DecodeVelocityFromTexture (scale 4.00801611f AND the "
@@ -4505,9 +4641,15 @@ static bool nr_lazy_ngx_init(device *dev)
 		     "bias, so it cannot fix this. Symptom: ghosting or smearing that does not track "
 		     "camera motion. The fix is the decode compute pass this build ships - see README "
 		     "\"Known gaps\", gap 2.",
-		     !g_cfg.mvec_decode ? "mvec_decode=0, so it is disabled by configuration"
-		                        : "its shader or pipeline could not be built - see above");
+		     !overlay_ui::live_mvec_decode() ? "mvec_decode=0, so it is disabled by configuration"
+		                                     : "its shader or pipeline could not be built - see above");
 	LOGI("==================================================================");
+
+	// THE LAST STATEMENT, AND IT MUST STAY THE LAST STATEMENT. RELEASE, paired with the ACQUIRE in
+	// nr_service_reconfigure: until this is stored, the present thread treats this nr_state as if
+	// it did not exist at all. Every `return false` above leaves it false for the life of the
+	// process, which is correct - a state that failed to initialise must never be serviced.
+	st->init_complete.store(true, std::memory_order_release);
 	return true;
 }
 
@@ -4599,7 +4741,18 @@ static void nr_service_reconfigure(device *dev)
 	if (dev->get_api() != device_api::d3d12)
 		return;
 
-	auto *st = probe::pd_get<nr_state>(dev, kNrStateGuid);
+	// ACQUIRE ON init_complete, AND A HALF-BUILT STATE IS TREATED AS NO STATE AT ALL.
+	//
+	// pd_get can hand back an nr_state that nr_lazy_ngx_init published on its first statement and
+	// is still filling in, on a recording thread, for hundreds of milliseconds - which is exactly
+	// the window a user who just ticked "Load the snippet and arm NGX" is sitting in the overlay
+	// for. Acting on it there would run nr_release_feature_and_output over fields another thread
+	// is writing and reach the pipeline builders concurrently with the same call. See
+	// nr_state::init_complete. The ACQUIRE pairs with the RELEASE on the last line of
+	// nr_lazy_ngx_init, so everything that function wrote is visible once this reads true.
+	nr_state *const st_raw = probe::pd_get<nr_state>(dev, kNrStateGuid);
+	nr_state *const st = (st_raw != nullptr && st_raw->init_complete.load(std::memory_order_acquire))
+		? st_raw : nullptr;
 
 	// Before nr_lazy_ngx_init has ever run there is no nr_state to keep the seen-epochs in - that
 	// is exactly the enabled=0 case, where the whole point is to be able to arm from the overlay.
@@ -4629,6 +4782,49 @@ static void nr_service_reconfigure(device *dev)
 
 	overlay_ui::publish_reconfig_pending(true);
 
+	// Hoisted ABOVE the early returns rather than declared next to the work they describe: two of
+	// those returns can now carry a real failure - a snippet that will not load, and an NGX
+	// initialisation that already failed and cannot be retried - and a failure reported as
+	// "APPLIED" is the exact defect this ladder exists to remove.
+	bool ok = true;
+	const char *fail_reason = nullptr;
+
+	// ---- the DXR census: FIRST, because it is the one action that needs NOTHING ----------------
+	//
+	// Two relaxed stores into rt_census's own atomics. NOT rt_census::arm(), which prints a
+	// start-up banner describing the whole gate - correct once at init, wrong every time a
+	// checkbox moves.
+	//
+	// IT IS FIRST BECAUSE IT USED TO BE LAST, AND THAT MADE IT A DEAD CONTROL. take_reconfigure
+	// DRAINS the overlay's action word with fetch_and(0), and both early returns below used to
+	// discard the drained bits and then publish the reconfigure as a SUCCESS. rt_census::set_live
+	// is the only route by which the two census keys ever reach the census, and the census
+	// checkboxes are deliberately drawn OUTSIDE the panel's BeginDisabled(!usable) block on the
+	// stated grounds that "the case where NGX did NOT arm is exactly when a user wants the shader
+	// census turned on" - which is precisely the state where nr_state does not exist. So with
+	// enabled=0 in the ini the box ticked, Save lit up, the status block said the reconfigure was
+	// fine, and the census never turned on for the rest of the session. A control that lies with a
+	// green status beside it.
+	//
+	// The other bits are NOT re-queued on those paths, and that is a decision rather than an
+	// oversight: a_teardown, a_clear_failed, a_clear_clip, a_reconcile and a_apply_populate all
+	// describe work on an nr_state, and a fresh nr_state has nothing to tear down, no latched
+	// failure, clean clip latches, and is built by nr_lazy_ngx_init directly from the live values
+	// (live_hdr_codec / live_mvec_decode / live_populate_parameters, all read there). They are
+	// satisfied by construction. Re-queueing them instead would leave reconfig_pending true for
+	// ever in a session that never arms - REBUILDING on screen, permanently, for work that has
+	// nothing to do.
+	if ((work & overlay_ui::a_apply_census) != 0u)
+	{
+		const bool     on   = overlay_ui::live_rt_census();
+		const uint32_t every = overlay_ui::live_rt_census_frames();
+		rt_census::set_live(on, every);
+		LOGI("DLSS-NR reconfigure: RT census %s (summary every %u presents). Its counters are "
+		     "CUMULATIVE from the first time it was armed and are not reset here, so read the "
+		     "deltas between summaries rather than the totals.",
+		     on ? "ON" : "OFF", (unsigned)(every != 0 ? every : 600));
+	}
+
 	// ---- the snippet arm, which is the one action that does not need nr_state -----------------
 	// Done BEFORE the lock, because it LoadLibraryW's a 166 MB module and there is no reason to
 	// hold st->mutex across that. Nothing it touches is under that mutex.
@@ -4649,15 +4845,71 @@ static void nr_service_reconfigure(device *dev)
 			return;
 		}
 	}
+	// ---- THE ARM THAT CANNOT WORK, SAID OUT LOUD -----------------------------------------------
+	// The branch above only re-arms when the snippet is not loaded. The other way to be un-armed
+	// is that the snippet loaded fine and Init_Ext FAILED - and that cannot be retried: nr_try_run's
+	// deferred initialiser is a one-shot that is set before the attempt and never cleared, so
+	// nothing here can make it run again. Without this the service logged "reconfigure APPLIED:
+	// \"enabled\" -> tier 1" for a request that reached nothing at all, under a status block still
+	// promising STANDBY would clear itself. See g_nr_init_failed for why the one-shot stays.
+	else if ((work & overlay_ui::a_reconcile) != 0u &&
+	         overlay_ui::live_enabled() && g_snippet.available &&
+	         !g_nr_armed.load(std::memory_order_acquire) &&
+	         g_nr_init_failed.load(std::memory_order_relaxed))
+	{
+		ok = false;
+		fail_reason = "NGX initialisation already failed in this session and cannot be retried "
+		              "in-process - a relaunch is required; see the status block for the result code";
+		static bool s_said_init_dead = false;
+		if (!s_said_init_dead)
+		{
+			s_said_init_dead = true;
+			LOGW("DLSS-NR reconfigure: \"%s\" cannot arm NGX. Init_Ext already ran and failed "
+			     "(0x%08X) and the deferred initialiser is a one-shot that is not cleared on "
+			     "failure - deliberately, because the one measured fact about its fragility is "
+			     "that it can HANG. Fix the cause and relaunch. This message is printed once.",
+			     why, (unsigned)g_nr_init_result.load(std::memory_order_relaxed));
+		}
+	}
+
+	// ---- INITIALISATION IS IN FLIGHT: KEEP THE WORK, DO NOT DISCARD IT -------------------------
+	//
+	// st_raw exists but has not published init_complete, so nr_lazy_ngx_init is running RIGHT NOW
+	// on a recording thread. That is not the same situation as "no state at all", and the
+	// difference is a lost setting: lazy init reads the live values ONCE, near its start, so a
+	// change the user makes during its several hundred milliseconds has ALREADY been missed by it.
+	// Dropping the bits here - which is what treating this as the no-state case would do, since
+	// take_reconfigure has already drained them - would leave the feature rebuilt (the rebuild
+	// epoch is re-detected afterwards, because adopt_epochs seeded seen_service at the START of
+	// init) but the codec or mvec pipelines never built. Tick HDR codec while the arm is running
+	// and it would silently do nothing.
+	//
+	// pending_work is safe to touch here even though nothing else about st_raw is: it is a
+	// std::atomic<uint32_t> that pd_create value-initialised BEFORE it published the pointer, and
+	// nr_lazy_ngx_init never writes it.
+	//
+	// The rebuild gate is NOT opened and reconfig_pending is NOT cleared, both deliberately: the
+	// work really is still owed, the pass must stay skipped until it is done, and REBUILDING is
+	// exactly what is happening. The escape hatch is g_nr_init_failed - an initialisation that
+	// died can never publish init_complete, so without that test this branch would hold the panel
+	// at REBUILDING for the rest of the session.
+	if (st == nullptr && st_raw != nullptr &&
+	    !g_nr_init_failed.load(std::memory_order_relaxed))
+	{
+		// The census is already applied, above; re-queuing it would just re-log it.
+		st_raw->pending_work.fetch_or(work & ~overlay_ui::a_apply_census,
+		                              std::memory_order_relaxed);
+		return;
+	}
 
 	if (st == nullptr)
 	{
 		// Nothing else can be done on this device yet: nr_lazy_ngx_init creates nr_state, and it
 		// runs on the next dispatch now that the arm above has set g_nr_pending_init. The gate is
-		// opened here too - with no nr_state there is nothing to release, so the rebuild IS done,
-		// and leaving it shut would wedge the pass before it had ever run.
+		// opened here too: with no serviceable nr_state there is nothing to release, so the
+		// rebuild IS done, and leaving it shut would wedge the pass before it had ever run.
 		overlay_ui::publish_serviced_rebuild(req.rebuild_epoch);
-		overlay_ui::publish_reconfigure(true, why);
+		overlay_ui::publish_reconfigure(ok, ok ? why : fail_reason);
 		overlay_ui::publish_reconfig_pending(false);
 		return;
 	}
@@ -4689,9 +4941,6 @@ static void nr_service_reconfigure(device *dev)
 	}
 
 	std::lock_guard<std::mutex> lock(st->mutex);
-
-	bool ok = true;
-	const char *fail_reason = nullptr;
 
 	// ---- R4: the teardown, through the EXISTING seam -------------------------------------------
 	// nr_release_feature_and_output is unchanged. It idles the queue, releases the NGX feature,
@@ -4739,11 +4988,30 @@ static void nr_service_reconfigure(device *dev)
 				              "falls back to the game's raw encoded velocity";
 			}
 		}
+	}
 
-		// populate_parameters. OFF->ON is one call on the block we already have. ON->OFF cannot
-		// be un-called, so it needs a FRESH block - which needs the feature released first,
-		// because CreateFeature was handed the old pointer. The overlay's Apply button raises
-		// k_rebuild for exactly that reason, so the teardown above has already happened.
+	// ---- populate_parameters: ITS OWN BIT, AND ONLY ITS OWN BIT --------------------------------
+	//
+	// This block used to live inside a_reconcile above and to key purely on
+	// live_populate_parameters() vs st->serviced_populate_parameters. That meant EVERY control
+	// that raised a_reconcile - enabled, hdr_codec, mvec_decode, require_trampoline, Reset,
+	// Revert - applied whatever the PopulateParameters checkbox happened to say, including a value
+	// the user had ticked and deliberately NOT Applied. The checkbox's tooltip promises the exact
+	// opposite ("only when you press Apply beside it - deliberately not on the click"), and the
+	// reason it does is that PopulateParameters_Impl is a gated export whose signature is
+	// unverified against this snippet build. Worse, require_trampoline raises a_reconcile at
+	// k_plain - no teardown - so it reached the ON->OFF branch with st->feature still alive and
+	// deleted the parameter block CreateFeature had been handed.
+	//
+	// a_apply_populate is raised by the Apply button and by Revert, both with a_teardown, and by
+	// nothing else. The bits are OR-merged into one word, so the service structurally cannot tell
+	// which key asked - which is exactly why the work must have its own bit rather than be derived
+	// from a value.
+	if ((work & overlay_ui::a_apply_populate) != 0u)
+	{
+		// OFF->ON is one call on the block we already have. ON->OFF cannot be un-called, so it
+		// needs a FRESH block - which needs the feature released FIRST, because CreateFeature was
+		// handed the old pointer.
 		const bool want_populate = overlay_ui::live_populate_parameters();
 		if (want_populate && !st->serviced_populate_parameters && st->params != nullptr)
 		{
@@ -4763,26 +5031,47 @@ static void nr_service_reconfigure(device *dev)
 		}
 		else if (!want_populate && st->serviced_populate_parameters)
 		{
-			// ALLOCATE FIRST, THEN DELETE. If the allocation fails we keep the block we have and
-			// report it: a null st->params is a bail on every subsequent dispatch, which would
-			// turn a settings change into "the add-on stopped working".
-			ngx::parameter_block *fresh = new (std::nothrow) ngx::parameter_block();
-			if (fresh == nullptr)
+			// CHECKED, NOT ASSUMED. The precondition is "the feature that was created against this
+			// block is gone", and the honest way to know that is to look at st->feature rather
+			// than to trust that the caller raised the right rung. want_teardown alone is not
+			// enough either: the teardown may have been refused earlier for want of a queue, and
+			// take_reconfigure ADOPTS the rebuild epoch on its first call for a given seen-state,
+			// so a request that relied on the epoch to imply the release can arrive without one.
+			// Refusing leaves the previous working state exactly as it was, which is the rule.
+			if (st->feature != nullptr)
 			{
 				ok = false;
-				fail_reason = "out of memory allocating a fresh NGX parameter block; the previous "
-				              "one is still in use and populate_parameters is unchanged";
+				fail_reason = "the NGX feature is still live, and the parameter block it was "
+				              "created against cannot be replaced underneath it - press \"Reset NR "
+				              "feature\" and then Apply again";
 			}
 			else
 			{
-				delete st->params;
-				st->params = fresh;
-				st->serviced_populate_parameters = false;
-				LOGI("DLSS-NR reconfigure: allocated a fresh NGX parameter block "
-				     "(populate_parameters 1 -> 0). PopulateParameters_Impl cannot be un-called on "
-				     "the block it was made against, so the block is replaced instead.");
+				// ALLOCATE FIRST, THEN DELETE. If the allocation fails we keep the block we have
+				// and report it: a null st->params is a bail on every subsequent dispatch, which
+				// would turn a settings change into "the add-on stopped working".
+				ngx::parameter_block *fresh = new (std::nothrow) ngx::parameter_block();
+				if (fresh == nullptr)
+				{
+					ok = false;
+					fail_reason = "out of memory allocating a fresh NGX parameter block; the "
+					              "previous one is still in use and populate_parameters is unchanged";
+				}
+				else
+				{
+					delete st->params;
+					st->params = fresh;
+					st->serviced_populate_parameters = false;
+					LOGI("DLSS-NR reconfigure: allocated a fresh NGX parameter block "
+					     "(populate_parameters 1 -> 0). PopulateParameters_Impl cannot be un-called "
+					     "on the block it was made against, so the block is replaced instead.");
+				}
 			}
 		}
+		// Mirrored to the panel either way, including on the refusal: the checkbox then keeps
+		// showing "checked but NOT APPLIED" beside a red RECONFIGURE FAILED banner, which together
+		// say precisely what happened.
+		overlay_ui::publish_populate(st->serviced_populate_parameters);
 	}
 
 	// ---- R3: the one-shot log latches --------------------------------------------------------
@@ -4879,20 +5168,9 @@ static void nr_service_reconfigure(device *dev)
 		st->logged_mvec_decode_only = false;
 	}
 
-	// ---- the DXR census -------------------------------------------------------------------------
-	// Two relaxed stores into rt_census's own atomics. NOT rt_census::arm(), which prints a
-	// start-up banner describing the whole gate - correct once at init, wrong every time a
-	// checkbox moves.
-	if ((work & overlay_ui::a_apply_census) != 0u)
-	{
-		const bool     on   = overlay_ui::live_rt_census();
-		const uint32_t every = overlay_ui::live_rt_census_frames();
-		rt_census::set_live(on, every);
-		LOGI("DLSS-NR reconfigure: RT census %s (summary every %u presents). Its counters are "
-		     "CUMULATIVE from the first time it was armed and are not reset here, so read the "
-		     "deltas between summaries rather than the totals.",
-		     on ? "ON" : "OFF", (unsigned)(every != 0 ? every : 600));
-	}
+	// (The DXR census is applied at the TOP of this function, above every early return - it needs
+	// neither nr_state nor a lock, and it is the control a user reaches for precisely when NGX
+	// never armed. See the comment there.)
 
 	// ---- report ---------------------------------------------------------------------------------
 	if (ok)
@@ -4902,7 +5180,7 @@ static void nr_service_reconfigure(device *dev)
 		// service returns early when there is no work, so reaching here means a rung was actually
 		// climbed. It names the key and the tier, which is what makes "did my change land?"
 		// answerable from the log alone.
-		LOGI("DLSS-NR reconfigure APPLIED: \"%s\" -> tier %s%s%s%s%s. "
+		LOGI("DLSS-NR reconfigure APPLIED: \"%s\" -> tier %s%s%s%s%s%s. "
 		     "codec=%s mvec=%s feature=%s",
 		     why,
 		     want_teardown ? "1 (feature recreate)" : (req.ident_changed ? "2 (re-identify)" : "0/1 (live)"),
@@ -4910,6 +5188,7 @@ static void nr_service_reconfigure(device *dev)
 		     (work & overlay_ui::a_reconcile)    ? " +reconcile" : "",
 		     (work & overlay_ui::a_clear_clip)   ? " +clip-latches" : "",
 		     (work & overlay_ui::a_apply_census) ? " +census" : "",
+		     (work & overlay_ui::a_apply_populate) ? " +populate" : "",
 		     st->codec_failed ? "FAILED" : (st->codec.ok ? "built" : "not built"),
 		     st->mvec_failed  ? "FAILED" : (st->mvec.ok  ? "built" : "not built"),
 		     st->feature != nullptr ? "kept" : "released");
@@ -5286,6 +5565,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 			f.trampoline          = g_snippet.trampoline_module != nullptr;
 			f.armed               = g_nr_armed.load(std::memory_order_relaxed);
 			f.abi_thunks_active   = probe::msvc_abi_thunks_active();
+			// The one state the panel cannot fix, reported so it can say so. `armed` false has two
+			// causes and only one of them clears itself; see host_facts::ngx_init_failed.
+			f.ngx_init_failed     = g_nr_init_failed.load(std::memory_order_relaxed);
+			f.ngx_init_result     = g_nr_init_result.load(std::memory_order_relaxed);
+			f.ngx_init_result_name = f.ngx_init_result != 0
+				? ngx::result_to_string(f.ngx_init_result) : "";
 			std::snprintf(f.snippet_reason, sizeof(f.snippet_reason), "%s",
 				g_snippet.not_available_reason.c_str());
 		};

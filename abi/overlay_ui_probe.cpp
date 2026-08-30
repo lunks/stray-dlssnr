@@ -31,13 +31,16 @@ extern "C" __declspec(dllexport) bool overlay_ui_install_probe()
 extern "C" __declspec(dllexport) bool overlay_ui_pass_probe()
 {
     static cfg::config             c;
+    // The per-device snapshot scratch. nr_state owns one of these; begin_pass builds into it
+    // under the overlay's seqlock and only commits to `c` when the panel did not move.
+    static cfg::config             scratch;
     static overlay_ui::seen_epochs seen_pass;
     static bool                    need_reset = false;
     static uint64_t                pending_res = 0;
 
     overlay_ui::seed_from_config(c, L"C:\\nowhere\\");
 
-    const bool run = overlay_ui::begin_pass(c, seen_pass, need_reset, pending_res,
+    const bool run = overlay_ui::begin_pass(c, scratch, seen_pass, need_reset, pending_res,
                                             true, false, true);
 
     overlay_ui::publish_evaluate(0u, "Success", true, 1920u, 1080u,
@@ -71,13 +74,16 @@ extern "C" __declspec(dllexport) unsigned overlay_ui_reconfigure_probe()
 
     overlay_ui::request(overlay_ui::a_teardown | overlay_ui::a_clear_failed |
                         overlay_ui::a_clear_clip | overlay_ui::a_apply_census |
-                        overlay_ui::a_reconcile,
+                        overlay_ui::a_reconcile | overlay_ui::a_apply_populate,
                         "overlay_ui_reconfigure_probe", overlay_ui::k_rebuild);
 
     const overlay_ui::reconfig_request r = overlay_ui::take_reconfigure(seen_service);
 
     overlay_ui::publish_reconfig_pending(r.bits != 0);
     overlay_ui::publish_reconfigure(true, "overlay_ui_reconfigure_probe");
+    overlay_ui::publish_populate(overlay_ui::live_populate_parameters());
+    // The service seeds nr_state::seen_service with this before it does any work.
+    overlay_ui::adopt_epochs(seen_service);
 
     return r.bits ^ id.epoch ^ (unsigned)id.shader_hash ^ (r.ident_changed ? 1u : 0u);
 }
