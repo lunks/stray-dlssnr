@@ -134,3 +134,54 @@ extern "C" __declspec(dllexport) void overlay_thunk_probe()
 	const ImVec2 p = overlay_imgui::by_value_ret(t->GetCursorScreenPos);
 	(void)p;
 }
+
+// ---------------------------------------------------------------------------------------------
+// The whitelist AGAIN, written the way the UI will actually be written: leaning on default
+// arguments.
+//
+// This is not redundant. reshade_overlay.hpp's inline wrappers declare NO default arguments -
+// `inline bool Button(const char* label, const ImVec2& size)` - so it looks as though every call
+// must pass every parameter. It does not: those inlines REDECLARE functions that <imgui.h> has
+// already declared in the same namespace WITH defaults (`Button(const char*, const ImVec2& size =
+// ImVec2(0,0))`), and a redeclaration inherits the earlier default arguments. Compiling this
+// under both toolchains is what keeps that true, so the UI can be written in ordinary ImGui style
+// instead of padding every call with explicit defaults.
+// ---------------------------------------------------------------------------------------------
+extern "C" __declspec(dllexport) void overlay_default_args_probe()
+{
+	if (!overlay_imgui::available())
+		return;
+
+	static bool  b = false;
+	static int   i = 0;
+	static float f = 0.0f;
+	static const char *const items[] = { "a", "b" };
+
+	ImGui::SeparatorText("DLSS 5 Neural Rendering");
+	ImGui::Checkbox("Enable DLSS Neural Rendering", &b);
+	ImGui::SliderFloat("NR Intensity", &f, 0.0f, 1.0f);
+	ImGui::SliderInt("NR Preset", &i, 0, 4);
+	ImGui::Combo("NR Style", &i, items, 2);
+	ImGui::RadioButton("Force inverted depth", true);
+	ImGui::Button("Reset");
+	ImGui::SameLine();
+	ImGui::SmallButton("Defaults");
+	ImGui::TextUnformatted("WAITING FOR NGX");
+	ImGui::Text("%d", 1);
+	ImGui::TextColored(ImVec4(1, 1, 0, 1), "%s", "WAITING FOR GAME DLSS");
+	ImGui::TextDisabled("%s", "n/a");
+	ImGui::TextWrapped("%s", "wrapped");
+	ImGui::SetTooltip("%s", "tip");
+	if (ImGui::IsItemHovered()) { }
+	if (ImGui::TreeNodeEx("Advanced", ImGuiTreeNodeFlags_DefaultOpen)) { ImGui::TreePop(); }
+	if (ImGui::CollapsingHeader("Diagnostics")) { }
+	ImGui::Selectable("row", false);
+	ImGui::ProgressBar(0.5f);
+	ImGui::Indent();
+	ImGui::Unindent();
+	ImGui::BeginDisabled(true);
+	ImGui::EndDisabled();
+	ImGui::Separator();
+	ImGui::Spacing();
+	ImGui::Bullet();
+}
