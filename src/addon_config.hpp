@@ -737,6 +737,12 @@ struct config
 	// image on this same machine, game and driver. 24 IS r10g10b10a2_unorm.
 	uint32_t neural_format   = 0;
 
+	// Bind the KNOWN-GOOD input texture into the probe's SECOND slot as well, so the slot is read
+	// against a value already proven to read correctly through the FIRST slot. If OUT then still
+	// reads zero, the probe's second binding is broken and every "the network's output is zero"
+	// result it has produced is an artifact of the instrument.
+	uint32_t nr_probe_selftest = 0;
+
 	// =======================================================================================
 	// DLSS SUPER RESOLUTION (NGX feature 1, nvngx_dlss.dll). See STAGING-sr.md.
 	// =======================================================================================
@@ -1128,6 +1134,7 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "nr_probe_frames")          c.nr_probe_frames = static_cast<uint32_t>(parse_u64(v, c.nr_probe_frames));
 		else if (key == "nr_probe_warmup")          c.nr_probe_warmup = static_cast<uint32_t>(parse_u64(v, c.nr_probe_warmup));
 		else if (key == "neural_format")            c.neural_format = static_cast<uint32_t>(parse_u64(v, c.neural_format));
+		else if (key == "nr_probe_selftest")        c.nr_probe_selftest = static_cast<uint32_t>(parse_u64(v, c.nr_probe_selftest));
 		else if (key == "app_id")                   c.app_id = parse_u64(v, c.app_id);
 		else if (key == "dlss_sr")                  c.dlss_sr = parse_bool(v, c.dlss_sr);
 		else if (key == "dlss_nr")                  c.dlss_nr = parse_bool(v, c.dlss_nr);

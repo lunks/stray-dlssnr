@@ -3810,10 +3810,10 @@ static void nr_codec_decode(command_list *cmd, nr_state &st, resource_view origi
 	// agreeing with the extremes). That is either an empty texture or a broken SRV/state, and
 	// the two are indistinguishable from that side. This dispatch is the same texture in the
 	// same frame by the other route, which separates them.
-	if (g_cfg.nr_probe != 0 && st.probe.ready && st.out_uav.handle != 0)
+	if (g_cfg.nr_probe != 0 && st.probe.ready)
 	{
 		nr_probe::frame(cmd->get_device(), cmd, st.probe, st.probe_run,
-		                original_srv, st.out_uav, st.out_tex, st.out_w, st.out_h,
+		                original_srv, st.out_srv, g_cfg.nr_probe_selftest != 0, st.out_w, st.out_h,
 		                g_cfg.nr_probe_frames, g_cfg.nr_probe_warmup,
 		                [](const char *fmt, auto... args) {
 			                logf(reshade::log::level::info, fmt, args...);

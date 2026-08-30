@@ -127,9 +127,9 @@ static const char *const kShaderSource = R"HLSL(
 // after that barrier returned exactly zero on validated gameplay content; this is the same
 // texture in the same frame by a different route, which is what separates "the texture is
 // empty" from "our view or state transition of it is wrong".
-Texture2D<float4>   t_in  : register(t0);
-RWBuffer<uint>      stats : register(u0);
-RWTexture2D<float4> u_out : register(u1);
+Texture2D<float4> t_in  : register(t0);
+Texture2D<float4> t_out : register(t1);
+RWBuffer<uint>    stats : register(u0);
 
 cbuffer Args : register(b0)
 {
@@ -156,7 +156,7 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
 
     float3 a = t_in.Load(int3(p, 0)).rgb;
-    float3 b = u_out[p].rgb;
+    float3 b = t_out.Load(int3(p, 0)).rgb;
 
     float la = luma(a);
     float lb = luma(b);
@@ -287,7 +287,7 @@ inline bool build(device *dev, const std::vector<uint8_t> &dxbc, pipeline_set &p
 {
 	const char *stage = nullptr;
 
-	if      (!hdr_codec::make_layout(dev, 1, kConstantCount, p.layout, 2)) stage = "create_pipeline_layout(probe)";
+	if      (!hdr_codec::make_layout(dev, 2, kConstantCount, p.layout)) stage = "create_pipeline_layout(probe)";
 	else if (!hdr_codec::make_pipeline(dev, p.layout, dxbc, p.pso))     stage = "create_pipeline(probe)";
 
 	if (stage == nullptr)
@@ -350,8 +350,8 @@ inline void clear(command_list *cmd, pipeline_set &p)
 
 // Both SRVs must already be in shader_resource_non_pixel. The caller runs this immediately after
 // the codec's decode, which has already transitioned out_tex for exactly that reason.
-inline void dispatch(command_list *cmd, pipeline_set &p, resource_view in_srv, resource_view out_uav,
-                     resource out_uav_res,
+inline void dispatch(command_list *cmd, pipeline_set &p, resource_view in_srv, resource_view out_srv,
+                     bool selftest,
                      uint32_t width, uint32_t height)
 {
 	// UAV BARRIER ON out_tex BEFORE WE READ IT.
@@ -366,23 +366,29 @@ inline void dispatch(command_list *cmd, pipeline_set &p, resource_view in_srv, r
 	//
 	// A UAV-to-UAV barrier is exactly the "wait for the previous writer" edge, with no state
 	// change - which is what is missing here.
-	cmd->barrier(out_uav_res, resource_usage::unordered_access, resource_usage::unordered_access);
-
 	cmd->bind_descriptor_tables(shader_stage::all_compute, p.layout, 0, 0, nullptr);
 	cmd->bind_pipeline(pipeline_stage::all_compute, p.pso);
 
+	// SELF-TEST: with selftest=true the SECOND slot gets in_srv as well, i.e. a texture already
+	// KNOWN to read correctly through the FIRST slot. Then:
+	//   OUT mirrors IN  -> the two-slot binding works, and out_tex really is zero
+	//   OUT reads zero  -> THE PROBE'S SECOND BINDING IS BROKEN and every "OUT is zero" result
+	//                      so far is an artifact of this instrument, not a fact about NGX
+	// This is the check that should have come before any conclusion was drawn from slot 1: the
+	// zero was invariant across FP16, r10g10b10a2_unorm, an SRV read after the decode's barrier
+	// and a UAV read before it - and invariance across every property of the TEXTURE is what a
+	// binding bug looks like.
+	const resource_view srvs[2] = { in_srv, selftest ? in_srv : out_srv };
 	descriptor_table_update srv_up = {};
-	srv_up.binding = 0; srv_up.array_offset = 0; srv_up.count = 1;
+	srv_up.binding = 0; srv_up.array_offset = 0; srv_up.count = 2;
 	srv_up.type = descriptor_type::shader_resource_view;
-	srv_up.descriptors = &in_srv;
+	srv_up.descriptors = srvs;
 	cmd->push_descriptors(shader_stage::compute, p.layout, kParamSrvTable, srv_up);
 
-	// u0 stats, u1 out_tex - one contiguous table, in declaration order.
-	const resource_view uavs[2] = { p.stats_uav, out_uav };
 	descriptor_table_update uav_up = {};
-	uav_up.binding = 0; uav_up.array_offset = 0; uav_up.count = 2;
+	uav_up.binding = 0; uav_up.array_offset = 0; uav_up.count = 1;
 	uav_up.type = descriptor_type::unordered_access_view;
-	uav_up.descriptors = uavs;
+	uav_up.descriptors = &p.stats_uav;
 	cmd->push_descriptors(shader_stage::compute, p.layout, kParamUavTable, uav_up);
 
 	args a = {};
@@ -449,7 +455,7 @@ static constexpr uint32_t kReadbackDelay = 4;
 
 template <typename LogFn>
 inline void frame(device *dev, command_list *cmd, pipeline_set &p, run_state &r,
-                  resource_view in_srv, resource_view out_uav, resource out_uav_res,
+                  resource_view in_srv, resource_view out_srv, bool selftest,
                   uint32_t width, uint32_t height, uint32_t frames_per_step,
                   uint32_t warmup_needed, LogFn log)
 {
@@ -578,7 +584,7 @@ inline void frame(device *dev, command_list *cmd, pipeline_set &p, run_state &r,
 	if (r.frames_in_step == 0)
 		clear(cmd, p);
 
-	dispatch(cmd, p, in_srv, out_uav, out_uav_res, width, height);
+	dispatch(cmd, p, in_srv, out_srv, selftest, width, height);
 	r.frames_in_step++;
 
 	if (r.frames_in_step >= frames_per_step)
