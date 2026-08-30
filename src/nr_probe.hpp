@@ -60,7 +60,20 @@ namespace nr_probe
 // and the mean ALONE cannot tell "NGX wrote nothing" from "NGX wrote negative values" - slots 0-2
 // saturate() before the fixed-point cast, so anything <= 0 accumulates as 0 either way. That
 // ambiguity is the whole question, so the signed extremes are carried separately and unsaturated.
-static constexpr uint32_t kSlots       = 10;
+// 10 sum(luma_out > 0)   11 max x of a written texel   12 max y   13 min x   14 min y (as ~x)
+//
+// THE POPULATED-REGION SLOTS. renodx's own shader source carries this note about the exact
+// snippet version we load:
+//
+//   "DLSSNR 310.8 writes the neural answer at its active network resolution even when the
+//    Output resource is larger (the signed runtime reports success but leaves the remainder
+//    untouched). Sample that populated region explicitly."
+//
+// If that is happening here, a strided grid over the WHOLE output reads almost entirely
+// untouched memory - which is what this probe has been reporting as "the output is zero" - while
+// the decode still picks up real content wherever the region IS written, giving a darker but
+// real frame. That is every observation at once, so measure the region instead of assuming it.
+static constexpr uint32_t kSlots       = 15;
 static constexpr uint32_t kSlotBytes   = kSlots * sizeof(uint32_t);
 static constexpr uint32_t kThreads     = 8;
 
@@ -186,6 +199,16 @@ void main(uint3 id : SV_DispatchThreadID)
     uint ka = order_key(la);
     InterlockedMax(stats[8], ka,  prev);
     InterlockedMax(stats[9], ~ka, prev);
+
+    // Where is the output ACTUALLY written? Bounds of the non-zero region, in texels.
+    if (lb != 0.0f)
+    {
+        InterlockedAdd(stats[10], 1u,   prev);
+        InterlockedMax(stats[11], p.x,  prev);
+        InterlockedMax(stats[12], p.y,  prev);
+        InterlockedMax(stats[13], ~p.x, prev);   // ~min x
+        InterlockedMax(stats[14], ~p.y, prev);   // ~min y
+    }
 }
 )HLSL";
 
@@ -231,6 +254,9 @@ struct step_result
 	float  max_in    = 0.0f;
 	uint32_t neg_out = 0;
 	uint32_t nan_out = 0;
+	// The written region, measured rather than assumed. See the kSlots note on DLSSNR 310.8.
+	uint32_t written  = 0;
+	uint32_t max_x = 0, max_y = 0, min_x = 0, min_y = 0;
 };
 
 // Inverse of the shader's order_key.
@@ -434,6 +460,11 @@ inline bool read(device *dev, pipeline_set &p, step_result &out)
 	out.nan_out   = v[7];
 	out.max_in    = key_to_float(v[8]);
 	out.min_in    = key_to_float(~v[9]);
+	out.written   = v[10];
+	out.max_x     = v[11];
+	out.max_y     = v[12];
+	out.min_x     = ~v[13];
+	out.min_y     = ~v[14];
 	out.valid     = true;
 	return true;
 }
@@ -482,6 +513,15 @@ inline void frame(device *dev, command_list *cmd, pipeline_set &p, run_state &r,
 				    "out<0: %u   non-finite out: %u",
 				    res.min_in, res.max_in, res.min_out, res.max_out,
 				    res.neg_out, res.nan_out);
+				log("DLSS-NR probe:   WRITTEN REGION  %u of %llu sampled texels non-zero"
+				    "%s",
+				    res.written, (unsigned long long)res.samples,
+				    res.written ? "" : "  <- NOTHING written anywhere in the sampled grid");
+				if (res.written)
+					log("DLSS-NR probe:   written bounds x[%u..%u] y[%u..%u] of %ux%u - if this is "
+					    "a SUB-REGION, DLSSNR 310.8 wrote at its active network resolution and left "
+					    "the remainder untouched (renodx documents exactly this).",
+					    res.min_x, res.max_x, res.min_y, res.max_y, width, height);
 				if (res.min_out == 0.0f && res.max_out == 0.0f)
 					log("DLSS-NR probe:   OUT IS EXACTLY ZERO EVERYWHERE - NGX returned Success but "
 					    "wrote nothing to the texture bound as DLSSNR.Output, or we are reading a "
