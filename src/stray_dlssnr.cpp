@@ -1546,6 +1546,11 @@ struct nr_state
 	bool logged_owned_throw      = false;
 	bool logged_copy_fmt         = false;
 	bool logged_identity         = false;
+	// The graft-mode log line is NOT a one-shot: hdr_graft is a tier-0 root constant whose entire
+	// point is that the user flips it mid-session from the overlay, and a run-lifetime latch would
+	// leave ReShade.log ASSERTING a graft that is no longer in effect for the rest of the session.
+	// 0xFFFFFFFF is "nothing logged yet", which no real mode value can collide with.
+	uint32_t logged_graft        = 0xFFFFFFFFu;
 	bool logged_codec_off        = false;
 	bool logged_codec_tex_fail   = false;
 	bool logged_hist_active      = false;
@@ -1657,6 +1662,15 @@ struct nr_state
 	// Latched for the whole run: the DXBC could not be produced, or the root signature / PSO could
 	// not be created. Nothing about a resolution change can undo that, so it is never cleared.
 	bool codec_failed      = false;
+	// Whether the DECODE BLOB IN HAND can do hdr_graft = 1. False when hdr_codec::build had to
+	// fall back to the survival source because the compile with the reference graft failed here;
+	// the CPU then pins the mode to 0 rather than dispatching into a stub that would silently
+	// return the original. Set once, from the build site, and never cleared.
+	bool codec_graft_ok    = true;
+	// True when the decode came from a user-supplied stray_dlssnr_decode.dxbc, which may predate
+	// g_hdrGraft and read the constant not at all. We cannot force anything in that case - the
+	// blob may well be this exact source, precompiled elsewhere - so it is REPORTED, not acted on.
+	bool codec_overridden  = false;
 	bool orig_ok           = false;     // orig_tex exists at (out_w, out_h)
 	// Latched per (out_w, out_h) only, exactly like feature_failed: a create_resource that failed
 	// at one resolution may well succeed at another, and retrying it every frame would be a
@@ -2955,7 +2969,7 @@ static void nr_codec_encode(command_list *cmd, nr_state &st, resource_view src_s
 
 static void nr_codec_decode(command_list *cmd, nr_state &st, resource_view original_srv,
                             float proxy_scale, float transfer_strength, float color_strength,
-                            bool &out_in_srv)
+                            uint32_t graft_mode, bool &out_in_srv)
 {
 	// NGX wrote out_tex OUTSIDE anything that tracks it, so nothing knows the decode's read of
 	// it has to wait. This transition is that dependency, and it is also what makes the
@@ -2992,7 +3006,12 @@ static void nr_codec_decode(command_list *cmd, nr_state &st, resource_view origi
 	// does not re-clamp them.
 	da.transfer_strength = transfer_strength;
 	da.color_strength    = color_strength;
-	da.pad0 = da.pad1 = da.pad2 = 0;
+	// The ONLY thing that selects the renodx graft. It reaches the shader here and nowhere
+	// else: no pipeline is rebuilt and no feature is recreated, so if this dispatch runs at
+	// all, the mode is in effect. Threaded through the extraction rather than read from
+	// g_cfg here, because the chain path calls this with the same value the encode used.
+	da.graft_mode        = graft_mode;
+	da.pad1 = da.pad2 = 0;
 	cmd->push_constants(shader_stage::compute, st.codec.decode_layout, hdr_codec::kParamConstants,
 	                    0, hdr_codec::kDecodeConstantCount, &da);
 
@@ -3506,6 +3525,11 @@ static void sr_try_run(command_list *cmd, device *dev, probe::device_shadow &sh,
 	bool  chain_run   = chain;
 	bool  chain_codec = false;
 	float chain_proxy_scale = 1.0f, chain_transfer = 0.0f, chain_colour_strength = 0.0f;
+	// Same selector the NR-alone path uses, computed here because the chain path has its own
+	// copies of every codec constant. codec_graft_ok is the build-time gate: with the renodx
+	// graft shader absent, mode 1 must fall back to 0 rather than dispatch a shader that is
+	// not there.
+	uint32_t chain_graft_mode = 0u;
 	bool  chain_encoded = false, chain_nr_ok = false, chain_decoded = false;
 	bool  chain_proxy_in_srv = false, chain_out_in_srv = false, chain_result_in_srv = false;
 	bool  chain_nr_reset = false;
@@ -3549,6 +3573,7 @@ static void sr_try_run(command_list *cmd, device *dev, probe::device_shadow &sh,
 		// encode's s and the decode's is a correctness failure, not a tuning difference. Same
 		// expressions as the DLSS-NR path's, and the clamps are Remix's.
 		chain_proxy_scale = 1.0f / (g_cfg.paper_white_scale > 0.01f ? g_cfg.paper_white_scale : 0.01f);
+		chain_graft_mode  = (st.codec_graft_ok && g_cfg.hdr_graft != 0u) ? 1u : 0u;
 		chain_transfer = (g_cfg.transfer_strength < 0.0f) ? 0.0f
 			: (g_cfg.transfer_strength > 1.0f ? 1.0f : g_cfg.transfer_strength);
 		chain_colour_strength = (g_cfg.color_strength < 0.0f) ? 0.0f
@@ -3795,7 +3820,7 @@ static void sr_try_run(command_list *cmd, device *dev, probe::device_shadow &sh,
 		if (chain_nr_ok && chain_encoded)
 		{
 			nr_codec_decode(cmd, st, colour_view, chain_proxy_scale, chain_transfer,
-			                chain_colour_strength, chain_out_in_srv);
+			                chain_colour_strength, chain_graft_mode, chain_out_in_srv);
 			chain_decoded = true;
 			// THE ONE BARRIER CHAIN MODE ADDS. It is the decode's write-completion AND the state
 			// NGX reads Color in, in one transition - the same shape as the proxy's.
@@ -4891,6 +4916,22 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 		: (g_cfg.transfer_strength > 1.0f ? 1.0f : g_cfg.transfer_strength);
 	const float color_strength    = (g_cfg.color_strength < 0.0f) ? 0.0f
 		: (g_cfg.color_strength > 1.0f ? 1.0f : g_cfg.color_strength);
+	// Which graft-back the decode uses. 0 = our additive scene-linear residual (default, and the
+	// only mode whose transfer_strength=0 identity is bit-exact), 1 = the reference add-on's
+	// UpgradeToneMap. This is a root constant, so changing it costs nothing but the next dispatch.
+	//
+	// NORMALISED TO {0, 1} HERE, unlike DLSSNR.Style. Style's unlisted values are PRESERVED
+	// because they genuinely reach NGX and may mean something there, so clamping them would make
+	// the overlay lie about what was sent. hdr_graft has no third behaviour - the shader branch is
+	// `g_hdrGraft == 0u ? ours : theirs` - and leaving a 2 in the live block only produced a row
+	// the combo refuses to draw ("2  (not a listed value - sent as-is)"), stranding the user with
+	// no way back to either mode without editing the ini and restarting. The stored value now says
+	// what the shader will actually do.
+	//
+	// And if the decode in hand was built WITHOUT the reference graft, the mode is 0 whatever was
+	// asked for: dispatching 1 into the survival build's stub would return the original at every
+	// colour strength, which is a silent wrong image rather than an honestly missing feature.
+	const uint32_t graft_mode = (st->codec_graft_ok && g_cfg.hdr_graft != 0u) ? 1u : 0u;
 
 	// Resources this pass moves OUT of their resting state inside the fenced window below. They
 	// are put back unconditionally after the fence, so an escape cannot leave D3D12's view of a
@@ -5181,6 +5222,41 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 				     (int)codec_encoded, (int)(g_cfg.history_restore && g_cfg.copy_back));
 			}
 
+			// THE GRAFT IN EFFECT, RE-STATED WHENEVER IT CHANGES - deliberately NOT folded into
+			// the one-shot below. hdr_graft is a tier-0 root constant that exists to be flipped
+			// mid-session from the overlay; logged once, ReShade.log would spend the rest of the
+			// session ASSERTING a graft that is no longer running, and this log is the primary
+			// evidence channel when the user reports what they saw during an A/B.
+			if (codec_encoded && graft_mode != st->logged_graft)
+			{
+				st->logged_graft = graft_mode;
+				LOGI("DLSS-NR: GRAFT-BACK MODE hdr_graft=%u - %s. The ENCODE is the same either "
+				     "way, so the network sees the same proxy and returns the same answer; only "
+				     "the way that answer is carried back differs. Their headroom term "
+				     "max(0, oY - pY) is algebraically our additive residual, so the two agree on "
+				     "LUMINANCE; the difference is CHROMA, in highlights at color_strength=1 and "
+				     "in shadows at color_strength=0. This is a root constant: flip it in the "
+				     "overlay and the next frame uses the other graft, with no feature recreate - "
+				     "and this line is printed again each time it moves.",
+				     (unsigned)graft_mode,
+				     graft_mode == 0u
+				         ? "ADDITIVE residual, result = original + (SrgbDecode(neural) - "
+				           "SrgbDecode(proxy)) / s (ours). Scales RGB uniformly, so hue cannot "
+				           "drift; has a chroma floor below Y = 0.001/s; and transfer_strength=0 "
+				           "is a BIT-EXACT no-op at every scale"
+				         : "renodx UpgradeToneMap, result = lerp(original, HueOkLab(neural * "
+				           "ratio, neural), transfer_strength). Rebuilds the pixel from the "
+				           "network's answer, hue-locked in OkLab with an AP1 negative clamp - a "
+				           "clipped highlight is pulled toward the white point and a dark coloured "
+				           "pixel keeps its chromaticity with no floor at all. transfer_strength=0 "
+				           "is exact here only when paper_white_scale is a power of two");
+				if (st->codec_overridden)
+					LOGW("DLSS-NR: ...but a user-supplied stray_dlssnr_decode.dxbc is in use. If it "
+					     "was not built from this add-on's shader source it never reads the "
+					     "hdr_graft constant, and the line above describes what was REQUESTED, not "
+					     "necessarily what the shader is doing. Delete the .dxbc to be sure.");
+			}
+
 			// THE IDENTITY PROPERTY, stated on the first evaluate that actually ran through the
 			// codec. It is not a hope: it is algebra, and it is written out in full in the header
 			// comment of hdr_codec.hpp.
@@ -5190,10 +5266,11 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 				LOGI("DLSS-NR: HDR CODEC ACTIVE. DLSSNR.Color is the display-referred PROXY "
 				     "(res=0x%llx, r16g16b16a16_float), built as proxy = "
 				     "SrgbEncode(SoftClip(original * s)) with s = 1/max(paper_white_scale, 0.01) = "
-				     "%.6f from paper_white_scale=%.4f. The network's answer is carried back onto "
-				     "the UNTOUCHED original as an additive residual, result = original + "
-				     "(SrgbDecode(neural) - SrgbDecode(proxy)) / s, with alpha taken from the "
-				     "ORIGINAL and never from the network.",
+				     "%.6f from paper_white_scale=%.4f. The network's answer is then carried back "
+				     "onto the UNTOUCHED original by the graft named on the GRAFT-BACK MODE line - "
+				     "which one is a LIVE setting, so the formula is stated there and not here, "
+				     "and that line is re-emitted every time the mode changes. Alpha is taken from "
+				     "the ORIGINAL and never from the network, in both grafts.",
 				     (unsigned long long)st->proxy_tex.handle, proxy_scale, g_cfg.paper_white_scale);
 				LOGI("DLSS-NR: IDENTITY IS EXACT, algebraically. If the network returns its input "
 				     "unchanged, InProxy (%s) and InNeural (%s) hold identical bit patterns, so "
@@ -5233,7 +5310,7 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	if (codec_encoded && evaluated)
 	{
 		nr_codec_decode(cmd, *st, st->orig_srv, proxy_scale, transfer_strength,
-		                color_strength, out_in_srv);
+		                color_strength, graft_mode, out_in_srv);
 
 		codec_used = true;
 	}
@@ -5647,6 +5724,13 @@ static bool nr_lazy_ngx_init(device *dev)
 			});
 		}
 
+		// What the blob in hand can actually do. Both are settled by build() before any dispatch
+		// and are published to the overlay here, so the combo and its warning line are correct
+		// from the first frame the panel is opened.
+		st->codec_graft_ok   = s_blobs.decode_has_graft;
+		st->codec_overridden = s_blobs.decode_overridden;
+		overlay_ui::publish_codec_build(s_blobs.decode_has_graft, s_blobs.decode_overridden);
+
 		if (!s_blobs.ok ||
 		    !hdr_codec::create(dev, s_blobs, st->codec, [](int lvl, const char *msg) {
 				logf(lvl == hdr_codec::log_error ? reshade::log::level::error
@@ -5664,6 +5748,17 @@ static bool nr_lazy_ngx_init(device *dev)
 		{
 			LOGI("DLSS-NR: HDR codec pipelines created (encode + decode, cs_5_0 DXBC, "
 			     "[numthreads(16,16,1)]).");
+			if (!st->codec_graft_ok)
+				LOGW("DLSS-NR: this decode was built WITHOUT the reference graft, so hdr_graft is "
+				     "PINNED TO 0 for this run whatever the ini or the overlay say. The default "
+				     "additive graft - the one this add-on ships and the image you already have - "
+				     "is completely unaffected; only the hdr_graft=1 experiment is unavailable.");
+			if (st->codec_overridden)
+				LOGW("DLSS-NR: the decode is a USER-SUPPLIED stray_dlssnr_decode.dxbc. If that blob "
+				     "was not built from this add-on's shader source it does not read the hdr_graft "
+				     "root constant at all, and the graft selector will do NOTHING while the "
+				     "overlay and the lines below still report the mode you picked. Delete the "
+				     ".dxbc if you want hdr_graft to be honoured.");
 		}
 	}
 	else
@@ -5901,9 +5996,12 @@ static bool nr_lazy_ngx_init(device *dev)
 	LOGI("  behaviour       copy_back=%d depth_inverted=%d restore_graphics_root=%d",
 	     (int)g_cfg.copy_back, (int)g_cfg.depth_inverted, (int)g_cfg.restore_graphics_root);
 	LOGI("  hdr codec       hdr_codec=%d paper_white_scale=%.4f (UNCALIBRATED) "
-	     "transfer_strength=%.3f color_strength=%.3f",
+	     "transfer_strength=%.3f color_strength=%.3f hdr_graft=%u (%s)",
 	     (int)(g_cfg.hdr_codec && !st->codec_failed), g_cfg.paper_white_scale,
-	     g_cfg.transfer_strength, g_cfg.color_strength);
+	     g_cfg.transfer_strength, g_cfg.color_strength, (unsigned)g_cfg.hdr_graft,
+	     !st->codec_graft_ok    ? "PINNED TO 0 - this decode was built without the reference graft"
+	     : g_cfg.hdr_graft == 0u ? "additive residual - ours, bit-exact identity"
+	                             : "renodx UpgradeToneMap - OkLab hue lock, AP1 clamp");
 	LOGI("  mvec decode     mvec_decode=%d mvec_reconstruct=%d mvec_dilate=%d clip_row=%s "
 	     "transpose=%d scale=%s/%s",
 	     (int)(g_cfg.mvec_decode && !st->mvec_failed), (int)g_cfg.mvec_reconstruct,
