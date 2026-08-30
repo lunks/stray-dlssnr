@@ -1452,6 +1452,13 @@ static std::atomic<command_queue *> g_queue{ nullptr };
 static const uint8_t kNrStateGuid[16] = {
 	0x2e,0xa7,0x6b,0x50, 0x18,0xc4, 0x47,0x3f, 0xb2,0x66, 0x0d,0x95,0x3a,0xe8,0x71,0x4c };
 
+// The bits of nr_state::pending_work. The overlay's own a_* bits are copied straight into this
+// word by the service's take_reconfigure call, so the two enumerations must agree - and rather
+// than restate them (two lists that must match by hand is how they stop matching), the render
+// side simply reuses overlay_ui's. kTeardown is the one bit this file raises on its own, from
+// nr_ensure_output, when the TAA output's resolution or format moves.
+enum : uint32_t { kTeardown = overlay_ui::a_teardown };
+
 struct nr_state
 {
 	std::mutex mutex;
@@ -1494,8 +1501,32 @@ struct nr_state
 
 	bool     need_reset = true;          // DLSSNR.Reset for the next evaluate
 	bool     feature_failed = false;     // latched per (out_w,out_h); cleared when they move
-	bool     pending_teardown = false;   // serviced on the next present, on the main thread
 	uint64_t evaluate_count = 0;
+
+	// ---- THE DEFERRED-RECONFIGURE MASK --------------------------------------------------------
+	// This replaces the plain `bool pending_teardown`, and the change is a fix rather than a
+	// generalisation. That bool was READ UNLOCKED at :2739 and from the present thread, while being
+	// WRITTEN under this mutex by nr_ensure_output and by the service. For a single bit whose only
+	// stale reading costs one deferred frame that was benign. For a MULTI-BIT mask it is not: a
+	// torn or stale read drops a request permanently, and a request dropped permanently is exactly
+	// the "control that lies" this whole ladder exists to remove.
+	//
+	// OR-MERGED, NEVER ASSIGNED. nr_ensure_output raises kTeardown on a resolution change and a
+	// user reconfigure can land in the same frame; an assignment would silently drop one of them.
+	// The service consumes with fetch_and(0).
+	std::atomic<uint32_t> pending_work{ 0 };
+
+	// The two consumers of the overlay's epochs, each with its own seen-state. PER DEVICE, in here,
+	// deliberately - overlay_ui::begin_pass used to keep these in FUNCTION-LOCAL statics, which are
+	// process-wide, so with two D3D12 devices the edge for a given change would be consumed by
+	// whichever device's pass ran first and the other would miss it. At three rungs that cost one
+	// reset frame; at five it costs a whole rebuild.
+	overlay_ui::seen_epochs seen_pass;      // begin_pass, on the recording thread
+	overlay_ui::seen_epochs seen_service;   // nr_service_reconfigure, on the present thread
+
+	// What the service has actually DONE, so it can tell an edge from a steady state. Set to the
+	// value that was in force when NGX was armed, and updated by the service on each change.
+	bool     serviced_populate_parameters = false;
 
 	// -1 mismatch, 0 not yet checked, 1 verified. See probe::verify_table_handle_identity.
 	int      table_identity = 0;
@@ -1705,6 +1736,174 @@ static nr_view_info nr_describe(device *dev, resource_view view)
 static void nr_log_ngx(reshade::log::level lvl, const char *what, ngx::Result r)
 {
 	logf(lvl, "DLSS-NR: %s -> 0x%08x (%s)", what, (unsigned)r, ngx::result_to_string(r));
+}
+
+// --------------------------------------------------------------------------------------------
+// THE PIPELINE BUILDERS, AND WHY THEIR SOURCE BLOBS ARE AT FILE SCOPE.
+//
+// These two used to be function-local statics inside nr_lazy_ngx_init:
+//
+//     static hdr_codec::blobs     s_blobs;
+//     static std::vector<uint8_t> s_mvec_dxbc;
+//
+// No rebuild path can reach a function-local static. Leaving them there and adding a rebuild
+// would have produced code that compiles cleanly, is called, and silently has nothing to build
+// from - which is exactly the "a feature that compiles is not a feature that runs" failure this
+// tree has already shipped once. They are process-wide because the SOURCE never changes: the HLSL
+// is embedded, and building it twice would LoadLibraryW d3dcompiler_47.dll and run D3DCompile
+// again for an identical result.
+//
+// TRANSACTIONAL, and that is requirement 3 ("a reconfigure that fails leaves the previous working
+// state") satisfied structurally rather than by care. hdr_codec::create does `p = pipelines()` as
+// its FIRST statement, and mvec_decode::create the same - so calling either on a LIVE struct
+// leaks the old root signature and PSO, each of which holds a reference on the ID3D12Device (the
+// exact leak documented at nr_destroy_device). Building into a LOCAL and only then destroying and
+// moving avoids the leak AND means a failed build leaves the previous pipelines running, logs
+// once, and reports the reason - never a half-applied state.
+// --------------------------------------------------------------------------------------------
+static hdr_codec::blobs     g_codec_blobs;
+static bool                 g_codec_blobs_tried = false;
+static std::vector<uint8_t> g_mvec_dxbc;
+static bool                 g_mvec_dxbc_tried = false;
+
+static void nr_pipeline_log(int lvl, const char *msg)
+{
+	logf(lvl == hdr_codec::log_error ? reshade::log::level::error
+	   : lvl == hdr_codec::log_warn  ? reshade::log::level::warning
+	                                 : reshade::log::level::info, "%s", msg);
+}
+
+// The add-on's own directory - where the snippet, the trampoline, the ini and the shader sources
+// all live. Derived from this module's own address, not the exe's.
+static std::wstring nr_addon_dir()
+{
+	return ngx::module_directory_of(reinterpret_cast<const void *>(&nr_pipeline_log));
+}
+
+/// Build (or rebuild) the HDR codec's two pipelines into st.codec. Returns false and leaves
+/// st.codec exactly as it was on any failure. MUST run on the main/present thread: hdr_codec::build
+/// LoadLibraryW's d3dcompiler_47.dll and runs D3DCompile to cs_5_0, which has no business on a
+/// command-list recording thread on demand.
+static bool nr_build_codec_pipelines(device *dev, nr_state &st, const std::wstring &dir)
+{
+	if (dev == nullptr || st.codec_failed)
+		return false;
+	if (st.codec.ok)
+		return true;   // already built; nothing to do and nothing to leak
+
+	if (!g_codec_blobs_tried)
+	{
+		g_codec_blobs_tried = true;
+		hdr_codec::build(dir, g_codec_blobs, &nr_pipeline_log);
+	}
+
+	hdr_codec::pipelines fresh;
+	if (!g_codec_blobs.ok || !hdr_codec::create(dev, g_codec_blobs, fresh, &nr_pipeline_log))
+	{
+		// create() has already destroyed whatever it managed to make of `fresh`, so there is
+		// nothing to clean up here and st.codec is untouched.
+		st.codec_failed = true;
+		LOGW("DLSS-NR: the HDR codec could not be built (see the error above). The denoise still "
+		     "runs and is still written back; the network is fed the raw linear TAA output, which "
+		     "is README gap 1 - expect the darkening this codec exists to fix. This is a REAL "
+		     "build failure and it is latched for the run: untick and re-tick HDR codec and it "
+		     "will not retry, because a D3DCompile that failed once will fail again.");
+		return false;
+	}
+
+	// Only now. The queue was idled by nr_release_feature_and_output before this ran (the codec
+	// toggle always raises a teardown), and st.codec is empty on every path that reaches here, so
+	// this destroy is a no-op guard rather than a real release - kept because a future caller
+	// that skipped the teardown would otherwise leak silently.
+	hdr_codec::destroy(dev, st.codec);
+	st.codec = fresh;
+	LOGI("DLSS-NR: HDR codec pipelines created (encode + decode, cs_5_0 DXBC, "
+	     "[numthreads(16,16,1)]).");
+	return true;
+}
+
+/// The same shape for the motion-vector decode.
+static bool nr_build_mvec_pipeline(device *dev, nr_state &st, const std::wstring &dir)
+{
+	if (dev == nullptr || st.mvec_failed)
+		return false;
+	if (st.mvec.ok)
+		return true;
+
+	if (!g_mvec_dxbc_tried)
+	{
+		g_mvec_dxbc_tried = true;
+		mvec_decode::build(dir, g_mvec_dxbc, &nr_pipeline_log);
+	}
+
+	mvec_decode::pipelines fresh;
+	if (g_mvec_dxbc.empty() || !mvec_decode::create(dev, g_mvec_dxbc, fresh, &nr_pipeline_log))
+	{
+		st.mvec_failed = true;
+		LOGW("DLSS-NR: the motion-vector decode could not be built (see the error above). "
+		     "DLSSNR.MVec falls back to the game's RAW ENCODED velocity with the derived grid "
+		     "scale - README gap 2 stands unmitigated. Nothing else changes. This is a REAL build "
+		     "failure and it is latched for the run.");
+		return false;
+	}
+
+	mvec_decode::destroy(dev, st.mvec);
+	st.mvec = fresh;
+	LOGI("DLSS-NR: motion-vector decode pipeline created (cs_5_0 DXBC, [numthreads(16,16,1)]). "
+	     "UE 4.27 velocity decode + camera-motion reconstruction from depth through "
+	     "View.ClipToPrevClip, writing absolute colour-grid pixels.");
+	return true;
+}
+
+// The snippet is process-wide and is loaded at most once per successful attempt. Hoisted out of
+// nr_init_device's function-local static for the same reason the blobs were: the reconfigure
+// service has to be able to run this path when `enabled` goes 0 -> 1 or require_trampoline goes
+// 1 -> 0, and a function-local static is unreachable from anywhere else.
+static bool g_snippet_tried = false;
+
+/// Load the snippet and ARM the deferred NGX initialisation. This is the SHIPPING STARTUP PATH,
+/// not a new one - the same two steps nr_init_device takes at every normal launch - which is what
+/// makes it safe to reach from the overlay.
+///
+/// NO RACE WITH THE RENDER THREAD, and the argument is short: every render-thread read of
+/// g_snippet is downstream of `g_nr_armed`, which nr_try_run tests on its second line and which
+/// is only ever set after nr_lazy_ngx_init has succeeded. This function refuses to run while
+/// g_nr_armed is true, so the recording thread is provably at its NR_BAIL("not armed") return
+/// while g_snippet is being written.
+///
+/// MAIN/PRESENT THREAD ONLY: ngx::load_snippet LoadLibraryW's a 166 MB module. The overlay's
+/// tooltip says so, because the user will see the frame it costs.
+static bool nr_arm_snippet(const std::wstring &dir, const char *why)
+{
+	if (g_nr_armed.load(std::memory_order_acquire))
+		return true;   // already armed; nothing to do, and writing g_snippet now would race
+
+	if (!g_snippet.available)
+	{
+		g_snippet_tried = true;
+		if (!ngx::load_snippet(g_snippet, dir, overlay_ui::live_require_trampoline()))
+		{
+			// load_snippet has already called unload() on every failure path, so g_snippet is
+			// clean and a later attempt (say, after the user unticks require_trampoline) starts
+			// from nothing rather than from a half-loaded module.
+			LOGI("DLSS-NR not available (%s): %s", why, g_snippet.not_available_reason.c_str());
+			return false;
+		}
+		LOGI("DLSS-NR: loaded nvngx_dlssnr.dll%s (%s).",
+			g_snippet.trampoline_module != nullptr
+				? " and routed every call through remix_nvngx.dll"
+				: " WITHOUT remix_nvngx.dll - require_trampoline=0; every GATED export is "
+				  "expected to return 0xbad00002",
+			why);
+	}
+
+	// The same store nr_init_device makes at every launch. nr_try_run's existing deferred
+	// initialiser consumes it on the next dispatch and calls Init_Ext there, on the render
+	// thread, with a device the game has finished building - which is the only place this title
+	// tolerates it.
+	g_nr_pending_init.store(true, std::memory_order_release);
+	LOGI("DLSS-NR: NGX initialisation armed; it happens on the next render-thread dispatch.");
+	return true;
 }
 
 // --------------------------------------------------------------------------------------------
@@ -1999,10 +2198,26 @@ static void nr_ensure_aux(device *dev, nr_state &st)
 // to r16g16b16a16_float, matching the proxy and matching Remix, which allocates both surfaces
 // VK_FORMAT_R16G16B16A16_SFLOAT (rtx_neural_rendering.cpp:108 and :115).
 //
-// The predicate below is process-constant: g_cfg is loaded once in nr_init_device and there is no
-// overlay or reload, and the codec pipelines are created in nr_init_device too, so st.codec.ok
-// and st.codec_failed are both settled before any dispatch reaches here. It therefore cannot
-// disagree with itself between the creation of out_tex and the creation of out_srv.
+// THE PREDICATE BELOW IS NO LONGER PROCESS-CONSTANT, AND THIS PARAGRAPH USED TO SAY IT WAS.
+//
+// It read: "g_cfg is loaded once in nr_init_device and there is no overlay or reload, and the
+// codec pipelines are created in nr_init_device too, so st.codec.ok and st.codec_failed are both
+// settled before any dispatch reaches here." Every clause of that is now false - hdr_codec is a
+// live setting, the pipelines can be built by nr_service_reconfigure, and g_cfg is written once
+// per pass by overlay_ui::begin_pass. Leaving the sentence standing would have been worse than
+// the bug it described, because the next reader would build on it.
+//
+// WHAT ACTUALLY HOLDS NOW, and it is enough. `codec_wanted` is read twice in this function - once
+// to choose `neural` and once, through st.neural_fmt, when nr_ensure_aux creates out_srv - and
+// both reads happen inside ONE call, under st->mutex, against the g_cfg the pass snapshotted on
+// its first line. So it still cannot disagree with itself within a pass.
+//
+// ACROSS passes it CAN change, and that is the point: a live hdr_codec toggle raises the rebuild
+// rung, the service releases out_tex and zeroes out_w/out_h, and the next accepted dispatch
+// re-enters this function on the CREATE branch below and re-decides `neural` against the new
+// value. The alternative - flipping the flag with out_tex still alive - is what the copy-back's
+// format guard would then silently reject, which is why a live change goes through the teardown
+// and not through the `if (st.out_tex.handle != 0)` fast path above.
 static bool nr_ensure_output(device *dev, nr_state &st, uint32_t w, uint32_t h, format fmt)
 {
 	if (st.out_tex.handle != 0)
@@ -2018,7 +2233,10 @@ static bool nr_ensure_output(device *dev, nr_state &st, uint32_t w, uint32_t h, 
 		// A resolution OR FORMAT change. Do NOT destroy from here: this runs inside a dispatch
 		// callback on a command-list recording thread, and destroy_resource requires the GPU to be
 		// idle first. Defer to the next present and skip the pass this frame.
-		st.pending_teardown = true;
+		//
+		// fetch_or, NOT a store: a user reconfigure can land in the same frame as a resolution
+		// change, and a store here would silently discard whatever the overlay had asked for.
+		st.pending_work.fetch_or(kTeardown, std::memory_order_relaxed);
 		return false;
 	}
 
@@ -2705,7 +2923,27 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	//
 	// Identification is the probe's, unchanged: the DXBC hash is the exact identifier, and the
 	// memo is refreshed once per SetPipelineState rather than once per dispatch.
-	if (cs->nr_checked != cs->pso)
+	// ---- BEGIN overlay_ui hook ----
+	// shader_hash IS LIVE, and this is the one render-path read that cannot come through the
+	// per-pass g_cfg snapshot: this block runs BEFORE st->mutex is taken (below) and BEFORE
+	// overlay_ui::begin_pass, so a snapshot value could never reach it. Snapshotting it anyway
+	// would have shipped a control that does nothing on the one path it names - the exact shape
+	// the kParam CI gate exists to catch. So the value comes through read_ident(), which is two
+	// relaxed-ish atomic loads and nothing else.
+	//
+	// cs->nr_epoch is what makes the change land on EVERY command list rather than on the next
+	// one. The memo is cleared unconditionally on every SetPipelineState (:912-913) and by
+	// cmd_shadow::reset, so the staleness window was already bounded by one command list - but it
+	// was non-deterministic across concurrently recording threads, and "takes effect on some
+	// command lists and not others" is worse than not being editable. An epoch is a single atomic
+	// each recording thread reads for itself.
+	//
+	// Cost on the hot path: one acquire load, one relaxed load and a 32-bit compare, next to a
+	// pointer compare that already ran here on every dispatch of every command list. This block
+	// is not skippable - if it did not run, no dispatch would ever be identified and the add-on
+	// would do nothing at all - so there is no question about whether the new code executes.
+	const overlay_ui::ident_view nr_ident = overlay_ui::read_ident();
+	if (cs->nr_checked != cs->pso || cs->nr_epoch != nr_ident.epoch)
 	{
 		bool is_target = false;
 		{
@@ -2719,12 +2957,14 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 				// measured false positive 0x901e041a7cadc9db scores confidence 150 and would
 				// pass any score-based test.
 				is_target = sr.is_compute && sr.dxbc_valid &&
-					(g_cfg.shader_hash != 0 ? (sr.hash == g_cfg.shader_hash) : sr.passed_all_gates);
+					(nr_ident.shader_hash != 0 ? (sr.hash == nr_ident.shader_hash) : sr.passed_all_gates);
 			}
 		}
 		cs->nr_checked   = cs->pso;
+		cs->nr_epoch     = nr_ident.epoch;
 		cs->nr_is_target = is_target;
 	}
+	// ---- END overlay_ui hook ----
 	if (!cs->nr_is_target)
 		NR_BAIL("this dispatch is not the target shader");
 
@@ -2736,8 +2976,13 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	auto *st = probe::pd_get<nr_state>(dev, kNrStateGuid);
 	if (sh == nullptr || !sh->is_d3d12 || st == nullptr || st->params == nullptr)
 		NR_BAIL("device shadow or nr_state missing (params not allocated?)");
-	if (st->pending_teardown)
-		NR_BAIL("pending teardown - waiting for present");
+	// Any outstanding work at all, not just a teardown: the service may be about to release the
+	// feature, rebuild a pipeline or allocate a fresh parameter block, and running a pass against
+	// state that is one present away from being destroyed is exactly what the deferral is for.
+	// Relaxed is right - a request seen one frame late costs one frame, and the acquire that
+	// matters happens in the service, on the thread that acts on it.
+	if (st->pending_work.load(std::memory_order_relaxed) != 0u)
+		NR_BAIL("a reconfigure is pending - waiting for present");
 
 	// One device, one TAA pass, one recording thread at a time - but the lock is cheap and this
 	// runs once a frame, and it is what makes the one-shot log latches sound.
@@ -2757,8 +3002,14 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	// A plain `return`, NOT NR_BAIL: NR_BAIL's one-shot latch would burn itself on the first
 	// toggle and never speak again. Returning here leaves 'issued' false, so ReShade issues the
 	// game's own Dispatch - a strict no-op.
-	if (!overlay_ui::begin_pass(g_cfg, st->need_reset, st->pending_res, st->pending_teardown,
-	                            st->feature_failed, st->codec.ok, st->codec_failed, st->orig_ok))
+	//
+	// It no longer takes pending_teardown or feature_failed. Both of those were the "Reset NR
+	// feature" button's route into the render path, and that button now goes through
+	// nr_service_reconfigure instead - which runs from on_present UNCONDITIONALLY, so it works in
+	// the one case the button exists for and the old routing could not reach: the pass has wedged
+	// and begin_pass is no longer being called at all.
+	if (!overlay_ui::begin_pass(g_cfg, st->seen_pass, st->need_reset, st->pending_res,
+	                            st->codec.ok, st->codec_failed, st->orig_ok))
 		return;
 	// ---- END overlay_ui hook ----
 
@@ -4005,6 +4256,9 @@ static void nr_init_device(device *dev)
 		// the title runs is useful whether or not the DLSS-NR pass itself is turned on. It is
 		// gated only by its own key.
 		rt_census::arm(g_cfg.rt_census, g_cfg.rt_census_frames, &rt_census_log);
+		// Both keys are LIVE now (overlay Diagnostics section -> a_apply_census), which is why
+		// rt_census::set_live exists beside arm(): this call keeps the start-up banner, and the
+		// overlay's later changes are two relaxed stores with a line of their own.
 		// ---- BEGIN overlay_ui hook ----
 		// Copy the live half of the freshly parsed ini into the overlay's atomics. Main thread,
 		// before any dispatch and before any overlay draw, so nothing can observe a half-seeded
@@ -4014,53 +4268,42 @@ static void nr_init_device(device *dev)
 		// ---- END overlay_ui hook ----
 	}
 
-	if (!g_cfg.enabled)
+	// overlay_ui::live_enabled(), not g_cfg.enabled, and it is the SAME VALUE here: seed_from_config
+	// ran three lines above and copied the parsed key into that atomic. Reading it through the
+	// overlay gives the setting exactly ONE reader in the whole add-on, which is what lets the
+	// overlay's copy be authoritative for both the UI and this arm decision - and it is what makes
+	// the checkbox real, because ticking it later runs nr_arm_snippet, which is this same path.
+	if (!overlay_ui::live_enabled())
 	{
 		LOGI("DLSS-NR is DISABLED (enabled=0). The add-on is a strict no-op on the render path: "
 		     "no snippet is loaded, no resource is created, and the game's dispatches are issued "
-		     "by ReShade exactly as they would be with no add-on present.");
+		     "by ReShade exactly as they would be with no add-on present. This is NO LONGER a "
+		     "restart-only state: ticking \"Load the snippet and arm NGX\" in the overlay runs "
+		     "exactly this path on the next present.");
 		return;
 	}
 
 	if (dev->get_api() != device_api::d3d12)
 		return;
 
-	// The snippet is process-wide and is loaded exactly once.
-	static bool s_snippet_tried = false;
-	if (!s_snippet_tried)
-	{
-		s_snippet_tried = true;
-		if (!ngx::load_snippet(g_snippet, dir, g_cfg.require_trampoline))
-		{
-			// A missing snippet is the EXPECTED state for a stock install, and is not an error.
-			LOGI("DLSS-NR not available: %s", g_snippet.not_available_reason.c_str());
-			return;
-		}
-		LOGI("DLSS-NR: loaded nvngx_dlssnr.dll%s.",
-			g_snippet.trampoline_module != nullptr
-				? " and routed every call through remix_nvngx.dll"
-				: " (WITHOUT remix_nvngx.dll - require_trampoline=0; every GATED export is "
-				  "expected to return 0xbad00002)");
-	}
-
-	if (!g_snippet.available)
-		return;
-
-	// The NGX half is DELIBERATELY NOT DONE HERE.
+	// The snippet is process-wide and is loaded exactly once per successful attempt.
 	//
-	// NVSDK_NGX_D3D12_Init_Ext hangs when called from init_device. Measured in STRAY: the log
-	// stops between "loaded nvngx_dlssnr.dll" and the Init_Ext result, the process sits at ~2%
-	// CPU, and the title never reaches its menu. init_device fires while the game is still
-	// inside CreateDXGIFactory1 with a half-built device, and the snippet's D3D12 entry point
-	// does not tolerate that. Note the Vulkan backend in our Remix build has no such problem -
-	// it is initialised from a live render path, which is what this now imitates.
+	// THE NGX HALF IS DELIBERATELY NOT DONE HERE. NVSDK_NGX_D3D12_Init_Ext hangs when called from
+	// init_device. Measured in STRAY: the log stops between "loaded nvngx_dlssnr.dll" and the
+	// Init_Ext result, the process sits at ~2% CPU, and the title never reaches its menu.
+	// init_device fires while the game is still inside CreateDXGIFactory1 with a half-built
+	// device, and the snippet's D3D12 entry point does not tolerate that. Note the Vulkan backend
+	// in our Remix build has no such problem - it is initialised from a live render path, which is
+	// what this now imitates.
 	//
-	// So: load the module here (cheap, and it is the expensive-but-safe part), and defer every
-	// call INTO it to the first dispatch, on the render thread, with a device the game has
-	// finished building.
-	g_nr_pending_init.store(true, std::memory_order_release);
-	LOGI("DLSS-NR: snippet loaded. NGX initialisation deferred to the first render-thread "
-	     "dispatch - calling Init_Ext from init_device hangs this title.");
+	// So: load the module (cheap, and it is the expensive-but-safe part) and defer every call INTO
+	// it to the first dispatch, on the render thread, with a device the game has finished
+	// building. BOTH of those steps now live in nr_arm_snippet, so the overlay's `enabled`
+	// checkbox and the require_trampoline 1 -> 0 direction run the identical code rather than a
+	// second copy of it - which is the difference between a live setting and a live setting that
+	// drifts out of step with start-up.
+	if (!g_snippet_tried || !g_snippet.available)
+		nr_arm_snippet(dir, "enabled=1 at load");
 }
 
 // Runs once, on a command-list recording thread, from nr_try_run. Everything here needs a fully
@@ -4114,45 +4357,30 @@ static bool nr_lazy_ngx_init(device *dev)
 	// Built HERE, on the render thread, once, next to the LoadLibraryW of the snippet - never on a
 	// command-list recording thread. A failure is survivable by construction: codec_failed latches,
 	// the pass runs exactly as it did before the codec existed, and the reason is in the log.
-	if (g_cfg.hdr_codec)
+	//
+	// AND NOTE WHAT IS NOT HERE ANY MORE. The `else` branch of this used to read
+	//
+	//     st->codec_failed = true;   // not a failure, but the same "do not use it" state
+	//
+	// which set a RUN-LATCHED SHADER-BUILD FAILURE flag to mean "the user configured it off" - and
+	// nr_release_feature_and_output deliberately never clears codec_failed, because a resolution
+	// change cannot undo a failed D3DCompile. That single assignment was the entire reason
+	// hdr_codec could not be turned on at runtime. It is deleted rather than cleared at
+	// reconfigure time, and the difference matters: CLEARING the latch to service a config change
+	// would also erase a real build failure and make the add-on retry a broken compile for ever.
+	// With the assignment gone, codec_failed means only what its own comment says it means, and
+	// g_cfg.hdr_codec alone gates the three sites that consult it (:1816, :2043, :3307).
+	if (overlay_ui::live_hdr_codec())
 	{
-		static hdr_codec::blobs s_blobs;      // process-wide: the source never changes
-		static bool             s_blobs_tried = false;
-		if (!s_blobs_tried)
-		{
-			s_blobs_tried = true;
-			hdr_codec::build(dir, s_blobs, [](int lvl, const char *msg) {
-				logf(lvl == hdr_codec::log_error ? reshade::log::level::error
-				   : lvl == hdr_codec::log_warn  ? reshade::log::level::warning
-				                                 : reshade::log::level::info, "%s", msg);
-			});
-		}
-
-		if (!s_blobs.ok ||
-		    !hdr_codec::create(dev, s_blobs, st->codec, [](int lvl, const char *msg) {
-				logf(lvl == hdr_codec::log_error ? reshade::log::level::error
-				   : lvl == hdr_codec::log_warn  ? reshade::log::level::warning
-				                                 : reshade::log::level::info, "%s", msg);
-			}))
-		{
-			st->codec_failed = true;
-			LOGW("DLSS-NR: the HDR codec is OFF for this run (see the error above). The denoise "
-			     "still runs and is still written back; the network is fed the raw linear TAA "
-			     "output, which is README gap 1 - expect the darkening this codec exists to fix. "
-			     "Set hdr_codec=0 to silence this.");
-		}
-		else
-		{
-			LOGI("DLSS-NR: HDR codec pipelines created (encode + decode, cs_5_0 DXBC, "
-			     "[numthreads(16,16,1)]).");
-		}
+		nr_build_codec_pipelines(dev, *st, dir);
 	}
 	else
 	{
-		st->codec_failed = true;   // not a failure, but the same "do not use it" state
 		LOGW("DLSS-NR: hdr_codec=0. DLSSNR.Color is bound to the RAW TAA output: linear, "
 		     "unbounded, upstream of bloom, eye adaptation and the film tone curve. That is "
-		     "out-of-distribution for a display-referred network - README gap 1.");
+		     "out-of-distribution for a display-referred network - README gap 1. The codec's "
+		     "pipelines are simply not built yet; ticking HDR codec in the overlay builds them "
+		     "on the next present and rebuilds the feature around them.");
 	}
 
 	// ---- the motion-vector decode --------------------------------------------------------------
@@ -4161,59 +4389,50 @@ static bool nr_lazy_ngx_init(device *dev)
 	// for the run and DLSSNR.MVec stays on the game's raw encoded velocity, which is bit-for-bit
 	// the behaviour before this feature existed (README gap 2). mvec_failed is deliberately never
 	// cleared, the same rule as codec_failed.
-	if (g_cfg.mvec_decode)
-	{
-		static std::vector<uint8_t> s_mvec_dxbc;   // process-wide: the source never changes
-		static bool                 s_mvec_tried = false;
-		if (!s_mvec_tried)
-		{
-			s_mvec_tried = true;
-			mvec_decode::build(dir, s_mvec_dxbc, [](int lvl, const char *msg) {
-				logf(lvl == mvec_decode::log_error ? reshade::log::level::error
-				   : lvl == mvec_decode::log_warn  ? reshade::log::level::warning
-				                                   : reshade::log::level::info, "%s", msg);
-			});
-		}
+	// The `else` branch here carried the IDENTICAL defect to the codec's, one line and the same
+	// comment: `st->mvec_failed = true;` because the key was zero. mvec_failed is the run-latched
+	// "the shader could not be compiled or its pipeline created" flag and is never cleared, so
+	// that assignment was the whole of mvec_decode's off-to-on impossibility. Deleted, for the
+	// same reason and with the same consequence: g_cfg.mvec_decode alone now gates :1830 and
+	// :3040, and mvec_failed means only what it says.
+	//
+	// Off-to-on then needs no teardown of its own either: once st.mvec.ok is true, nr_ensure_aux
+	// allocates mvec_tex on the very next pass, and the guide-reset latch keyed on mvec_bound_res
+	// forces the one Reset frame by itself.
+	if (overlay_ui::live_mvec_decode())
+		nr_build_mvec_pipeline(dev, *st, dir);
 
-		if (s_mvec_dxbc.empty() ||
-		    !mvec_decode::create(dev, s_mvec_dxbc, st->mvec, [](int lvl, const char *msg) {
-				logf(lvl == mvec_decode::log_error ? reshade::log::level::error
-				   : lvl == mvec_decode::log_warn  ? reshade::log::level::warning
-				                                   : reshade::log::level::info, "%s", msg);
-			}))
-		{
-			st->mvec_failed = true;
-			LOGW("DLSS-NR: the motion-vector decode is OFF for this run (see the error above). "
-			     "DLSSNR.MVec falls back to the game's RAW ENCODED velocity with the derived grid "
-			     "scale - README gap 2 stands unmitigated. Nothing else changes. Set "
-			     "mvec_decode=0 to silence this.");
-		}
-		else
-		{
-			LOGI("DLSS-NR: motion-vector decode pipeline created (cs_5_0 DXBC, "
-			     "[numthreads(16,16,1)]). UE 4.27 velocity decode + camera-motion reconstruction "
-			     "from depth through View.ClipToPrevClip, writing absolute colour-grid pixels.");
-		}
-	}
-	else
-	{
-		st->mvec_failed = true;   // not a failure, but the same "do not use it" state
-	}
-
-	if (g_cfg.populate_parameters && g_snippet.populate_params != nullptr)
+	if (overlay_ui::live_populate_parameters() && g_snippet.populate_params != nullptr)
 	{
 		const ngx::Result pr = g_snippet.populate_params(st->params);
 		nr_log_ngx(ngx::failed(pr) ? reshade::log::level::warning : reshade::log::level::info,
 		           "PopulateParameters_Impl (populate_parameters=1)", pr);
+		st->serviced_populate_parameters = true;
+	}
+	else
+	{
+		st->serviced_populate_parameters = false;
 	}
 
 	LOGI("==================================================================");
 	LOGI("DLSS-NR ARMED. feature id %u, preset %u (the only network in this snippet build).",
 	     ngx::kFeatureDLSSNR, ngx::kOnlyPreset);
-	LOGI("  target shader   0x%016llx%s", (unsigned long long)g_cfg.shader_hash,
-	     g_cfg.shader_hash == 0 ? "  (0 = any shader passing all census gates - NOT recommended)" : "");
-	LOGI("  registers       depth=t%u velocity=t%u colour=t%u output=u%u",
-	     g_cfg.srv_depth, g_cfg.srv_velocity, g_cfg.srv_colour, g_cfg.uav_output);
+	// The identification block reads the OVERLAY'S atomics, not g_cfg. shader_hash never passes
+	// through the g_cfg snapshot at all (it is read at its own site, before begin_pass runs), and
+	// the four register pins only reach g_cfg on the first accepted dispatch - which is after this
+	// banner. Printing g_cfg here would report the ini's values even when the user had already
+	// changed them and re-armed, which is the sort of small lie this log exists to not tell.
+	{
+		const overlay_ui::live_block &lb = overlay_ui::live();
+		const unsigned long long hash = (unsigned long long)lb.shader_hash.load(std::memory_order_relaxed);
+		LOGI("  target shader   0x%016llx%s", hash,
+		     hash == 0 ? "  (0 = any shader passing all census gates - NOT recommended)" : "");
+		LOGI("  registers       depth=t%u velocity=t%u colour=t%u output=u%u",
+		     (unsigned)lb.srv_depth.load(std::memory_order_relaxed),
+		     (unsigned)lb.srv_velocity.load(std::memory_order_relaxed),
+		     (unsigned)lb.srv_colour.load(std::memory_order_relaxed),
+		     (unsigned)lb.uav_output.load(std::memory_order_relaxed));
+	}
 	LOGI("  tuning          Intensity=%.3f LocalTone=%.3f LocalStructure=%.3f "
 	     "SkinStructure=%.3f Style=%u UseAutoMask=%d",
 	     g_cfg.intensity, g_cfg.local_tone_strength, g_cfg.local_structure_strength,
@@ -4341,59 +4560,380 @@ static void nr_destroy_device(device *dev)
 	// teardown buys nothing.
 }
 
-// Serviced from present, on the main thread, where idling the queue is safe.
-static void nr_service_pending_teardown(device *dev)
+// =============================================================================================
+// THE UNIFIED DEFERRED RECONFIGURE. R3, R4 and R5 of the ladder in src/overlay_ui.hpp.
+//
+// Serviced from on_present, on the MAIN thread, where idling the queue and destroying a resource
+// are safe. This is the generalisation of nr_service_pending_teardown, not a parallel mechanism:
+// the seam is the same one the resolution change has always used - a bit raised on a recording
+// thread, consumed here, handed to nr_release_feature_and_output.
+//
+// LOCK ORDER, and it is the one thing here that could deadlock the game. nr_try_run takes
+// st->mutex (:2744) and then g.mutex (:2771). on_present takes g.mutex further down, AFTER this
+// function has returned. So this function takes st->mutex ONLY and must never take g.mutex - the
+// same AB/BA argument the atomics on nr_state exist to satisfy. It is called from exactly the
+// same statement region nr_service_pending_teardown was.
+//
+// IT RUNS EVEN WHEN THE PASS DOES NOT. That is deliberate and it is why the overlay's epochs are
+// read here rather than only in begin_pass: with enabled=0, with the master bypass on, or with
+// the feature wedged, begin_pass is never called - and those are precisely the situations in
+// which a user reaches for a reconfigure.
+//
+// FAILURE DEGRADES. Every step either completes or leaves the previous working state alone, says
+// why in the log once, and publishes the reason to the status block, which draws it in red above
+// everything else. There is no path here that leaves a half-applied configuration.
+// =============================================================================================
+static void nr_service_reconfigure(device *dev)
 {
 	if (dev == nullptr)
 		return;
-	auto *st = probe::pd_get<nr_state>(dev, kNrStateGuid);
-	if (st == nullptr || !st->pending_teardown)
+	// Everything below either loads a D3D12 snippet or touches D3D12 resources, and nr_init_device
+	// makes the same check before it does any of it. Without this, a present on a D3D11 swapchain
+	// would LoadLibraryW the snippet for a device that can never use it.
+	//
+	// [ASSUMED] one D3D12 device. take_reconfigure DRAINS the overlay's action word, so with two
+	// D3D12 devices the first one to present would consume a request the second never sees. That
+	// is the same single-device assumption the whole identification path already makes (and which
+	// moving the seen-epochs into nr_state removed for the EPOCH half of this); it is recorded
+	// here rather than glossed over. STRAY is single-device.
+	if (dev->get_api() != device_api::d3d12)
 		return;
+
+	auto *st = probe::pd_get<nr_state>(dev, kNrStateGuid);
+
+	// Before nr_lazy_ngx_init has ever run there is no nr_state to keep the seen-epochs in - that
+	// is exactly the enabled=0 case, where the whole point is to be able to arm from the overlay.
+	// A process-wide static is correct HERE and only here: the thing it is tracking, "has the
+	// snippet been asked for yet", is itself process-wide.
+	static overlay_ui::seen_epochs s_bootstrap_seen;
+	overlay_ui::seen_epochs &seen = (st != nullptr) ? st->seen_service : s_bootstrap_seen;
+
+	const overlay_ui::reconfig_request req = overlay_ui::take_reconfigure(seen);
+
+	uint32_t work = req.bits;
+	if (st != nullptr)
+		work |= st->pending_work.fetch_and(0u, std::memory_order_acquire);
+
+	if (work == 0u && !req.ident_changed)
+	{
+		overlay_ui::publish_reconfig_pending(false);
+		return;
+	}
+
+	// Which key asked. A teardown with no overlay request behind it is nr_ensure_output's own
+	// resolution change, which is not a user reconfigure and must not be reported as one.
+	const bool from_overlay = (req.bits != 0u) || req.ident_changed;
+	const char *const why = from_overlay
+		? (req.why != nullptr ? req.why : "an overlay setting")
+		: "the TAA output resolution or format changed";
+
+	overlay_ui::publish_reconfig_pending(true);
+
+	// ---- the snippet arm, which is the one action that does not need nr_state -----------------
+	// Done BEFORE the lock, because it LoadLibraryW's a 166 MB module and there is no reason to
+	// hold st->mutex across that. Nothing it touches is under that mutex.
+	if ((work & overlay_ui::a_reconcile) != 0u &&
+	    overlay_ui::live_enabled() && !g_snippet.available)
+	{
+		if (!nr_arm_snippet(nr_addon_dir(), why))
+		{
+			// The gate is opened even though this failed, and deliberately. Nothing was released
+			// and nothing needs rebuilding - the snippet simply is not there - so leaving it shut
+			// would make begin_pass skip every pass for the rest of the session on top of a failure
+			// that has already stopped the pass by other means. A shut gate must only ever mean
+			// "a release is still owed", which is the one case the refusal below leaves it shut for.
+			overlay_ui::publish_serviced_rebuild(req.rebuild_epoch);
+			overlay_ui::publish_reconfigure(false,
+				"the snippet could not be loaded - see ReShade.log for the exact reason");
+			overlay_ui::publish_reconfig_pending(false);
+			return;
+		}
+	}
+
+	if (st == nullptr)
+	{
+		// Nothing else can be done on this device yet: nr_lazy_ngx_init creates nr_state, and it
+		// runs on the next dispatch now that the arm above has set g_nr_pending_init. The gate is
+		// opened here too - with no nr_state there is nothing to release, so the rebuild IS done,
+		// and leaving it shut would wedge the pass before it had ever run.
+		overlay_ui::publish_serviced_rebuild(req.rebuild_epoch);
+		overlay_ui::publish_reconfigure(true, why);
+		overlay_ui::publish_reconfig_pending(false);
+		return;
+	}
+
+	// ---- REFUSE RATHER THAN RUN A RELEASE WITH NO IDLE -----------------------------------------
+	// nr_release_feature_and_output idles the GPU through g_queue, and g_queue is cleared at
+	// on_destroy_command_queue. With it null the release would destroy resources the GPU may
+	// still be reading, with no diagnostic. Its only callers used to be present, resize and
+	// destroy, where that is unlikely; a user-triggered reconfigure widens the window
+	// arbitrarily, so it is checked rather than assumed. The work is put BACK, not dropped, so
+	// the reconfigure lands as soon as a queue exists again.
+	const bool want_teardown = (work & overlay_ui::a_teardown) != 0u;
+	if (want_teardown && g_queue.load(std::memory_order_relaxed) == nullptr)
+	{
+		st->pending_work.fetch_or(work, std::memory_order_relaxed);
+		overlay_ui::publish_reconfigure(false,
+			"there is no graphics queue to idle the GPU with, so nothing was released - the "
+			"reconfigure is still queued and will be applied as soon as one exists");
+		static bool s_said_no_queue = false;
+		if (!s_said_no_queue)
+		{
+			s_said_no_queue = true;
+			LOGW("DLSS-NR reconfigure: DEFERRED (\"%s\") - g_queue is null, so the feature and "
+			     "textures cannot be released without leaving in-flight GPU work referencing "
+			     "them. The request is kept and retried on every present. This message is "
+			     "printed once.", why);
+		}
+		return;
+	}
 
 	std::lock_guard<std::mutex> lock(st->mutex);
-	if (!st->pending_teardown)
-		return;
 
-	nr_release_feature_and_output(dev, *st, "the TAA output resolution changed");
-	st->pending_teardown = false;
-	// Let every one-shot diagnostic speak again for the new resolution.
-	st->logged_taa_found      = false;
-	st->logged_srv_reject     = false;
-	st->logged_uav_reject     = false;
-	st->logged_uav_ambiguous  = false;
-	st->logged_restore_reject = false;
-	st->logged_create_fail    = false;
-	st->logged_eval_fail      = false;
-	st->logged_codec_off      = false;
-	st->logged_codec_tex_fail = false;
-	// The mvec pass's per-resolution state is cleared in nr_release_feature_and_output, so its
-	// one-shot diagnostics must be re-armed here for exactly the same reason the codec's are: a
-	// target that allocates at one extent and not at the next, or a View-CB discovery that
-	// validates at one render size and not at the next, would otherwise re-latch in SILENCE and
-	// leave the log's last word on the subject a stale "GAP 2 ADDRESSED" from the old resolution
-	// while the census printed mode=RAW with no reason anywhere.
-	st->logged_mvec_format      = false;
-	st->logged_mvec_active      = false;
-	st->logged_mvec_off         = false;
-	st->logged_mvec_tex_fail    = false;
-	st->logged_mvec_no_viewcb   = false;
-	st->logged_mvec_clip_bad    = false;
-	st->logged_mvec_clip_row    = false;
-	st->logged_mvec_decode_only = false;
-	// logged_mvec_pinned_row is deliberately NOT reset: it is a statement about the ini file, not
-	// about the resolution, and it has already been said once.
-	st->logged_hist_active    = false;
-	st->logged_hist_dropped   = false;
-	st->logged_hist_odd_reg   = false;
-	st->logged_hist_tex_fail  = false;
-	// The ring of resources the copy-back wrote into holds handles from the OLD resolution, whose
-	// resources are on their way out; a recycled address could otherwise false-match. Clear it
-	// with the latch it feeds.
-	for (uint64_t &h : st->copied_into) h = 0;
-	st->copied_into_next = 0;
-	st->logged_feedback_loop  = false;
-	// The identity statement is deliberately NOT reset: it is a property of the codec, not of the
-	// resolution, and it has already been said once.
+	bool ok = true;
+	const char *fail_reason = nullptr;
+
+	// ---- R4: the teardown, through the EXISTING seam -------------------------------------------
+	// nr_release_feature_and_output is unchanged. It idles the queue, releases the NGX feature,
+	// destroys every view and every texture, drops st->pending_res, and clears every
+	// per-resolution latch. Crucially for hdr_codec it zeroes out_w/out_h and out_tex, so the
+	// next accepted dispatch re-enters nr_ensure_output on the CREATE branch and re-decides the
+	// neural format against the new value - which is the whole of the on-to-off fix, with no new
+	// mechanism at all.
+	if (want_teardown)
+	{
+		nr_release_feature_and_output(dev, *st, why);
+		// Keeps the status block's REBUILDING rung on screen for the three seconds its own comment
+		// describes. publish_evaluate clears the stamp on the first successful evaluate, so it can
+		// never become the stale positive that a latch would be.
+		overlay_ui::publish_teardown();
+	}
+
+	if ((work & overlay_ui::a_clear_failed) != 0u)
+		st->feature_failed = false;
+
+	// ---- R5: make what EXISTS match what is WANTED ---------------------------------------------
+	// The overlay cannot make these decisions - whether the codec needs building depends on
+	// st->codec.ok and st->codec_failed, which live behind this mutex - so it asks for a
+	// reconcile and the answer is worked out here, once, with the state to work it out from.
+	if ((work & overlay_ui::a_reconcile) != 0u)
+	{
+		const std::wstring dir = nr_addon_dir();
+
+		if (overlay_ui::live_hdr_codec() && !st->codec.ok && !st->codec_failed)
+		{
+			if (!nr_build_codec_pipelines(dev, *st, dir))
+			{
+				ok = false;
+				fail_reason = "the HDR codec's shaders or pipelines could not be built; the "
+				              "denoise still runs, undecoded";
+			}
+		}
+
+		if (overlay_ui::live_mvec_decode() && !st->mvec.ok && !st->mvec_failed)
+		{
+			if (!nr_build_mvec_pipeline(dev, *st, dir))
+			{
+				ok = false;
+				fail_reason = "the motion-vector decode's shader could not be built; the guide "
+				              "falls back to the game's raw encoded velocity";
+			}
+		}
+
+		// populate_parameters. OFF->ON is one call on the block we already have. ON->OFF cannot
+		// be un-called, so it needs a FRESH block - which needs the feature released first,
+		// because CreateFeature was handed the old pointer. The overlay's Apply button raises
+		// k_rebuild for exactly that reason, so the teardown above has already happened.
+		const bool want_populate = overlay_ui::live_populate_parameters();
+		if (want_populate && !st->serviced_populate_parameters && st->params != nullptr)
+		{
+			if (g_snippet.populate_params != nullptr)
+			{
+				const ngx::Result pr = g_snippet.populate_params(st->params);
+				nr_log_ngx(ngx::failed(pr) ? reshade::log::level::warning : reshade::log::level::info,
+				           "PopulateParameters_Impl (live: populate_parameters 0 -> 1)", pr);
+				st->serviced_populate_parameters = true;
+			}
+			else
+			{
+				ok = false;
+				fail_reason = "this snippet build exports no PopulateParameters_Impl, so there is "
+				              "nothing to call";
+			}
+		}
+		else if (!want_populate && st->serviced_populate_parameters)
+		{
+			// ALLOCATE FIRST, THEN DELETE. If the allocation fails we keep the block we have and
+			// report it: a null st->params is a bail on every subsequent dispatch, which would
+			// turn a settings change into "the add-on stopped working".
+			ngx::parameter_block *fresh = new (std::nothrow) ngx::parameter_block();
+			if (fresh == nullptr)
+			{
+				ok = false;
+				fail_reason = "out of memory allocating a fresh NGX parameter block; the previous "
+				              "one is still in use and populate_parameters is unchanged";
+			}
+			else
+			{
+				delete st->params;
+				st->params = fresh;
+				st->serviced_populate_parameters = false;
+				LOGI("DLSS-NR reconfigure: allocated a fresh NGX parameter block "
+				     "(populate_parameters 1 -> 0). PopulateParameters_Impl cannot be un-called on "
+				     "the block it was made against, so the block is replaced instead.");
+			}
+		}
+	}
+
+	// ---- R3: the one-shot log latches --------------------------------------------------------
+	// Without this a WRONG new pin would be rejected IN SILENCE - the one-shot log lines have
+	// already fired for the run - and the status block would still say WAITING FOR GAME DLSS with
+	// nothing in the log to say why. It is the same re-arm the resolution change has always done
+	// (this function absorbed nr_service_pending_teardown, and its list is preserved verbatim),
+	// now reached by a user reconfigure as well.
+	if (want_teardown)
+	{
+		// Let every one-shot diagnostic speak again for the new configuration.
+		st->logged_taa_found      = false;
+		st->logged_srv_reject     = false;
+		st->logged_uav_reject     = false;
+		st->logged_uav_ambiguous  = false;
+		st->logged_restore_reject = false;
+		st->logged_create_fail    = false;
+		st->logged_eval_fail      = false;
+		st->logged_codec_off      = false;
+		st->logged_codec_tex_fail = false;
+		st->logged_copy_fmt       = false;
+		// The mvec pass's per-resolution state is cleared in nr_release_feature_and_output, so its
+		// one-shot diagnostics must be re-armed here for exactly the same reason the codec's are: a
+		// target that allocates at one extent and not at the next, or a View-CB discovery that
+		// validates at one render size and not at the next, would otherwise re-latch in SILENCE and
+		// leave the log's last word on the subject a stale "GAP 2 ADDRESSED" from the old
+		// configuration while the census printed mode=RAW with no reason anywhere.
+		st->logged_mvec_format      = false;
+		st->logged_mvec_active      = false;
+		st->logged_mvec_off         = false;
+		st->logged_mvec_tex_fail    = false;
+		st->logged_mvec_no_viewcb   = false;
+		st->logged_mvec_clip_bad    = false;
+		st->logged_mvec_clip_row    = false;
+		st->logged_mvec_decode_only = false;
+		// logged_mvec_pinned_row is deliberately NOT reset by a teardown: it is a statement about
+		// the ini file, not about the resolution. It IS reset by a_clear_clip below, because there
+		// the ini value is precisely what changed.
+		st->logged_hist_active   = false;
+		st->logged_hist_dropped  = false;
+		st->logged_hist_odd_reg  = false;
+		st->logged_hist_tex_fail = false;
+		st->logged_hist_double_arm = false;
+		// The identity statement is deliberately NOT reset: it is a property of the codec, not of
+		// the resolution, and it has already been said once.
+	}
+	else if (req.ident_changed)
+	{
+		// An identification change with no teardown behind it. Only the lines that speak about
+		// identification are re-armed; the resource-allocation ones have nothing new to say.
+		st->logged_taa_found       = false;
+		st->logged_srv_reject      = false;
+		st->logged_uav_reject      = false;
+		st->logged_uav_ambiguous   = false;
+		st->logged_hist_odd_reg    = false;
+		st->logged_hist_dropped    = false;
+		st->logged_hist_double_arm = false;
+	}
+
+	if (req.ident_changed || want_teardown)
+	{
+		// The armed pristine copy names a resource chosen under the OLD identification. begin_pass
+		// drops it too, on the render thread, but only if the pass is actually being reached - and
+		// the whole point of servicing here is that it may not be. (nr_release_feature_and_output
+		// already did this on the teardown path; doing it twice is free and the alternative is a
+		// branch that has to stay in step with that function.)
+		st->pending_res = 0;
+		st->pending_w = st->pending_h = 0;
+		st->pending_fmt = format::unknown;
+		// The ring the copy-back's one-shot feedback warning reads holds handles from the OLD
+		// configuration, whose resources may be on their way out; a recycled address could
+		// otherwise false-match. Clear it with the latch it feeds.
+		for (uint64_t &h : st->copied_into) h = 0;
+		st->copied_into_next = 0;
+		st->logged_feedback_loop = false;
+	}
+
+	// ---- R1's latch clear: mvec_clip_row / mvec_clip_transpose ---------------------------------
+	// These two can set view_layout_failed and clip_ok=false PERMANENTLY for the resolution after
+	// thirty consecutive failures, and until this ladder existed only a full feature release
+	// cleared them. Without this the knob is dead after the first bad value and every later change
+	// does nothing: a control that lies, which is the one outcome the overlay exists to prevent.
+	if ((work & overlay_ui::a_clear_clip) != 0u)
+	{
+		st->view_layout_failed = false;
+		st->view_discover_tries = 0;
+		st->clip_fail_streak = 0;
+		st->clip_ok = false;            // re-derive it rather than trust a matrix from the old row
+		st->logged_mvec_clip_bad  = false;
+		st->logged_mvec_clip_row  = false;
+		st->logged_mvec_pinned_row = false;
+		st->logged_mvec_no_viewcb = false;
+		st->logged_mvec_off       = false;
+		st->logged_mvec_decode_only = false;
+	}
+
+	// ---- the DXR census -------------------------------------------------------------------------
+	// Two relaxed stores into rt_census's own atomics. NOT rt_census::arm(), which prints a
+	// start-up banner describing the whole gate - correct once at init, wrong every time a
+	// checkbox moves.
+	if ((work & overlay_ui::a_apply_census) != 0u)
+	{
+		const bool     on   = overlay_ui::live_rt_census();
+		const uint32_t every = overlay_ui::live_rt_census_frames();
+		rt_census::set_live(on, every);
+		LOGI("DLSS-NR reconfigure: RT census %s (summary every %u presents). Its counters are "
+		     "CUMULATIVE from the first time it was armed and are not reset here, so read the "
+		     "deltas between summaries rather than the totals.",
+		     on ? "ON" : "OFF", (unsigned)(every != 0 ? every : 600));
+	}
+
+	// ---- report ---------------------------------------------------------------------------------
+	if (ok)
+	{
+		overlay_ui::publish_reconfigure(true, why);
+		// THE LINE THAT FIRES ONLY ON A REAL RECONFIGURE. Not once-per-run, not per frame: the
+		// service returns early when there is no work, so reaching here means a rung was actually
+		// climbed. It names the key and the tier, which is what makes "did my change land?"
+		// answerable from the log alone.
+		LOGI("DLSS-NR reconfigure APPLIED: \"%s\" -> tier %s%s%s%s%s. "
+		     "codec=%s mvec=%s feature=%s",
+		     why,
+		     want_teardown ? "1 (feature recreate)" : (req.ident_changed ? "2 (re-identify)" : "0/1 (live)"),
+		     req.ident_changed        ? " +ident-epoch" : "",
+		     (work & overlay_ui::a_reconcile)    ? " +reconcile" : "",
+		     (work & overlay_ui::a_clear_clip)   ? " +clip-latches" : "",
+		     (work & overlay_ui::a_apply_census) ? " +census" : "",
+		     st->codec_failed ? "FAILED" : (st->codec.ok ? "built" : "not built"),
+		     st->mvec_failed  ? "FAILED" : (st->mvec.ok  ? "built" : "not built"),
+		     st->feature != nullptr ? "kept" : "released");
+	}
+	else
+	{
+		overlay_ui::publish_reconfigure(false,
+			fail_reason != nullptr ? fail_reason : "see ReShade.log");
+		LOGE("DLSS-NR reconfigure FAILED: \"%s\" - %s. The PREVIOUS working state is still "
+		     "running and nothing is half-applied.", why,
+		     fail_reason != nullptr ? fail_reason : "see above");
+	}
+
+	// LAST, and only on a path that actually completed. This is the render thread's rebuild gate:
+	// until it moves, begin_pass skips the pass entirely, so no frame ever runs with the new
+	// settings against the old textures. The refusal path above returns WITHOUT publishing, which
+	// is correct - the pass must stay skipped while the release is still owed.
+	//
+	// Published even when `ok` is false: a reconfigure that failed has still finished, the previous
+	// working state is what is running, and leaving the gate shut would turn one failed pipeline
+	// build into "the add-on stopped rendering". The red banner is how the user learns about it,
+	// not a black screen.
+	overlay_ui::publish_serviced_rebuild(req.rebuild_epoch);
+	overlay_ui::publish_reconfig_pending(false);
 }
 
 static void on_init_command_queue(command_queue *queue)
@@ -4420,15 +4960,29 @@ static void on_destroy_command_queue(command_queue *queue)
 	})
 }
 
+// ---- BEGIN overlay_ui hook ----
+// live_diagnostics(), NOT g_cfg.diagnostics, at all three of the sites below.
+//
+// This is the one setting that could never have been made live through the per-pass g_cfg
+// snapshot, and the reason is the shape of these three functions rather than anything about the
+// value: they run on EVERY draw and EVERY dispatch in the process, on arbitrary recording
+// threads, with no lock, and entirely outside the accepted-TAA-pass window that begin_pass
+// covers. Writing it into g_cfg from the snapshot and reading it here would be a plain data race
+// on every draw call in the game.
+//
+// One relaxed atomic load at each site makes it live at zero risk. The old ledger's reason for
+// greying the control out - "read from threads this overlay must not race with, for the sake of a
+// log knob" - was an argument for using an atomic, not for having no control.
 static bool on_draw(command_list *cmd, uint32_t, uint32_t, uint32_t, uint32_t)
 {
-	PROBE_GUARD_FALSE({ if (g_cfg.diagnostics) dump_bindings(cmd, false); })
+	PROBE_GUARD_FALSE({ if (overlay_ui::live_diagnostics()) dump_bindings(cmd, false); })
 }
 
 static bool on_draw_indexed(command_list *cmd, uint32_t, uint32_t, uint32_t, int32_t, uint32_t)
 {
-	PROBE_GUARD_FALSE({ if (g_cfg.diagnostics) dump_bindings(cmd, false); })
+	PROBE_GUARD_FALSE({ if (overlay_ui::live_diagnostics()) dump_bindings(cmd, false); })
 }
+// ---- END overlay_ui hook ----
 
 // UE 4.27 TAA is compute-only: every entry point in TemporalAA.cpp is SF_Compute
 // (FTAAStandaloneCS "MainCS"). This is the handler that matters, and the only one that ever
@@ -4446,8 +5000,10 @@ static bool on_dispatch(command_list *cmd, uint32_t group_count_x, uint32_t grou
 	// described; it is now actually implemented.
 	bool handled = false;
 	PROBE_GUARD_RETURN(handled, {
-		if (g_cfg.diagnostics)
+		// ---- BEGIN overlay_ui hook ---- (see on_draw above for why this is not g_cfg)
+		if (overlay_ui::live_diagnostics())
 			dump_bindings(cmd, true);
+		// ---- END overlay_ui hook ----
 		nr_try_run(cmd, group_count_x, group_count_y, group_count_z, handled);
 	})
 }
@@ -4505,7 +5061,7 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 		// A resolution change was noticed on a recording thread, which cannot idle the GPU or
 		// destroy a resource. This is the main thread; do it here.
 		if (sc != nullptr)
-			nr_service_pending_teardown(sc->get_device());
+			nr_service_reconfigure(sc->get_device());
 
 		// Read the DLSS-NR counters BEFORE g.mutex is taken and WITHOUT st->mutex. nr_try_run
 		// holds st->mutex and then takes g.mutex; acquiring them in the other order here would
@@ -4561,7 +5117,14 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 		// per-frame 64-byte read of View.ClipToPrevClip out of UE's upload pool is failing or
 		// returning implausible rows and the last good matrix is standing in - a one-frame-stale
 		// reprojection each time, and at 30 consecutive the reconstruction latches off.
-		if (nst != nullptr && (nr_mvec_frames != 0 || nr_mvec_reuse != 0 || g_cfg.mvec_decode))
+		// ---- BEGIN overlay_ui hook ----
+		// mvec_decode and mvec_reconstruct are LIVE now, and g_cfg carries them only because
+		// begin_pass wrote them there on a RECORDING thread; on_present runs on the main thread. So
+		// the gate and the two values it prints all read the overlay's atomics - the GATE included,
+		// because a racy gate is the same data race as a racy argument AND can additionally admit a
+		// line that then reports the opposite state. Exactly the fix the history_restore/copy_back
+		// line above already carries, for exactly the same reason.
+		if (nst != nullptr && (nr_mvec_frames != 0 || nr_mvec_reuse != 0 || overlay_ui::live_mvec_decode()))
 			LOGI("--- DLSS-NR mvec @ frame %llu: decoded=%llu cb_reuse=%llu mode=%s "
 			     "(mvec_decode=%d mvec_reconstruct=%d)",
 			     (unsigned long long)g.frame,
@@ -4569,7 +5132,8 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 			     nr_mvec_mode == 2 ? "FULL (decode + camera reconstruction)"
 			   : nr_mvec_mode == 1 ? "DECODE ONLY (invalid texels are zero - bring-up A/B)"
 			                       : "RAW (the game's encoded velocity - pre-decode behaviour)",
-			     (int)g_cfg.mvec_decode, (int)g_cfg.mvec_reconstruct);
+			     (int)overlay_ui::live_mvec_decode(), (int)overlay_ui::live_mvec_reconstruct());
+		// ---- END overlay_ui hook ----
 
 		// `dxil=` COUNTS PIXEL AND COMPUTE SHADERS ONLY. on_init_pipeline's loop skips every
 		// sub-object that is not a PS or a CS, so a DXIL ray tracing library can never reach it
@@ -4700,18 +5264,22 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 		// and only the LOAD-ONLY half of g_cfg: the live half is written by the snapshot on a
 		// recording thread, and handing the overlay a pointer would make reading one of those by
 		// accident possible.
+		//
+		// ELEVEN g_cfg READS WERE DELETED FROM THIS LAMBDA BY THE RECONFIGURE LADDER, AND THAT IS
+		// PART OF THE LADDER RATHER THAN TIDYING. enabled, diagnostics, hdr_codec, shader_hash,
+		// srv_depth/velocity/colour, uav_output, populate_parameters and require_trampoline are all
+		// LIVE now, which means overlay_ui::begin_pass writes them into g_cfg on a RECORDING thread
+		// - while this lambda runs on the PRESENT thread, from overlay_ui::read_facts(). Leaving
+		// them here would have reintroduced, on eleven fields at once, the exact race the on_present
+		// hook below was written to remove for history_restore and copy_back.
+		//
+		// The overlay reads its own atomics for all eleven instead. Those are authoritative anyway:
+		// they are what g_cfg is written FROM. What is left below is the load-only remainder, and
+		// every one of them is written once, on the main thread, before any dispatch: app_id has no
+		// live control at all (see draw_load_only), ini_found is a statement about a file read once,
+		// and the rest are facts about the snippet rather than settings.
 		overlay_ui::facts_hook() = [](overlay_ui::host_facts &f) {
 			f.addon_name          = NAME;
-			f.enabled_at_load     = g_cfg.enabled;
-			f.diagnostics         = g_cfg.diagnostics;
-			f.hdr_codec_at_load   = g_cfg.hdr_codec;
-			f.shader_hash         = g_cfg.shader_hash;
-			f.srv_depth           = g_cfg.srv_depth;
-			f.srv_velocity        = g_cfg.srv_velocity;
-			f.srv_colour          = g_cfg.srv_colour;
-			f.uav_output          = g_cfg.uav_output;
-			f.populate_parameters = g_cfg.populate_parameters;
-			f.require_trampoline  = g_cfg.require_trampoline;
 			f.app_id              = g_cfg.app_id;
 			f.ini_found           = g_cfg.ini_found;
 			f.snippet_loaded      = g_snippet.available;

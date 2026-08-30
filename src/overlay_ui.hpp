@@ -1,16 +1,28 @@
 // overlay_ui.hpp - the ReShade overlay for the STRAY DLSS-NR add-on.
 //
-// SELF-CONTAINED BY DESIGN. src/stray_dlssnr.cpp is being edited concurrently, so everything that
-// can live here does. What is left there is SEVEN small hooks, each wrapped in
+// SELF-CONTAINED BY DESIGN. Everything that can live here does; what is left in
+// src/stray_dlssnr.cpp is a set of small hooks, each wrapped in
 // `// ---- BEGIN overlay_ui hook ----` / `// ---- END overlay_ui hook ----`:
-//   :45    the #include
-//   :2203  begin_pass - the one place the overlay reaches the render path
-//   :2825  the DLSSNR.UICorrection write (see "NR UI Correction" below)
-//   :2839  publish_evaluate - the status block
-//   :3170  seed_from_config - the live half of the parsed ini into the overlay atomics
-//   :3554  the census line's gate and its two live values
-//   :3681  DllMain: install the status hook and the load-only host_facts snapshot
-// Two more live in src/addon_config.hpp (:163, :308) and one in src/ngx_interop.hpp (:192).
+//   the #include
+//   read_ident + the per-PSO memo - the ONE new render-path touch the ladder needed, and the only
+//     way shader_hash can be live at all (its read site runs before st->mutex and before
+//     begin_pass, so no snapshot can reach it)
+//   begin_pass - the per-pass snapshot, the rebuild gate and rungs R0-R3
+//   the DLSSNR.UICorrection write (see "NR UI Correction" below)
+//   publish_evaluate - the status block
+//   seed_from_config - the parsed ini into the overlay atomics
+//   the two census lines' gates and their live values
+//   on_draw / on_draw_indexed / on_dispatch - live_diagnostics() at each of the three sites
+//   DllMain: install the status hook and the load-only host_facts snapshot
+// Plus nr_service_reconfigure, which is not a hook but the other half of this file's design: the
+// present-thread half of the ladder, in stray_dlssnr.cpp because the CI gate below forbids this
+// header from taking a lock or touching nr_state. Two more hooks live in src/addon_config.hpp and
+// one in src/ngx_interop.hpp.
+//
+// LINE NUMBERS ARE DELIBERATELY NOT GIVEN FOR THE HOOK LIST. They were, and every one of them was
+// wrong by the time this ladder landed - a hook list that names stale lines is worse than one
+// that names none, because it sends the reader to the wrong place with confidence. Grep for the
+// marker; it is there for exactly this.
 //
 // =============================================================================================
 // WHAT THIS FILE IS FOR, IN ONE PARAGRAPH
@@ -72,60 +84,97 @@
 //    one relaxed load per field per frame.
 //
 // =============================================================================================
-// WHICH SETTINGS ARE LIVE, AND WHICH CANNOT BE - EVERY ONE OF THESE IS SAID IN THE UI TOO
+// THE RECONFIGURE LADDER - HOW EVERY SETTING IS MADE LIVE, AT THE RIGHT GRANULARITY
 //
-//   LIVE, FREE            intensity, local_tone_strength, local_structure_strength,
-//                         skin_structure_strength, style, use_auto_mask, ui_correction.
-//                         nr_try_run writes every NGX tuning parameter from g_cfg on EVERY
-//                         accepted dispatch (:2810-2834), and nr_ensure_feature - the
-//                         CreateFeature site - writes only Width/Height/InputWidth/InputHeight/
-//                         Enabled/RenderPreset/ScalingRatio/node-masks/FreeMemOnRelease
-//                         (:1899-1918). Not one tuning knob is baked at create time, so these
-//                         sliders are honest with no extra machinery.
-//   LIVE + SNAPSHOT       paper_white_scale, transfer_strength, color_strength,
-//                         restore_graphics_root (see rule 3).
-//   LIVE + ONE RESET      depth_inverted, mvec_scale_x, mvec_scale_y. Changing the depth
-//                         convention or the motion-vector grid invalidates the accumulated
-//                         temporal history; :2794-2800 already forces a reset frame when the
-//                         guide GRID moves, for the same reason.
-//   LIVE + CLEAR pending_res
-//                         copy_back, history_restore, and the overlay's own master bypass.
-//                         st->pending_res is a RAW ID3D12Resource address held across a frame,
-//                         and :2531-2534 warns that UE 4.27's render-target pool can free that
-//                         element and hand the address back for a differently sized colour
-//                         texture. A stale arm surviving a toggle could write a seconds-old frame
-//                         over a recycled resource that passes the shape check.
-//   LOAD-ONLY, SHOWN GREYED, WITH THE REASON
-//                         enabled ...... read once at :3179; nothing on the render path reads it.
-//                                        A checkbox bound to it would do nothing until relaunch,
-//                                        so the overlay's master switch is a SEPARATE per-dispatch
-//                                        bypass and the ini key is displayed read-only.
-//                         hdr_codec .... cannot be flipped in place IN EITHER DIRECTION. OFF->ON
-//                                        is impossible: hdr_codec=0 at load sets
-//                                        st->codec_failed (:3312-3314) and
-//                                        nr_release_feature_and_output deliberately never clears
-//                                        it (:1625-1629). ON->OFF in place silently kills the
-//                                        copy-back: out_tex was forced to r16g16b16a16_float for
-//                                        its lifetime (:1844-1845), so src_fmt (:3048) would
-//                                        mismatch an r11g11b10_float TAA output and :3050-3067
-//                                        fires. Doing it properly needs a deferred teardown plus
-//                                        a one-shot pipeline build, which is a change to
-//                                        stray_dlssnr.cpp far larger than this overlay is allowed
-//                                        to make.
-//                         shader_hash .. MEMOIZED PER-PSO: the lookup is guarded by
-//                                        `cs->nr_checked != cs->pso` (:2165) and cached in
-//                                        cs->nr_is_target (:2182-2183). A live change would take
-//                                        effect on some command lists and not others.
-//                         srv_* / uav_output
-//                                        identification pins, and srv_colour is ALSO the
-//                                        history-restore refusal test (:2519, :2585). Changing it
-//                                        between the arm (:3139) and the consume (:2499) can land
-//                                        last frame's image on this frame's scene-colour input.
-//                         diagnostics .. read on the draw/dispatch path (:3492 :3497 :3516) from
-//                                        threads this overlay must not race with for the sake of
-//                                        a log knob.
-//                         populate_parameters / require_trampoline / app_id
-//                                        consumed once each at :3320 / :3195 / :3248.
+// An earlier version of this file listed ten keys as LOAD-ONLY and greyed them out. That
+// allowance is withdrawn: eight of those ten are reachable, and this is the mechanism. Six rungs,
+// strictly nesting - each implies every rung below it - and they generalise the three epochs this
+// file already had rather than adding a parallel scheme.
+//
+//   R0  SNAPSHOT   begin_pass copies these atomics into g_cfg once per pass, on the render
+//                  thread, under the lock the pass already holds. Rule 3 below is why.
+//   R1  RESET      + st->need_reset: one DLSSNR.Reset frame, because the accumulated temporal
+//                  history was built under the other geometry.        bump(k_reset)
+//   R2  FLUSH      + st->pending_res = 0. The armed pristine copy names a RAW ID3D12Resource
+//                  address held across a frame and UE 4.27's pool can recycle it.  bump(k_flush)
+//   R3  IDENT      + a bump of ident_epoch, which (a) invalidates the per-PSO memo on EVERY
+//                  command list at once, (b) re-arms the identification one-shot log latches, and
+//                  (c) clears the copied_into ring.                    bump(k_ident)
+//   R4  REBUILD    + a deferred teardown through the EXISTING seam - nr_state::pending_work's
+//                  kTeardown bit, serviced on the next present by nr_service_reconfigure, which
+//                  calls nr_release_feature_and_output. The feature, every view and every texture
+//                  go; the next accepted dispatch rebuilds them and RE-DECIDES out_tex's format
+//                  against the new hdr_codec.                          bump(k_rebuild)
+//   R5  REARM      + an explicit action mask, OR-merged into the same pending_work word and
+//                  serviced in the same present-thread pass: build the codec or mvec pipelines,
+//                  rebuild the NGX parameter block, load the snippet, clear the clip latches.
+//                                                                      request(a_*)
+//
+// WHY THE SPLIT BETWEEN THIS FILE AND stray_dlssnr.cpp IS NOT STYLISTIC. The CI gate at
+// .github/workflows/build.yml:421-448 bans std::mutex / std::lock_guard / ngx::set_ / ngx::store /
+// pd_get / kNrStateGuid from this header. Values and epochs live HERE, as lock-free atomics; every
+// ACTION lives in stray_dlssnr.cpp, on a thread allowed to take st->mutex. That is the invariant
+// that keeps this file lock-free on the present thread, and the ladder is built to respect it.
+//
+// WHERE THE RUNGS ARE CONSUMED, AND WHY THERE ARE TWO CONSUMERS. begin_pass consumes R0-R3 on the
+// RENDER thread (they are per-pass consequences). nr_service_reconfigure consumes R3-R5 on the
+// PRESENT thread (they idle the queue, destroy resources and LoadLibrary). Each keeps its own
+// seen-epoch state, both of them in nr_state - NOT in a function-local static, which would be
+// process-wide rather than per-device and would silently cost a second D3D12 device its whole
+// rebuild. The service reading the epochs FOR ITSELF is load-bearing rather than tidy: with
+// enabled=0, or with the feature wedged, begin_pass never runs at all, and those are exactly the
+// cases where the user most needs a reconfigure to land.
+//
+//   PER KEY (34 keys; the render-path read site for each is cited in stray_dlssnr.cpp):
+//     R0        intensity, local_tone_strength, local_structure_strength, skin_structure_strength,
+//               style, use_auto_mask, ui_correction, paper_white_scale, transfer_strength,
+//               color_strength, restore_graphics_root
+//     R1        depth_inverted, mvec_scale_x, mvec_scale_y, mvec_dilate, mvec_reconstruct
+//     R1+latch  mvec_clip_row, mvec_clip_transpose - these two can PERMANENTLY latch
+//               view_layout_failed / clip_ok=false (stray_dlssnr.cpp:2589-2593, :2604-2612,
+//               :2640-2645), cleared only by nr_release_feature_and_output. Without a_clear_clip
+//               the knob is dead after the first bad value: a control that lies.
+//     R2        copy_back, history_restore, and the master bypass
+//     R3        shader_hash, srv_depth, srv_velocity, srv_colour, uav_output
+//     R4        hdr_codec (BOTH directions), mvec_decode off, enabled off
+//     R4+R5     mvec_decode on (a_rebuild_mvec), enabled on (a_arm_snippet),
+//               populate_parameters (a_populate_params on; a_rebuild_params off)
+//     ATOMIC AT ITS OWN SITE, never through the g_cfg snapshot:
+//               shader_hash  - read at :2722, BEFORE st->mutex (:2744) and BEFORE begin_pass
+//                              (:2760). A snapshot cannot reach it, so it goes through
+//                              read_ident() at its own site. Snapshotting it would have shipped a
+//                              control that does nothing on the one path it names - the exact
+//                              shape the kParam CI gate exists to catch.
+//               diagnostics  - read at :4425 / :4430 / :4449, i.e. on EVERY draw and EVERY
+//                              dispatch in the process, on arbitrary recording threads, outside
+//                              the accepted-pass snapshot. live_diagnostics() at each site.
+//               mvec_decode / mvec_reconstruct
+//                            - ALSO read on the MAIN thread by the census line at :4564 / :4572.
+//                              live_mvec_decode() / live_mvec_reconstruct(), for the same reason
+//                              live_copy_back() / live_history_restore() already exist.
+//               rt_census / rt_census_frames
+//                            - live in rt_census's own atomics; the service stores them there.
+//
+//   RELAUNCH-ONLY, AND ONLY THESE TWO. Both say so in their own tooltip, with the evidence:
+//     require_trampoline 0->1  Honouring it means UNLOADING an already-initialised snippet, and
+//                              this tree has no in-process unload path: stray_dlssnr.cpp:4339-4341
+//                              declines to FreeLibrary even at device teardown ("a 166 MB module
+//                              that may still hold worker threads"). 1->0 IS live - on that path
+//                              load_snippet already called s.unload() (ngx_interop.hpp:686), so
+//                              nothing is loaded and re-running it is clean.
+//     app_id                   The MECHANISM exists (Shutdown1 is resolved and is already called
+//                              in-process at :4328-4333, so Shutdown1 + Init_Ext is one more
+//                              action bit). What is NOT proven is that Init_Ext survives a SECOND
+//                              call, and the tree's only measurement of its fragility is that it
+//                              HANGS when called at the wrong moment (:4049-4056: "the log stops
+//                              between loaded nvngx_dlssnr.dll and the Init_Ext result, the
+//                              process sits at ~2% CPU, and the title never reaches its menu"). A
+//                              hang is not a failure that degrades. Since app_id has NO
+//                              render-path effect whatsoever - addon_config.hpp:265-267 and
+//                              stray_dlssnr.cpp:4083-4085 both record that it only names the log
+//                              file the snippet writes beside the add-on - shipping an unverified
+//                              path that can hang the user's game to rename a log file is the
+//                              wrong trade. It is stated as exactly that, and not as "load-only".
 //
 // =============================================================================================
 // FOUR renodx CONTROLS ARE DELIBERATELY ABSENT. "Never add a control that does nothing."
@@ -266,15 +315,94 @@ struct live_block
 	std::atomic<bool>     use_auto_mask{ true };
 	std::atomic<uint32_t> ui_correction{ 0 };
 
+	// ---- R3: IDENTIFICATION. shader_hash is read by the render path through read_ident(), NOT
+	// through the g_cfg snapshot: its one functional read site (stray_dlssnr.cpp:2722) executes
+	// BEFORE st->mutex is taken (:2744) and BEFORE begin_pass (:2760), so a snapshot value can
+	// never reach it. The four register pins DO ride the snapshot - every read of them is after
+	// begin_pass (:2833-2835, :2270) - and need only the arm drop and the latch re-arm that the
+	// ident rung already carries. Saying they need the memo too would be wrong.
+	std::atomic<uint64_t> shader_hash{ 0 };
+	std::atomic<uint32_t> srv_depth{ 0 };
+	std::atomic<uint32_t> srv_velocity{ 2 };
+	std::atomic<uint32_t> srv_colour{ 5 };
+	std::atomic<uint32_t> uav_output{ 0 };
+
+	// ---- R4/R5: the keys that need a feature recreate or a pipeline build.
+	std::atomic<bool>     hdr_codec{ true };
+	std::atomic<bool>     mvec_decode{ true };
+	std::atomic<bool>     populate_parameters{ false };
+	std::atomic<bool>     require_trampoline{ true };
+	// The ini's master switch, and it is NOT the same control as `bypass` above. Both are real:
+	// `bypass` is the per-dispatch no-op, this one is whether the 166 MB snippet is loaded and
+	// NGX is armed at all. Off gives the VRAM back; on runs the shipping startup path.
+	std::atomic<bool>     enabled{ true };
+
+	// ---- R1, and two of them also need the clip latches cleared.
+	std::atomic<bool>     mvec_reconstruct{ true };
+	std::atomic<bool>     mvec_dilate{ false };
+	std::atomic<bool>     mvec_clip_transpose{ false };
+	std::atomic<uint32_t> mvec_clip_row{ 0 };
+
+	// ---- read at their own sites, on threads the per-pass snapshot does not cover.
+	std::atomic<bool>     diagnostics{ true };
+	std::atomic<bool>     rt_census{ false };
+	std::atomic<uint32_t> rt_census_frames{ 600 };
+
 	// MULTI-FIELD CHANGES GO THROUGH AN EPOCH, NOT THROUGH THE VALUES. The overlay stores the
-	// value relaxed and then bumps an epoch with RELEASE; begin_pass loads the epochs with
+	// value relaxed and then bumps an epoch with RELEASE; every reader loads an epoch with
 	// ACQUIRE before reading any value. That pair is the only ordering anything depends on -
 	// every field is a single scalar whose stale value is at most one frame old and, because of
-	// the snapshot, always self-consistent within the pass.
-	std::atomic<uint32_t> epoch{ 0 };           // any change at all
-	std::atomic<uint32_t> reset_epoch{ 0 };     // needs one DLSSNR.Reset frame
-	std::atomic<uint32_t> flush_epoch{ 0 };     // needs st->pending_res dropped as well
-	std::atomic<uint32_t> teardown_epoch{ 0 };  // the "Reset NR feature" button
+	// the snapshot, always self-consistent within the pass. It is also what makes a MULTI-FIELD
+	// edit atomic: a user who retypes shader_hash and srv_colour together can never be observed
+	// half way, because the reader acquires the epoch before it reads either value.
+	std::atomic<uint32_t> epoch{ 0 };           // R0: any change at all
+	std::atomic<uint32_t> reset_epoch{ 0 };     // R1: needs one DLSSNR.Reset frame
+	std::atomic<uint32_t> flush_epoch{ 0 };     // R2: needs st->pending_res dropped as well
+	std::atomic<uint32_t> ident_epoch{ 0 };     // R3: the pass must be re-identified
+	std::atomic<uint32_t> rebuild_epoch{ 0 };   // R4: the feature and our textures must go
+
+	// R5: OR-MERGED, NEVER ASSIGNED, and consumed with fetch_and(0) by the present-thread
+	// service. An OR-merge is required rather than a plain store because two independent requests
+	// - a codec rebuild and a parameter-block rebuild, say, or a user reconfigure landing in the
+	// same frame as nr_ensure_output's own resolution-change teardown - can arrive together, and
+	// a store would silently drop one of them for ever.
+	std::atomic<uint32_t> action_bits{ 0 };
+	// The key that most recently asked for a reconfigure, for the log line and the status block.
+	// A STRING LITERAL, like every other pointer that crosses this boundary, so it outlives any
+	// read. Stored BEFORE the action bits are ORed in, so a reader that sees the bits sees this.
+	std::atomic<const char *> action_why{ nullptr };
+};
+
+// R5 action bits. Every one of these is performed by nr_service_reconfigure in stray_dlssnr.cpp,
+// on the present thread, under st->mutex ONLY - never g.mutex, which would invert nr_try_run's
+// st->mutex-then-g.mutex order into a textbook AB/BA against the recording thread.
+//
+// THERE IS DELIBERATELY NO PER-PIPELINE BIT. An earlier shape of this had a_rebuild_codec,
+// a_rebuild_mvec, a_rebuild_params and a_arm_snippet, and every control had to work out which of
+// them its own change implied - a checkbox deciding, from the UI thread, whether a pipeline needs
+// building. That is a decision the UI cannot make correctly: whether the codec needs a build
+// depends on st->codec.ok and st->codec_failed, which live behind st->mutex and which the overlay
+// is forbidden to reach for. So the UI raises a_reconcile and the SERVICE compares the live values
+// against what actually exists, in one place, with the state to decide it. A control that raises
+// the wrong bit then cannot exist.
+enum : uint32_t {
+	a_teardown     = 1u << 0,   // release the feature, every view and every texture
+	a_clear_failed = 1u << 1,   // clear the latched create-failure (the Reset button)
+	a_clear_clip   = 1u << 2,   // clear view_layout_failed / clip_ok, re-arm their latches
+	a_apply_census = 1u << 3,   // push rt_census / rt_census_frames into rt_census's own atomics
+	a_reconcile    = 1u << 4,   // make the codec / mvec / snippet / parameter block match the
+	                            // live values, building or arming whatever is now wanted
+};
+
+// The per-consumer, PER-DEVICE seen-epoch state. Deliberately NOT function-local statics: those
+// are process-wide, so with two D3D12 devices the edge for a given change would be consumed by
+// whichever device's pass ran first and the other would miss it entirely. At three rungs that
+// cost one reset frame; at five it costs a whole rebuild. One of these lives in nr_state per
+// consumer - begin_pass has one, the present-thread service has another.
+struct seen_epochs
+{
+	uint32_t reset = 0, flush = 0, ident = 0, rebuild = 0;
+	bool     first = true;
 };
 
 static_assert(std::atomic<bool>::is_always_lock_free,     "std::atomic<bool> must be lock-free: the render thread reads it inside the fenced NGX window.");
@@ -323,6 +451,37 @@ struct status_block
 	// reading "REBUILDING" indefinitely - which is exactly the kind of stale-positive this panel
 	// exists to avoid, and the same defect the reference add-on's "ACTIVE" has.
 	std::atomic<uint64_t>     teardown_ms{ 0 };
+
+	// ---- THE RECONFIGURE, reported the same way and for the same reason -----------------------
+	// reconfig_ms is a TIMESTAMP, not a latch, on exactly the argument teardown_ms's comment above
+	// makes: as a latch, a reconfigure that never came back would leave the panel reading
+	// RECONFIGURING for ever, which is the stale-positive this whole block exists to avoid.
+	std::atomic<uint64_t>     reconfig_ms{ 0 };
+	// FALSE means the last reconfigure FAILED and the previous working state is still running.
+	// The UI shows that in red, above the REBUILDING rung, rather than silently degrading.
+	std::atomic<bool>         reconfig_ok{ true };
+	// A string literal, like every other pointer here: which key asked, or why it failed.
+	std::atomic<const char *> reconfig_what{ nullptr };
+	// Set by the service while work is outstanding and cleared when it has all been done. This is
+	// what drives the REBUILDING rung now - a real fact published by the thread doing the work,
+	// not a three-second guess off a timestamp.
+	std::atomic<bool>         reconfig_pending{ false };
+	// THE RENDER THREAD'S GATE, and it is what makes a rebuild ATOMIC with respect to the pass.
+	//
+	// Without it there is a window: the user clicks, the overlay bumps rebuild_epoch, and the next
+	// dispatch runs BEFORE the present-thread service has released anything - so it runs with the
+	// new g_cfg against the old textures. For hdr_codec ON->OFF that window is not cosmetic: the
+	// pass would take the codec-off branch while out_tex was still the r16g16b16a16_float the codec
+	// needed, the copy-back's format guard would fire, and the frame would silently get no denoise.
+	// A half-applied frame is exactly what requirement "never a half-applied state" rules out.
+	//
+	// So begin_pass compares the live rebuild epoch against this one and SKIPS the pass while they
+	// differ - ReShade then issues the game's own dispatch, a strict no-op - and the service
+	// publishes the epoch it actually completed. The skip is one or two frames and is the hitch the
+	// tooltips already promise. If the service refuses (no graphics queue to idle), this is not
+	// published and the pass correctly stays skipped rather than running against state that is one
+	// present away from being destroyed.
+	std::atomic<uint32_t>     serviced_rebuild_epoch{ 0 };
 };
 
 inline status_block &status()
@@ -345,13 +504,20 @@ struct host_facts
 	bool     valid = false;
 
 	const char *addon_name = "";        // the NAME export, for the DisabledAddons check
-	bool     enabled_at_load = true;    // cfg.enabled
-	bool     diagnostics = true;
-	bool     hdr_codec_at_load = true;
-	uint64_t shader_hash = 0;
-	uint32_t srv_depth = 0, srv_velocity = 0, srv_colour = 0, uav_output = 0;
-	bool     populate_parameters = false;
-	bool     require_trampoline = true;
+
+	// ELEVEN FIELDS WERE DELETED FROM HERE BY THE RECONFIGURE LADDER, AND THAT IS A FIX.
+	//
+	// enabled, diagnostics, hdr_codec, shader_hash, srv_depth/velocity/colour, uav_output,
+	// populate_parameters and require_trampoline used to be copied out of g_cfg by the DllMain
+	// hook. Every one of them is now LIVE, which means begin_pass writes it on a RECORDING thread
+	// while this hook runs on the PRESENT thread - the exact data race the on_present hook at
+	// stray_dlssnr.cpp:4539-4555 was written to remove for history_restore and copy_back. The
+	// overlay reads its own atomics for all eleven instead, which are authoritative anyway: they
+	// are what g_cfg is written FROM.
+	//
+	// What is left is the load-only remainder, and each one is load-only for a reason that is
+	// still true: app_id has no live control at all (see the header), ini_found is a statement
+	// about a file read once, and the rest are facts about the snippet rather than settings.
 	uint64_t app_id = 0;
 	bool     ini_found = false;
 
@@ -407,29 +573,70 @@ inline std::atomic<bool> &seeded()
 
 inline void bump(uint32_t kind);   // fwd
 
+// ---------------------------------------------------------------------------------------------
+// THE OWNED-FIELD LIST, WRITTEN ONCE.
+//
+// Four callers need it - seeding from the ini, the Save button's baseline update, dirty(), and
+// "Revert to stray_dlssnr.ini" - and before the reconfigure ladder each of them carried its own
+// copy of a sixteen-line block. A key added to three of the four is a Save button that never
+// lights up for it, or a Revert that leaves it behind: a silent, per-key failure with no
+// diagnostic. With the list at thirty-three keys that stopped being a theoretical risk, so it is
+// spelled out in exactly one place and the four callers share it.
+//
+// app_id is deliberately absent from all of this. It is the one setting with no live control -
+// see the header - so the overlay neither owns it nor writes it, and the ini keeps whatever the
+// user put there.
+// ---------------------------------------------------------------------------------------------
+#define OVERLAY_OWNED_FIELDS(X) \
+	X(copy_back) X(history_restore) X(restore_graphics_root) \
+	X(paper_white_scale) X(transfer_strength) X(color_strength) \
+	X(depth_inverted) X(mvec_scale_x) X(mvec_scale_y) \
+	X(intensity) X(local_tone_strength) X(local_structure_strength) \
+	X(skin_structure_strength) X(style) X(use_auto_mask) X(ui_correction) \
+	X(enabled) X(diagnostics) X(hdr_codec) \
+	X(shader_hash) X(srv_depth) X(srv_velocity) X(srv_colour) X(uav_output) \
+	X(mvec_decode) X(mvec_reconstruct) X(mvec_dilate) \
+	X(mvec_clip_row) X(mvec_clip_transpose) \
+	X(populate_parameters) X(require_trampoline) \
+	X(rt_census) X(rt_census_frames)
+
+inline void live_to_config(const live_block &l, cfg::config &c)
+{
+#define X(f) c.f = l.f.load(std::memory_order_relaxed);
+	OVERLAY_OWNED_FIELDS(X)
+#undef X
+}
+
+inline void config_to_live(const cfg::config &c, live_block &l)
+{
+#define X(f) l.f.store(c.f, std::memory_order_relaxed);
+	OVERLAY_OWNED_FIELDS(X)
+#undef X
+}
+
+inline bool same_owned(const cfg::config &a, const cfg::config &b)
+{
+	bool eq = true;
+#define X(f) eq = eq && (a.f == b.f);
+	OVERLAY_OWNED_FIELDS(X)
+#undef X
+	return eq;
+}
+
 /// Copy the live half of a freshly loaded config into the atomics. Called ONCE, on the main
 /// thread, from nr_init_device immediately after cfg::load - before any dispatch and before any
 /// overlay draw, so no reader can observe the half-seeded state.
 inline void seed_from_config(const cfg::config &c, const std::wstring &directory)
 {
 	live_block &l = live();
-	l.copy_back.store(c.copy_back, std::memory_order_relaxed);
-	l.history_restore.store(c.history_restore, std::memory_order_relaxed);
-	l.restore_graphics_root.store(c.restore_graphics_root, std::memory_order_relaxed);
-	l.paper_white_scale.store(c.paper_white_scale, std::memory_order_relaxed);
-	l.transfer_strength.store(c.transfer_strength, std::memory_order_relaxed);
-	l.color_strength.store(c.color_strength, std::memory_order_relaxed);
-	l.depth_inverted.store(c.depth_inverted, std::memory_order_relaxed);
-	l.mvec_scale_x.store(c.mvec_scale_x, std::memory_order_relaxed);
-	l.mvec_scale_y.store(c.mvec_scale_y, std::memory_order_relaxed);
-	l.intensity.store(c.intensity, std::memory_order_relaxed);
-	l.local_tone_strength.store(c.local_tone_strength, std::memory_order_relaxed);
-	l.local_structure_strength.store(c.local_structure_strength, std::memory_order_relaxed);
-	l.skin_structure_strength.store(c.skin_structure_strength, std::memory_order_relaxed);
-	l.style.store(c.style, std::memory_order_relaxed);
-	l.use_auto_mask.store(c.use_auto_mask, std::memory_order_relaxed);
-	l.ui_correction.store(c.ui_correction, std::memory_order_relaxed);
+	config_to_live(c, l);
 	l.bypass.store(false, std::memory_order_relaxed);
+
+	// Seeding is NOT a user edit, so no action bit is raised here: the shipping startup path
+	// already builds the codec and mvec pipelines from these same values, and asking the service
+	// to redo it would tear down a feature that has only just been created.
+	l.action_bits.store(0u, std::memory_order_relaxed);
+	l.action_why.store(nullptr, std::memory_order_relaxed);
 
 	baseline() = c;
 	ini_dir() = directory;
@@ -438,28 +645,33 @@ inline void seed_from_config(const cfg::config &c, const std::wstring &directory
 }
 
 // ---------------------------------------------------------------------------------------------
-// THE ONE RENDER-THREAD HOOK.
+// THE RENDER-THREAD HOOK. R0 through R3.
 //
 // Called from nr_try_run immediately after `std::lock_guard<std::mutex> lock(st->mutex)`
-// (stray_dlssnr.cpp:2201) - so it runs on the recording thread, under the lock that pass already
+// (stray_dlssnr.cpp:2744) - so it runs on the recording thread, under the lock that pass already
 // holds, with nothing else able to observe g_cfg mid-write on that device.
 //
 // Returns FALSE to skip the pass. Every early return in nr_try_run leaves 'issued' false, which
-// leaves ReShade to issue the game's own Dispatch - i.e. a strict no-op (:2135-2136). The caller
-// must use a plain `return`, NOT NR_BAIL: NR_BAIL's one-shot latch (:1376-1380) would burn itself
-// on the first toggle and never speak again.
+// leaves ReShade to issue the game's own Dispatch - i.e. a strict no-op. The caller must use a
+// plain `return`, NOT NR_BAIL: NR_BAIL's one-shot latch would burn itself on the first toggle and
+// never speak again.
 //
-// WHY WRITING g_cfg IS THE RIGHT SHAPE HERE. The alternative - replacing ~30 g_cfg reads across
-// nr_try_run with atomic loads - is a far larger edit to a file another agent is editing, and it
-// would make each of the multi-read sites in rule 3 a fresh chance to get the snapshot wrong. One
-// assignment block at the top of the pass fixes every one of them at once and leaves the reads
-// alone. The cost is one documented writer of g_cfg; see the note on the census line below.
+// WHY WRITING g_cfg IS THE RIGHT SHAPE HERE. The alternative - replacing ~100 g_cfg reads across
+// nr_try_run with atomic loads - would make each of the multi-read sites in rule 3 a fresh chance
+// to get the snapshot wrong. One assignment block at the top of the pass fixes every one of them
+// at once and leaves the reads alone. The four keys that CANNOT come through here - shader_hash,
+// diagnostics, and the two mvec flags the main-thread census reads - are listed in the header and
+// each has its own accessor below.
+//
+// THE ACTIONS ARE NOT HERE. R4 and R5 idle the GPU queue, destroy resources and LoadLibrary a
+// 166 MB module; none of that may happen on a recording thread. They are serviced from
+// on_present by nr_service_reconfigure, which reads take_reconfigure() below. This function only
+// ever writes memory it was handed.
 // ---------------------------------------------------------------------------------------------
 inline bool begin_pass(cfg::config &c,
+                       seen_epochs &seen,
                        bool &need_reset,
                        uint64_t &pending_res,
-                       bool &pending_teardown,
-                       bool &feature_failed,
                        bool codec_pipelines_ok,
                        bool codec_failed,
                        bool orig_ok)
@@ -480,52 +692,38 @@ inline bool begin_pass(cfg::config &c,
 	// is not otherwise used - the snapshot is unconditional - so it is discarded deliberately
 	// rather than kept in a variable nothing compares.
 	(void)l.epoch.load(std::memory_order_acquire);
-	const uint32_t reset_e  = l.reset_epoch.load(std::memory_order_relaxed);
-	const uint32_t flush_e  = l.flush_epoch.load(std::memory_order_relaxed);
-	const uint32_t tear_e   = l.teardown_epoch.load(std::memory_order_relaxed);
+	const uint32_t reset_e = l.reset_epoch.load(std::memory_order_relaxed);
+	const uint32_t flush_e = l.flush_epoch.load(std::memory_order_relaxed);
+	const uint32_t ident_e = l.ident_epoch.load(std::memory_order_relaxed);
 
-	// FUNCTION-LOCAL, therefore PROCESS-WIDE rather than per-device. With two D3D12 devices the
-	// edge for a given change would be consumed by whichever device's pass ran first, and the
-	// other would miss its reset frame. Making it per-device means putting these in nr_state, i.e.
-	// more edits to a file this work is deliberately keeping out of. STRAY is single-device and
-	// this add-on's whole identification path assumes one device already; recorded here rather
-	// than glossed over. The SNAPSHOT above is unconditional and so is unaffected either way.
-	static uint32_t s_seen_reset = 0, s_seen_flush = 0, s_seen_tear = 0;
-	static bool     s_first = true;
-	if (s_first)
+	if (seen.first)
 	{
 		// Adopt the current epochs on the very first pass rather than treating "the overlay has
 		// been seeded" as a user edit; a reset frame on the first evaluate is initialisation
 		// anyway, and pending_res is 0 there.
-		s_seen_reset = reset_e; s_seen_flush = flush_e; s_seen_tear = tear_e;
-		s_first = false;
+		seen.reset = reset_e; seen.flush = flush_e; seen.ident = ident_e;
+		seen.first = false;
 	}
 
-	// ---- the Reset NR feature button ---------------------------------------------------------
-	// Deferred, exactly like a resolution change: pending_teardown is serviced from on_present ->
-	// nr_service_pending_teardown (:3428-3464), which takes st->mutex on the MAIN thread, idles
-	// the queue (:1586-1588) and releases the feature, every view and every texture (:1606-1615).
-	// A recording thread must not do any of that itself. feature_failed is cleared here because a
-	// latched failure is the main reason to press the button at all.
-	if (tear_e != s_seen_tear)
+	// ---- THE REBUILD GATE ----------------------------------------------------------------------
+	// BEFORE the snapshot, and before anything is written to the caller's state. While a rebuild is
+	// outstanding this pass must not run at all: the values are new and the textures are still the
+	// old ones, which for hdr_codec is the difference between "a hitch" and "a silently skipped
+	// copy-back". See status_block::serviced_rebuild_epoch for the full argument.
+	//
+	// pending_res is dropped on the way out for the same reason every other skip drops it: the arm
+	// names a raw resource address, and the resource it names is about to be destroyed.
+	if (l.rebuild_epoch.load(std::memory_order_relaxed) !=
+	    s.serviced_rebuild_epoch.load(std::memory_order_acquire))
 	{
-		s_seen_tear = tear_e;
-		s_seen_reset = reset_e; s_seen_flush = flush_e;
-		pending_teardown = true;
-		feature_failed   = false;
-		pending_res      = 0;
-		need_reset       = true;
-		s.teardown_ms.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_relaxed);
-		OVERLAY_LOG_ONCE(reshade::log::level::info,
-			"DLSS-NR overlay: feature reset requested. The NGX feature and every texture will be "
-			"released on the next present and rebuilt on the following dispatch. This message is "
-			"printed once.");
+		pending_res = 0;
+		need_reset  = true;
 		return false;
 	}
 
 	// ---- THE SNAPSHOT ------------------------------------------------------------------------
 	// Unconditional, not gated on the epoch: it is what makes every read inside this pass
-	// coherent, and it is a dozen relaxed loads and stores once a frame.
+	// coherent, and it is a few dozen relaxed loads and stores once a frame.
 	c.copy_back                = l.copy_back.load(std::memory_order_relaxed);
 	c.history_restore          = l.history_restore.load(std::memory_order_relaxed);
 	c.restore_graphics_root    = l.restore_graphics_root.load(std::memory_order_relaxed);
@@ -542,34 +740,202 @@ inline bool begin_pass(cfg::config &c,
 	c.style                    = l.style.load(std::memory_order_relaxed);
 	c.use_auto_mask            = l.use_auto_mask.load(std::memory_order_relaxed);
 	c.ui_correction            = l.ui_correction.load(std::memory_order_relaxed);
+	// ---- newly live. Every read site of each of these is downstream of this call.
+	c.srv_depth                = l.srv_depth.load(std::memory_order_relaxed);
+	c.srv_velocity             = l.srv_velocity.load(std::memory_order_relaxed);
+	c.srv_colour               = l.srv_colour.load(std::memory_order_relaxed);
+	c.uav_output               = l.uav_output.load(std::memory_order_relaxed);
+	c.hdr_codec                = l.hdr_codec.load(std::memory_order_relaxed);
+	c.mvec_decode              = l.mvec_decode.load(std::memory_order_relaxed);
+	c.mvec_reconstruct         = l.mvec_reconstruct.load(std::memory_order_relaxed);
+	c.mvec_dilate              = l.mvec_dilate.load(std::memory_order_relaxed);
+	c.mvec_clip_transpose      = l.mvec_clip_transpose.load(std::memory_order_relaxed);
+	c.mvec_clip_row            = l.mvec_clip_row.load(std::memory_order_relaxed);
+	// shader_hash is DELIBERATELY ABSENT from this list. Its read site runs before this function
+	// does; read_ident() serves it instead. Writing it here would be worse than useless - it
+	// would look correct to a reader and reach nothing.
 
 	// ---- consequences ------------------------------------------------------------------------
-	if (flush_e != s_seen_flush)
+	// Strictly nesting, strongest first. R3 implies R2 implies R1, so one `else if` chain is
+	// exactly right and a change that bumps several of them is serviced once.
+	if (ident_e != seen.ident)
 	{
-		s_seen_flush = flush_e;
-		s_seen_reset = reset_e;
+		seen.ident = ident_e;
+		seen.flush = flush_e;
+		seen.reset = reset_e;
+		// The identification changed, so an arm made under the OLD srv_colour must not be
+		// consumed under the new one. That is precisely the "last frame's image on this frame's
+		// scene-colour input" hazard the restore path already refuses by name at :3249-3260.
+		pending_res = 0;
+		need_reset  = true;
+	}
+	else if (flush_e != seen.flush)
+	{
+		seen.flush = flush_e;
+		seen.reset = reset_e;
 		// See the header: pending_res is a raw resource ADDRESS held across a frame, and
-		// :2531-2534 documents that UE 4.27 can recycle it. Never let one survive a toggle of the
+		// :3206-3210 documents that UE 4.27 can recycle it. Never let one survive a toggle of the
 		// thing that armed it.
 		pending_res = 0;
 		need_reset  = true;
 	}
-	else if (reset_e != s_seen_reset)
+	else if (reset_e != seen.reset)
 	{
-		s_seen_reset = reset_e;
-		need_reset   = true;
+		seen.reset = reset_e;
+		need_reset = true;
 	}
 
-	// ---- the master bypass -------------------------------------------------------------------
+	// ---- the two switches ---------------------------------------------------------------------
 	// AFTER the snapshot, so g_cfg is coherent whether or not we run, and after the flush, so
-	// both edges of the toggle drop any pending pristine copy.
-	if (l.bypass.load(std::memory_order_relaxed))
+	// every edge of either toggle drops any pending pristine copy.
+	//
+	// `enabled` IS TESTED HERE RATHER THAN BY TEARING NGX DOWN, and that is a deliberate,
+	// evidence-driven choice. Turning it off could instead have cleared g_nr_armed - but then
+	// turning it back on would re-run nr_lazy_ngx_init and call NVSDK_NGX_D3D12_Init_Ext A SECOND
+	// TIME in the session, and the only thing this project has measured about Init_Ext's
+	// fragility is that it HANGS when called at a moment the snippet does not tolerate
+	// (stray_dlssnr.cpp:4049-4056). A hang is not a failure that degrades. So OFF releases the
+	// feature and every texture - which is where the VRAM actually is - and stops the pass here,
+	// while NGX itself stays initialised; ON simply lets the pass through again and the existing
+	// nr_ensure_* path rebuilds everything on the next dispatch. Both directions are live, and no
+	// second Init_Ext is ever needed. The tooltip says exactly this.
+	if (!l.enabled.load(std::memory_order_relaxed) || l.bypass.load(std::memory_order_relaxed))
 	{
 		pending_res = 0;
 		return false;
 	}
 
 	return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE IDENTIFICATION READ. R3's render-path half.
+//
+// stray_dlssnr.cpp memoises "is cs->pso the shader the ini pinned?" per pipeline state object
+// (:2708-2727). That memo is cleared unconditionally on every SetPipelineState (:912-913) and by
+// cmd_shadow::reset, so its staleness window is bounded by the dispatches left in one command
+// list after its last SetPipelineState - narrower than the old ledger claimed, but real, and
+// NON-DETERMINISTIC across concurrently recording threads. An epoch beside the memo is what
+// invalidates it on EVERY command list rather than on the next one: a single atomic that each
+// recording thread reads for itself.
+//
+// Cost on the hot path: one relaxed load and one 32-bit compare, next to a pointer compare that
+// already runs on every dispatch of every command list.
+// ---------------------------------------------------------------------------------------------
+struct ident_view
+{
+	uint32_t epoch = 0;
+	uint64_t shader_hash = 0;
+};
+
+inline ident_view read_ident()
+{
+	const live_block &l = live();
+	ident_view v;
+	// ACQUIRE first, then the value, exactly as begin_pass does: bump(k_ident) stores the hash
+	// relaxed and then releases the epoch, so acquiring here is what makes the pair visible.
+	v.epoch       = l.ident_epoch.load(std::memory_order_acquire);
+	v.shader_hash = l.shader_hash.load(std::memory_order_relaxed);
+	return v;
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE SERVICE-SIDE READ. R3 through R5, consumed on the PRESENT thread.
+//
+// Called from nr_service_reconfigure, which holds st->mutex and nothing else. It is a separate
+// consumer from begin_pass with its own seen-epoch state, and that is load-bearing rather than
+// tidy: with enabled=0, or with the feature wedged, or with the master bypass on, begin_pass may
+// never run at all - and those are exactly the cases where a reconfigure most needs to land.
+// ---------------------------------------------------------------------------------------------
+struct reconfig_request
+{
+	uint32_t    bits = 0;          // a_* above; zero means "nothing to do"
+	const char *why  = nullptr;    // a string literal naming the key that asked
+	bool        ident_changed = false;
+	// The rebuild epoch this request was taken AT. Published back through
+	// publish_serviced_rebuild once the work is done, so the render thread's gate opens on the
+	// value that was actually serviced rather than on a re-read that may have moved again while
+	// the service was releasing textures.
+	uint32_t    rebuild_epoch = 0;
+};
+
+inline reconfig_request take_reconfigure(seen_epochs &seen)
+{
+	live_block &l = live();
+	reconfig_request r;
+
+	// ACQUIRE, and first. Pairs with the RELEASE in bump()/request().
+	const uint32_t ident_e   = l.ident_epoch.load(std::memory_order_acquire);
+	const uint32_t rebuild_e = l.rebuild_epoch.load(std::memory_order_relaxed);
+
+	if (seen.first)
+	{
+		seen.ident = ident_e; seen.rebuild = rebuild_e;
+		seen.reset = l.reset_epoch.load(std::memory_order_relaxed);
+		seen.flush = l.flush_epoch.load(std::memory_order_relaxed);
+		seen.first = false;
+		// Still drain any bits that were requested before the first present, so a reconfigure
+		// asked for during start-up is not silently swallowed by the adoption above.
+	}
+
+	if (ident_e != seen.ident)
+	{
+		seen.ident = ident_e;
+		r.ident_changed = true;
+	}
+	r.rebuild_epoch = rebuild_e;
+	if (rebuild_e != seen.rebuild)
+	{
+		seen.rebuild = rebuild_e;
+		r.bits |= a_teardown;
+	}
+
+	// WHY FIRST, THEN THE BITS, and the order is the opposite of the writer's on purpose.
+	// request() stores the name and then ORs the bits; reading in the same order could hand back a
+	// name whose bits have not arrived yet. Reading the name first can only hand back the name of
+	// an EARLIER request - one whose bits the fetch_and below therefore definitely includes. So
+	// the name always belongs to something that is actually being applied.
+	r.why = l.action_why.load(std::memory_order_relaxed);
+	// fetch_and(0) with ACQUIRE: takes every bit that has been ORed in since the last service
+	// pass and leaves the word empty for the next batch. Nothing else ever clears it.
+	r.bits |= l.action_bits.fetch_and(0u, std::memory_order_acquire);
+	return r;
+}
+
+/// Published by the service when a reconfigure finishes, succeeds or fails. `what` must be a
+/// string literal. ok=false means the previous working state is still running.
+inline void publish_reconfigure(bool ok, const char *what)
+{
+	status_block &s = status();
+	s.reconfig_what.store(what, std::memory_order_relaxed);
+	s.reconfig_ok.store(ok, std::memory_order_relaxed);
+	s.reconfig_ms.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_relaxed);
+}
+
+/// True while the service still has outstanding work. Drives the REBUILDING rung.
+inline void publish_reconfig_pending(bool pending)
+{
+	status().reconfig_pending.store(pending, std::memory_order_relaxed);
+}
+
+/// Stamped by the service when it has actually released the feature and the textures. Keeps
+/// teardown_ms meaning what its own comment says it means now that the Reset button no longer
+/// goes through begin_pass - and it is what keeps REBUILDING on screen long enough to read.
+/// reconfig_pending alone would flash for a single frame, because the service finishes the
+/// release in one present and the rebuild then happens on the next dispatch; the three-second
+/// window off this timestamp is what covers that gap, and publish_evaluate clears it the moment
+/// an evaluate succeeds, so it can never be a stale positive.
+inline void publish_teardown()
+{
+	status().teardown_ms.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_relaxed);
+}
+
+/// Opens the render thread's rebuild gate. RELEASE, and it must be the LAST thing the service
+/// does with that reconfigure: it is what tells the recording thread the textures it is about to
+/// create can be created against the new settings.
+inline void publish_serviced_rebuild(uint32_t epoch)
+{
+	status().serviced_rebuild_epoch.store(epoch, std::memory_order_release);
 }
 
 /// Called from nr_try_run immediately after EvaluateFeature. Publishes everything the status
@@ -625,6 +991,26 @@ inline void publish_evaluate(uint32_t ngx_result, const char *ngx_result_name, b
 /// cross-thread reader of a snapshot-written field anywhere in the add-on.
 inline bool live_copy_back()       { return live().copy_back.load(std::memory_order_relaxed); }
 inline bool live_history_restore() { return live().history_restore.load(std::memory_order_relaxed); }
+/// Same rule, same reason, for the mvec census line at stray_dlssnr.cpp:4564/:4572. :4564 is the
+/// GATE for that line, so a racy read there is worse than a racy argument: it can admit a line
+/// that then reports the opposite state.
+inline bool live_mvec_decode()      { return live().mvec_decode.load(std::memory_order_relaxed); }
+inline bool live_mvec_reconstruct() { return live().mvec_reconstruct.load(std::memory_order_relaxed); }
+/// THE ONE THAT CAN NEVER GO THROUGH g_cfg AT ALL. g_cfg.diagnostics was read at :4425 (on_draw),
+/// :4430 (on_draw_indexed) and :4449 (on_dispatch) - every draw and every dispatch in the
+/// process, on arbitrary recording threads, with no lock and outside the accepted-pass snapshot.
+/// One relaxed atomic load at each of those three sites makes it live at zero risk, which is why
+/// the old ledger's "threads this overlay must not race with" was a reason to use an atomic and
+/// not a reason to grey the control out.
+inline bool live_diagnostics()      { return live().diagnostics.load(std::memory_order_relaxed); }
+/// Read by nr_init_device in place of g_cfg.enabled, so that the ini's master switch has exactly
+/// ONE reader and the overlay's copy is authoritative for both the UI and the arm decision.
+inline bool live_enabled()          { return live().enabled.load(std::memory_order_relaxed); }
+inline bool live_hdr_codec()        { return live().hdr_codec.load(std::memory_order_relaxed); }
+inline bool live_require_trampoline() { return live().require_trampoline.load(std::memory_order_relaxed); }
+inline bool live_populate_parameters() { return live().populate_parameters.load(std::memory_order_relaxed); }
+inline bool     live_rt_census()        { return live().rt_census.load(std::memory_order_relaxed); }
+inline uint32_t live_rt_census_frames() { return live().rt_census_frames.load(std::memory_order_relaxed); }
 
 // =============================================================================================
 // PERSISTENCE
@@ -682,6 +1068,30 @@ inline bool owned_value(const std::string &key_lower, const live_block &l, std::
 	if (key_lower == "skin_structure_strength")  { fmt_float(buf, sizeof(buf), l.skin_structure_strength.load(std::memory_order_relaxed)); out = buf; return true; }
 	if (key_lower == "style")                    { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.style.load(std::memory_order_relaxed)); out = buf; return true; }
 	if (key_lower == "ui_correction")            { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.ui_correction.load(std::memory_order_relaxed)); out = buf; return true; }
+	// ---- the keys that became live controls with the reconfigure ladder. They are round-tripped
+	// now for the reason the ladder exists at all: a control that applies live but silently
+	// forgets on relaunch is still a control that lies, just more slowly. app_id is the one
+	// setting deliberately still NOT owned - see the header, and draw_load_only.
+	if (key_lower == "enabled")                  { out = l.enabled.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "diagnostics")              { out = l.diagnostics.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "hdr_codec")                { out = l.hdr_codec.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "mvec_decode")              { out = l.mvec_decode.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "mvec_reconstruct")         { out = l.mvec_reconstruct.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "mvec_dilate")              { out = l.mvec_dilate.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "mvec_clip_transpose")      { out = l.mvec_clip_transpose.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "populate_parameters")      { out = l.populate_parameters.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "require_trampoline")       { out = l.require_trampoline.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "rt_census")                { out = l.rt_census.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "rt_census_frames")         { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.rt_census_frames.load(std::memory_order_relaxed)); out = buf; return true; }
+	if (key_lower == "mvec_clip_row")            { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.mvec_clip_row.load(std::memory_order_relaxed)); out = buf; return true; }
+	if (key_lower == "srv_depth")                { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.srv_depth.load(std::memory_order_relaxed)); out = buf; return true; }
+	if (key_lower == "srv_velocity")             { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.srv_velocity.load(std::memory_order_relaxed)); out = buf; return true; }
+	if (key_lower == "srv_colour" ||
+	    key_lower == "srv_color")                { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.srv_colour.load(std::memory_order_relaxed)); out = buf; return true; }
+	if (key_lower == "uav_output")               { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.uav_output.load(std::memory_order_relaxed)); out = buf; return true; }
+	// Hex, zero-padded to 16, which is how every shader hash in this tree's logs, its README and
+	// its shipped ini is written. A decimal here would round-trip correctly and be unreadable.
+	if (key_lower == "shader_hash")              { std::snprintf(buf, sizeof(buf), "0x%016llx", (unsigned long long)l.shader_hash.load(std::memory_order_relaxed)); out = buf; return true; }
 	return false;
 }
 
@@ -694,6 +1104,13 @@ inline const char *const *owned_keys(size_t &n)
 		"depth_inverted", "mvec_scale_x", "mvec_scale_y",
 		"intensity", "local_tone_strength", "local_structure_strength",
 		"skin_structure_strength", "style", "use_auto_mask", "ui_correction",
+		// The reconfigure ladder's keys.
+		"enabled", "diagnostics", "hdr_codec",
+		"shader_hash", "srv_depth", "srv_velocity", "srv_colour", "uav_output",
+		"mvec_decode", "mvec_reconstruct", "mvec_dilate",
+		"mvec_clip_row", "mvec_clip_transpose",
+		"populate_parameters", "require_trampoline",
+		"rt_census", "rt_census_frames",
 	};
 	n = sizeof(keys) / sizeof(keys[0]);
 	return keys;
@@ -822,9 +1239,14 @@ inline bool save_ini(std::string &err)
 
 			for (size_t i = 0; i < n_keys; ++i)
 			{
-				// color_strength / colour_strength are the same setting; the canonical key is
-				// "color_strength" and either spelling in the file counts as written.
-				const std::string canon = (kl == "colour_strength") ? std::string("color_strength") : kl;
+				// The two alias pairs cfg::load accepts. Either spelling in the file counts as
+				// the canonical key having been written; without this the append block below would
+				// add a SECOND line in the other spelling, and cfg::load takes the last one - so the
+				// user's own line would silently stop being the one that counts.
+				const std::string canon =
+					  (kl == "colour_strength") ? std::string("color_strength")
+					: (kl == "srv_color")       ? std::string("srv_colour")
+					: kl;
 				if (canon == keys[i]) { written[i] = true; break; }
 			}
 		}
@@ -901,23 +1323,7 @@ inline bool save_ini(std::string &err)
 	}
 
 	// The file now IS the live state, so nothing is dirty any more.
-	cfg::config &b = baseline();
-	b.copy_back                = l.copy_back.load(std::memory_order_relaxed);
-	b.history_restore          = l.history_restore.load(std::memory_order_relaxed);
-	b.restore_graphics_root    = l.restore_graphics_root.load(std::memory_order_relaxed);
-	b.paper_white_scale        = l.paper_white_scale.load(std::memory_order_relaxed);
-	b.transfer_strength        = l.transfer_strength.load(std::memory_order_relaxed);
-	b.color_strength           = l.color_strength.load(std::memory_order_relaxed);
-	b.depth_inverted           = l.depth_inverted.load(std::memory_order_relaxed);
-	b.mvec_scale_x             = l.mvec_scale_x.load(std::memory_order_relaxed);
-	b.mvec_scale_y             = l.mvec_scale_y.load(std::memory_order_relaxed);
-	b.intensity                = l.intensity.load(std::memory_order_relaxed);
-	b.local_tone_strength      = l.local_tone_strength.load(std::memory_order_relaxed);
-	b.local_structure_strength = l.local_structure_strength.load(std::memory_order_relaxed);
-	b.skin_structure_strength  = l.skin_structure_strength.load(std::memory_order_relaxed);
-	b.style                    = l.style.load(std::memory_order_relaxed);
-	b.use_auto_mask            = l.use_auto_mask.load(std::memory_order_relaxed);
-	b.ui_correction            = l.ui_correction.load(std::memory_order_relaxed);
+	live_to_config(l, baseline());
 
 	logf(reshade::log::level::info, "DLSS-NR overlay: saved %zu setting(s) to stray_dlssnr.ini "
 	     "(rewritten in place; comments, ordering and every key the overlay does not own were preserved).", n_keys);
@@ -926,24 +1332,11 @@ inline bool save_ini(std::string &err)
 
 inline bool dirty()
 {
-	const live_block &l = live();
-	const cfg::config &b = baseline();
-	return l.copy_back.load(std::memory_order_relaxed)                != b.copy_back
-	    || l.history_restore.load(std::memory_order_relaxed)          != b.history_restore
-	    || l.restore_graphics_root.load(std::memory_order_relaxed)    != b.restore_graphics_root
-	    || l.paper_white_scale.load(std::memory_order_relaxed)        != b.paper_white_scale
-	    || l.transfer_strength.load(std::memory_order_relaxed)        != b.transfer_strength
-	    || l.color_strength.load(std::memory_order_relaxed)           != b.color_strength
-	    || l.depth_inverted.load(std::memory_order_relaxed)           != b.depth_inverted
-	    || l.mvec_scale_x.load(std::memory_order_relaxed)             != b.mvec_scale_x
-	    || l.mvec_scale_y.load(std::memory_order_relaxed)             != b.mvec_scale_y
-	    || l.intensity.load(std::memory_order_relaxed)                != b.intensity
-	    || l.local_tone_strength.load(std::memory_order_relaxed)      != b.local_tone_strength
-	    || l.local_structure_strength.load(std::memory_order_relaxed) != b.local_structure_strength
-	    || l.skin_structure_strength.load(std::memory_order_relaxed)  != b.skin_structure_strength
-	    || l.style.load(std::memory_order_relaxed)                    != b.style
-	    || l.use_auto_mask.load(std::memory_order_relaxed)            != b.use_auto_mask
-	    || l.ui_correction.load(std::memory_order_relaxed)            != b.ui_correction;
+	// Start from the baseline so the fields the overlay does NOT own - app_id, ini_found, ini_path
+	// - are equal by construction and only the owned ones can make this true.
+	cfg::config now = baseline();
+	live_to_config(live(), now);
+	return !same_owned(now, baseline());
 }
 
 // =============================================================================================
@@ -1075,16 +1468,45 @@ inline bool listed_as_disabled(reshade::api::effect_runtime *rt, const char *add
 // ui_correction) is k_plain: nr_try_run rewrites all of them from g_cfg on EVERY accepted
 // dispatch, so they need no machinery at all. That is exactly the split this file's header
 // comment describes under "LIVE, FREE" and "LIVE + ONE RESET", and the code now matches it.
-enum : uint32_t { k_plain = 0, k_reset = 1, k_flush = 2 };
+//
+// THE RUNGS NEST. k_rebuild implies k_ident implies k_flush implies k_reset, and bump() raises
+// every epoch at or below the rung it is given. That is what lets each consumer test exactly one
+// thing: begin_pass takes the strongest rung it sees and does its consequence once, and the
+// service sees the rebuild edge without having to know that a rebuild also invalidates the
+// identification and the armed pristine copy.
+enum : uint32_t { k_plain = 0, k_reset = 1, k_flush = 2, k_ident = 3, k_rebuild = 4 };
 
 inline void bump(uint32_t kind)
 {
 	live_block &l = live();
-	if (kind == k_flush)      l.flush_epoch.fetch_add(1, std::memory_order_relaxed);
-	else if (kind == k_reset) l.reset_epoch.fetch_add(1, std::memory_order_relaxed);
-	// RELEASE last, and it is the only ordering edge in the design: begin_pass loads this with
-	// ACQUIRE before reading any value, so everything stored above is visible to it.
+	if (kind >= k_rebuild) l.rebuild_epoch.fetch_add(1, std::memory_order_relaxed);
+	if (kind >= k_ident)   l.ident_epoch.fetch_add(1, std::memory_order_relaxed);
+	if (kind >= k_flush)   l.flush_epoch.fetch_add(1, std::memory_order_relaxed);
+	if (kind >= k_reset)   l.reset_epoch.fetch_add(1, std::memory_order_relaxed);
+	// RELEASE last, and it is the only ordering edge in the design: every consumer loads an epoch
+	// with ACQUIRE before reading any value, so everything stored above is visible to it.
 	l.epoch.fetch_add(1, std::memory_order_release);
+}
+
+/// Ask the present-thread service for one or more R5 actions, naming the key that asked.
+/// `why` MUST be a string literal - it crosses the thread boundary as a bare pointer and is read
+/// later by the log line and the status block.
+///
+/// The bits are OR-MERGED, never assigned: two requests landing in the same frame must both be
+/// serviced, and nr_ensure_output raises a_teardown of its own accord on a resolution change.
+inline void request(uint32_t bits, const char *why, uint32_t rung = k_plain)
+{
+	live_block &l = live();
+	// Only claim authorship when this change actually needs the service or a rung above R0. Some
+	// tier-0 controls route through here for uniformity - `diagnostics` is one - and letting one
+	// of those overwrite the name of a heavier change that is still queued would make the
+	// reconfigure log line credit the wrong key, which is the sort of small lie that costs an
+	// afternoon. Two HEAVY changes in one frame still name the later one; both are applied, and
+	// the log says so by listing the tiers it climbed.
+	if (bits != 0u || rung != k_plain)
+		l.action_why.store(why, std::memory_order_relaxed);
+	l.action_bits.fetch_or(bits, std::memory_order_release);
+	bump(rung);
 }
 
 namespace col {
@@ -1155,6 +1577,93 @@ inline void combo_u32(const char *label, std::atomic<uint32_t> &a, const char *c
 		ImGui::SetItemTooltip("%s", help);
 }
 
+// ---------------------------------------------------------------------------------------------
+// THE RECONFIGURE WIDGETS.
+//
+// Each of these is a normal control that additionally asks the present-thread service to make
+// reality match the new value. The `why` string is a LITERAL and crosses the thread boundary as a
+// bare pointer - it ends up in the reconfigure log line and in the status block, so it must name
+// the KEY, in the ini's own spelling, and nothing else.
+// ---------------------------------------------------------------------------------------------
+
+/// A checkbox whose change needs the service: it raises action bits as well as a rung.
+inline void checkbox_action(const char *label, std::atomic<bool> &a, uint32_t bits,
+                            const char *why, uint32_t rung, const char *help)
+{
+	bool v = a.load(std::memory_order_relaxed);
+	if (ImGui::Checkbox(label, &v))
+	{
+		a.store(v, std::memory_order_relaxed);
+		request(bits, why, rung);
+	}
+	if (help != nullptr)
+		ImGui::SetItemTooltip("%s", help);
+}
+
+/// An integer pin, as a slider because ImGui::InputInt is NOT on this project's CI-verified safe
+/// list and SliderInt is. Every register this add-on can resolve is inside the range it is given
+/// (descriptor_shadow.hpp: kMaxSrvWalk 64, kMaxUavWalk 16).
+inline void slider_u32(const char *label, std::atomic<uint32_t> &a, int lo, int hi,
+                       uint32_t bits, const char *why, uint32_t rung, const char *help)
+{
+	int v = static_cast<int>(a.load(std::memory_order_relaxed));
+	// A value outside the range is SHOWN rather than clamped away, on the same argument
+	// combo_u32 makes above: the render path uses whatever is in the ini, and a widget that
+	// silently rewrote it would make the panel disagree with what is actually being matched.
+	if (v < lo) v = lo;
+	if (v > hi) v = hi;
+	if (ImGui::SliderInt(label, &v, lo, hi))
+	{
+		a.store(static_cast<uint32_t>(v < 0 ? 0 : v), std::memory_order_relaxed);
+		if (bits != 0 || rung != k_plain)
+			request(bits, why, rung);
+		else
+			bump(k_plain);
+	}
+	if (help != nullptr)
+		ImGui::SetItemTooltip("%s", help);
+}
+
+/// The shader hash, as text. It is a 64-bit hex identifier the user copies out of ReShade.log, so
+/// a slider is the wrong shape and ImGui::InputScalar is not on the safe list either; InputText
+/// plus strtoull is, and it accepts both "0x…" and decimal exactly as the ini parser does.
+///
+/// The buffer is a function-local static because the panel is drawn from one thread only (the
+/// present thread) and there is exactly one of these controls.
+inline void input_hash(std::atomic<uint64_t> &a, const char *why)
+{
+	static char s_buf[32] = {};
+	static bool s_editing = false;
+
+	const uint64_t cur = a.load(std::memory_order_relaxed);
+	if (!s_editing)
+		std::snprintf(s_buf, sizeof(s_buf), "0x%016llx", (unsigned long long)cur);
+
+	ImGui::SetNextItemWidth(200.0f);
+	if (ImGui::InputText("shader_hash", s_buf, sizeof(s_buf), 0, nullptr, nullptr))
+		s_editing = true;
+
+	ImGui::SameLine();
+	if (ImGui::Button("Apply hash"))
+	{
+		char *end = nullptr;
+		const unsigned long long parsed = std::strtoull(s_buf, &end, 0);
+		if (end != s_buf)
+		{
+			a.store(static_cast<uint64_t>(parsed), std::memory_order_relaxed);
+			// k_ident: the per-PSO memo has to be invalidated on EVERY command list, and the
+			// armed pristine copy has to be dropped, before the next dispatch is identified
+			// against the new hash.
+			request(0u, why, k_ident);
+		}
+		s_editing = false;
+	}
+	if (s_editing)
+		overlay_imgui::textf_colored(col::amber,
+			"    typed but not applied - press Apply hash. 0 means \"any shader passing every "
+			"census gate\", which is not recommended.");
+}
+
 /// A read-only line for a setting that exists but cannot be changed at runtime. Greyed rather
 /// than hidden, per the brief: a user must be able to see what the ini said without leaving the
 /// game, and must be able to see WHY it is not editable.
@@ -1163,37 +1672,33 @@ inline void load_only(const char *label, const char *value, const char *why)
 	ImGui::BeginDisabled(true);
 	ImGui::TextUnformatted(label);
 	ImGui::EndDisabled();
+	// THE TOOLTIP IS ON THE DISABLED LABEL DELIBERATELY, and it is the same text as the indented
+	// line below rather than a shorter version of it. A reason that only exists in a header
+	// comment is a reason the user never reads, and the whole point of these two remaining entries
+	// is that the user can tell "this needs a relaunch, and here is the specific line that says
+	// why" from "this add-on is broken", at the moment they reach for the control.
+	if (why != nullptr)
+		ImGui::SetItemTooltip("%s", why);
 	ImGui::SameLine();
 	overlay_imgui::textf_colored(col::dim, "%s", value);
 	if (why != nullptr)
 	{
 		ImGui::Indent();
-		overlay_imgui::textf_colored(col::dim, "load-only: %s", why);
+		overlay_imgui::textf_colored(col::dim, "%s", why);
 		ImGui::Unindent();
 	}
 }
 
 inline void revert_to_baseline()
 {
-	live_block &l = live();
-	const cfg::config &b = baseline();
-	l.copy_back.store(b.copy_back, std::memory_order_relaxed);
-	l.history_restore.store(b.history_restore, std::memory_order_relaxed);
-	l.restore_graphics_root.store(b.restore_graphics_root, std::memory_order_relaxed);
-	l.paper_white_scale.store(b.paper_white_scale, std::memory_order_relaxed);
-	l.transfer_strength.store(b.transfer_strength, std::memory_order_relaxed);
-	l.color_strength.store(b.color_strength, std::memory_order_relaxed);
-	l.depth_inverted.store(b.depth_inverted, std::memory_order_relaxed);
-	l.mvec_scale_x.store(b.mvec_scale_x, std::memory_order_relaxed);
-	l.mvec_scale_y.store(b.mvec_scale_y, std::memory_order_relaxed);
-	l.intensity.store(b.intensity, std::memory_order_relaxed);
-	l.local_tone_strength.store(b.local_tone_strength, std::memory_order_relaxed);
-	l.local_structure_strength.store(b.local_structure_strength, std::memory_order_relaxed);
-	l.skin_structure_strength.store(b.skin_structure_strength, std::memory_order_relaxed);
-	l.style.store(b.style, std::memory_order_relaxed);
-	l.use_auto_mask.store(b.use_auto_mask, std::memory_order_relaxed);
-	l.ui_correction.store(b.ui_correction, std::memory_order_relaxed);
-	bump(k_flush);
+	config_to_live(baseline(), live());
+	// k_rebuild, not k_flush: a Revert can put hdr_codec, mvec_decode, enabled or an
+	// identification pin back, and each of those needs the full ladder to actually take effect.
+	// Raising the strongest rung is correct here even when nothing at that rung moved - one
+	// rebuild costs a couple of frames, and the alternative is a Revert button that silently
+	// restores some settings and not others.
+	request(a_teardown | a_clear_failed | a_clear_clip | a_apply_census | a_reconcile,
+	        "Revert to stray_dlssnr.ini", k_rebuild);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1253,13 +1758,33 @@ inline void draw_status(reshade::api::effect_runtime *rt, const host_facts &f)
 		return;
 	}
 
-	if (!f.enabled_at_load)
+	// A FAILED RECONFIGURE IS SAID FIRST, AND IN RED, ABOVE EVERY OTHER RUNG.
+	//
+	// Requirement: a reconfigure that fails leaves the previous working state, logs why, and the
+	// UI shows it - never a half-applied state. The first two happen in nr_service_reconfigure;
+	// this is the third. It is above the ladder rather than in it because the add-on may well be
+	// EVALUATING perfectly happily on the old settings, and "EVALUATING" on its own would then be
+	// a true headline that answers the wrong question.
+	if (!s.reconfig_ok.load(std::memory_order_relaxed))
+	{
+		const char *what = s.reconfig_what.load(std::memory_order_relaxed);
+		ImGui::PushStyleColor(ImGuiCol_Text, col::red);
+		ImGui::TextWrapped("RECONFIGURE FAILED - %s. The PREVIOUS settings are still running and "
+		                   "nothing is half-applied; ReShade.log has the reason. Change the setting "
+		                   "back, or press \"Reset NR feature\" to try the whole rebuild again.",
+		                   what != nullptr ? what : "see ReShade.log");
+		ImGui::PopStyleColor(1);
+		ImGui::Separator();
+	}
+
+	if (!live_enabled())
 	{
 		overlay_imgui::textf_colored(col::red, "DISABLED - enabled=0 in stray_dlssnr.ini");
 		ImGui::TextWrapped("The add-on is a strict no-op this session: no snippet was loaded and no "
-		                   "resource was created. Set enabled=1 in stray_dlssnr.ini and restart the "
-		                   "game. Nothing in this panel can turn it on now, because there is nothing "
-		                   "loaded to turn on.");
+		                   "resource was created. Tick \"Load the snippet and arm NGX\" below to load "
+		                   "it now, without restarting - that runs exactly the startup path a normal "
+		                   "launch runs, on the present thread. It will stall one frame while a "
+		                   "166 MB module is loaded.");
 		return;
 	}
 	if (!f.snippet_loaded)
@@ -1267,7 +1792,7 @@ inline void draw_status(reshade::api::effect_runtime *rt, const host_facts &f)
 		overlay_imgui::textf_colored(col::red, "WAITING FOR NGX - the snippet is not loaded");
 		ImGui::TextWrapped("%s", f.snippet_reason[0] != '\0' ? f.snippet_reason
 		                        : "nvngx_dlssnr.dll could not be loaded (no reason was recorded).");
-		if (f.require_trampoline && !f.trampoline)
+		if (live_require_trampoline() && !f.trampoline)
 			ImGui::TextWrapped("remix_nvngx.dll is required (require_trampoline=1) and was not found "
 			                   "beside the add-on. Every GATED snippet export would return 0xbad00002 "
 			                   "without it.");
@@ -1293,6 +1818,18 @@ inline void draw_status(reshade::api::effect_runtime *rt, const host_facts &f)
 		ImGui::TextWrapped("The TAA pass is still being identified and the game's own dispatch is "
 		                   "issued untouched. Nothing is denoised and nothing is written back.");
 	}
+	else if (s.reconfig_pending.load(std::memory_order_relaxed))
+	{
+		// Driven by the SERVICE, not by a timestamp: this is set while nr_service_reconfigure still
+		// has outstanding work and cleared when it has none. The old three-second window off
+		// teardown_ms could only ever be a guess, and it guessed wrong in both directions - it
+		// stayed on for three seconds after a rebuild that took one frame, and it went away while a
+		// slow one was still running.
+		const char *what = s.reconfig_what.load(std::memory_order_relaxed);
+		overlay_imgui::textf_colored(col::amber,
+			"REBUILDING - applying \"%s\": the NGX feature and our textures are being released and "
+			"will be recreated on the next dispatch", what != nullptr ? what : "a setting change");
+	}
 	else if (tear_ms != 0 && age_s(tear_ms) < 3.0)
 	{
 		overlay_imgui::textf_colored(col::amber, "REBUILDING - the NGX feature is being released and recreated");
@@ -1303,7 +1840,7 @@ inline void draw_status(reshade::api::effect_runtime *rt, const host_facts &f)
 		ImGui::TextWrapped("NGX is up but no dispatch has matched shader_hash 0x%016llx with the "
 		                   "configured SRV registers. Check the shader identification below, and "
 		                   "ReShade.log for the one-shot \"pass did not run\" line that names the "
-		                   "exact reason.", (unsigned long long)f.shader_hash);
+		                   "exact reason.", (unsigned long long)live().shader_hash.load(std::memory_order_relaxed));
 	}
 	else if (evals == 0)
 	{
@@ -1353,7 +1890,7 @@ inline void draw_status(reshade::api::effect_runtime *rt, const host_facts &f)
 	// This flag is refreshed only when an evaluate happens, so once the pass stops it would keep
 	// claiming RUNNING underneath a NOT EVALUATING headline. Say so instead of contradicting it.
 	const bool codec_fresh   = (eval_ms != 0) && age_s(eval_ms) <= 0.25;
-	if (!f.hdr_codec_at_load)
+	if (!live_hdr_codec())
 		overlay_imgui::textf_colored(col::amber, "HDR codec  OFF (hdr_codec=0) - the network is fed the RAW linear TAA output (README gap 1: the darkening)");
 	else if (codec_running)
 		overlay_imgui::textf_colored(codec_fresh ? col::green : col::dim,
@@ -1387,7 +1924,74 @@ inline void draw_controls(const host_facts &f)
 	// renodx disables NOTHING, so its sliders stay interactive when NGX never loaded and a user
 	// can spend a while tuning something that reaches nothing. That is a defect, not a style
 	// choice, and it is not copied.
-	const bool usable = f.valid && f.enabled_at_load && f.snippet_loaded && f.armed;
+	const bool usable = f.valid && live_enabled() && f.snippet_loaded && f.armed;
+
+	// ---- THE ADD-ON ITSELF ---------------------------------------------------------------------
+	// OUTSIDE the BeginDisabled below, and that is the whole point of it. Everything else greys out
+	// when NGX is not armed; this is the control that ARMS it, so greying it out with the rest
+	// would leave exactly one situation - the one where the ini said enabled=0 - in which the panel
+	// offers no way out and tells the user to restart the game. That was the old behaviour and it
+	// is what this ladder exists to remove.
+	ImGui::SeparatorText("Add-on");
+	{
+		bool on = l.enabled.load(std::memory_order_relaxed);
+		if (ImGui::Checkbox("Load the snippet and arm NGX  (ini: enabled)", &on))
+		{
+			l.enabled.store(on, std::memory_order_relaxed);
+			// a_reconcile does BOTH directions: on, the service runs the shipping startup path -
+			// ngx::load_snippet then g_nr_pending_init, after which the deferred lazy init on the
+			// next dispatch does Init_Ext exactly as it does at every normal launch. Off, it tears
+			// the feature and every texture down so the VRAM goes back.
+			request(a_teardown | a_reconcile, "enabled", k_rebuild);
+		}
+		ImGui::SetItemTooltip(
+			"Live in BOTH directions, and it is the ini's `enabled` key - not the per-dispatch "
+			"bypass below.\n\n"
+			"ON runs the SHIPPING STARTUP PATH, not a new one: ngx::load_snippet, then "
+			"g_nr_pending_init, which the render thread's existing deferred initialiser consumes on "
+			"the next dispatch to call Init_Ext. That is the same two steps every normal launch "
+			"takes. It happens on the PRESENT thread because it LoadLibraryW's a 166 MB module, "
+			"which has no business on a command-list recording thread - so EXPECT ONE STALLED "
+			"FRAME when you tick this.\n\n"
+			"OFF releases the NGX feature, every view and every texture on the next present, so the "
+			"VRAM goes back. The snippet module itself stays loaded: this tree has no in-process "
+			"unload path (stray_dlssnr.cpp:4339-4341 declines to FreeLibrary even at device "
+			"teardown), and unloading a module that may still hold worker threads to save address "
+			"space would be a bad trade. Nothing on the render path reads it once it is off.");
+
+		if (!f.snippet_loaded && f.snippet_reason[0] != '\0')
+		{
+			ImGui::Indent();
+			overlay_imgui::textf_colored(col::dim, "the last load attempt said: %s", f.snippet_reason);
+			ImGui::Unindent();
+		}
+	}
+
+	if (ImGui::Button("Reset NR feature"))
+	{
+		// Through the SERVICE now, not through begin_pass. begin_pass only runs when the pass is
+		// actually being reached - so the old routing meant this button, whose entire purpose is
+		// "something has wedged", did nothing in precisely the case it exists for. The service
+		// runs from on_present unconditionally.
+		request(a_teardown | a_clear_failed | a_clear_clip | a_reconcile,
+		        "Reset NR feature", k_rebuild);
+	}
+	ImGui::SetItemTooltip(
+		"Releases the NGX feature, every view and every texture on the next present (on the main "
+		"thread, after the queue is idle), clears the latched create-failure AND the latched "
+		"View-CB / ClipToPrevClip failures, and rebuilds everything on the following dispatch. "
+		"This is the control to reach for when something has wedged - it is the single most useful "
+		"button in the reference add-on too, and unlike the reference it works even when the pass "
+		"is no longer being reached at all.");
+
+	ImGui::SameLine();
+	ImGui::BeginDisabled(!dirty());
+	if (ImGui::Button("Revert to stray_dlssnr.ini"))
+		revert_to_baseline();
+	ImGui::EndDisabled();
+	ImGui::SetItemTooltip("Puts every control below back to the value that was on disk at load, or "
+	                      "at the last Save, and runs one full rebuild so that the settings which "
+	                      "need one actually take effect. Live, like any other change.");
 
 	ImGui::BeginDisabled(!usable);
 
@@ -1401,34 +2005,16 @@ inline void draw_controls(const host_facts &f)
 			l.bypass.store(!on, std::memory_order_relaxed);
 			// k_flush, both directions: the toggle must not leave a pending pristine copy armed.
 			// st->pending_res is a raw resource address held across a frame and UE 4.27 can
-			// recycle it (stray_dlssnr.cpp:2531-2534).
+			// recycle it (stray_dlssnr.cpp:3206-3210).
 			bump(k_flush);
 		}
 		ImGui::SetItemTooltip(
-			"Live, per dispatch. This is NOT the ini's `enabled` key - that one is read once at load "
-			"(stray_dlssnr.cpp:3179) and a checkbox bound to it would silently do nothing until the "
-			"game was restarted. Off means the add-on identifies the TAA pass and then lets ReShade "
-			"issue the game's own dispatch untouched: a strict no-op, reversible in one click.");
+			"Live, per dispatch, and it is the CHEAP switch: the add-on still identifies the TAA "
+			"pass and then lets ReShade issue the game's own dispatch untouched. A strict no-op, "
+			"reversible in one click, with nothing released and nothing rebuilt.\n\n"
+			"The `enabled` checkbox above is the expensive one - it unloads NGX and gives the VRAM "
+			"back. Both are real and both are live; this is the one to use for an A/B.");
 	}
-
-	if (ImGui::Button("Reset NR feature"))
-	{
-		l.teardown_epoch.fetch_add(1, std::memory_order_relaxed);
-		l.epoch.fetch_add(1, std::memory_order_release);
-	}
-	ImGui::SetItemTooltip(
-		"Releases the NGX feature, every view and every texture on the next present (on the main "
-		"thread, after the queue is idle), clears the latched create-failure, and rebuilds "
-		"everything on the following dispatch. This is the control to reach for when something has "
-		"wedged - it is the single most useful button in the reference add-on too.");
-
-	ImGui::SameLine();
-	ImGui::BeginDisabled(!dirty());
-	if (ImGui::Button("Revert to stray_dlssnr.ini"))
-		revert_to_baseline();
-	ImGui::EndDisabled();
-	ImGui::SetItemTooltip("Puts every control below back to the value that was on disk at load, or "
-	                      "at the last Save. Live, like any other change.");
 
 	// ---- network tuning ----------------------------------------------------------------------
 	ImGui::SeparatorText("Network");
@@ -1530,9 +2116,9 @@ inline void draw_controls(const host_facts &f)
 
 	{
 		const bool codec_live = s.codec_running.load(std::memory_order_relaxed);
-		if (!f.hdr_codec_at_load)
+		if (!live_hdr_codec())
 			overlay_imgui::textf_colored(col::amber,
-				"hdr_codec=0 in the ini: these three do nothing this session.");
+				"The HDR codec is off, so these three do nothing until it is turned back on.");
 		else if (!codec_live)
 			overlay_imgui::textf_colored(col::amber,
 				"The codec is not running at the moment, so these three are not reaching the image.");
@@ -1540,7 +2126,7 @@ inline void draw_controls(const host_facts &f)
 		// Greyed when the codec cannot run at all, not merely when it is not running THIS frame:
 		// all three are consumed only by the encode and the decode, so with the codec latched off
 		// they reach nothing. renodx leaves its equivalents interactive in the same situation.
-		ImGui::BeginDisabled(!f.hdr_codec_at_load || s.codec_failed.load(std::memory_order_relaxed));
+		ImGui::BeginDisabled(!live_hdr_codec() || s.codec_failed.load(std::memory_order_relaxed));
 
 		slider_f("Scene Paper-White Scale", l.paper_white_scale, 0.05f, 16.0f, "%.3f", k_plain,
 			"Live. THIS VALUE IS UNCALIBRATED - Remix folds its own auto-exposure and EV bias into it "
@@ -1675,6 +2261,41 @@ inline void draw_controls(const host_facts &f)
 		"the copy-back is off, which is why it greys out.");
 	ImGui::EndDisabled();
 
+	// ---- the HDR codec, live in BOTH directions ------------------------------------------------
+	//
+	// THE HARD ONE, and the reason the rebuild rung exists. Two things used to block it, one per
+	// direction, and both are gone:
+	//
+	//   OFF -> ON  was blocked by ONE LINE. nr_lazy_ngx_init's else branch set st->codec_failed =
+	//              true "not a failure, but the same do-not-use-it state", and
+	//              nr_release_feature_and_output deliberately never clears codec_failed. So
+	//              hdr_codec=0 at load latched a RUN-LATCHED SHADER-BUILD FAILURE flag to mean
+	//              "the user configured it off", and nothing could ever undo it. That assignment
+	//              is deleted; codec_failed now means only what its own comment says it means,
+	//              and the service builds the pipelines lazily on the first ON.
+	//   ON -> OFF  was blocked by the FORMAT. out_tex is forced to r16g16b16a16_float for its
+	//              LIFETIME whenever the codec is on, so with the codec off it becomes the
+	//              copy-back source and its format no longer matches an r11g11b10_float TAA
+	//              output - and the copy-back guard then SILENTLY skips, which reads as "no
+	//              denoise on screen" while every other indicator stays healthy. The teardown
+	//              fixes it with no new code at all: releasing out_tex zeroes out_w/out_h, so the
+	//              next accepted dispatch re-enters nr_ensure_output on the create branch and
+	//              re-decides the format against the new value.
+	checkbox_action("HDR codec (feed the network a display-referred proxy)", l.hdr_codec,
+		a_teardown | a_reconcile, "hdr_codec", k_rebuild,
+		"Live in BOTH directions, and it costs one full rebuild each way - the NGX feature and "
+		"every texture are released on the next present and recreated on the following dispatch, "
+		"because the network's target texture has to be re-created in a DIFFERENT FORMAT. Expect a "
+		"visible hitch and one un-accumulated frame.\n\n"
+		"ON: the pass builds a soft-clipped exact-piecewise-sRGB proxy, hands the PROXY to the "
+		"network as DLSSNR.Color, and carries the answer back onto the untouched original as an "
+		"additive residual. DLSS-NR is a display-referred network and UE4 SceneColor is linear and "
+		"unbounded, so this is what fixes README gap 1 - the darkening.\n\n"
+		"OFF: the raw TAA output is bound as DLSSNR.Color and the network's raw answer is copied "
+		"straight back. That is the A/B, and it is a genuinely different image - it is NOT the same "
+		"as HDR Transfer Strength = 0, which is an exact bypass of the DENOISE with the codec still "
+		"running.");
+
 	checkbox_b("Restore the graphics root signature too", l.restore_graphics_root, k_plain,
 		"Live, and safe to change mid-scene ONLY because of the snapshot at the top of each pass. "
 		"This value is read TWICE per pass - once by capture_state and once by restore_state - and "
@@ -1684,7 +2305,197 @@ inline void draw_controls(const host_facts &f)
 		"Streamline shadow does not track graphics root state, but a descriptor-heap change "
 		"invalidates graphics tables too, so leave it on unless you are measuring.");
 
+	// ---- motion vectors --------------------------------------------------------------------------
+	ImGui::SeparatorText("Motion vectors (README gap 2)");
+
+	checkbox_action("Decode UE4's velocity encoding", l.mvec_decode,
+		a_teardown | a_reconcile, "mvec_decode", k_rebuild,
+		"Live in BOTH directions. ON is the one that costs something: the decode's compute pipeline "
+		"has to be built, which compiles DXBC at runtime, so it happens on the present thread and "
+		"will stall a frame the first time. After that the guide-reset latch forces one Reset frame "
+		"by itself, because the resource bound as DLSSNR.MVec has changed.\n\n"
+		"ON binds OUR r16g16_float texture on the colour grid: one compute pass applies UE 4.27's "
+		"DecodeVelocityFromTexture - scale AND bias, and MVecScaleX/Y can rescale a grid but can "
+		"never remove a bias - and MVecScaleX/Y are then FORCED to 1.0 so the grid correction "
+		"cannot double-apply. OFF binds the game's raw encoded velocity with the derived grid "
+		"ratio, which is bit-for-bit the behaviour before this feature existed.\n\n"
+		"Off-to-on used to be impossible for the same one-line reason the HDR codec's was: "
+		"mvec_decode=0 at load latched mvec_failed, the run-latched \"the shader could not be "
+		"built\" flag, which nothing ever cleared. That assignment is deleted.");
+
+	ImGui::BeginDisabled(!l.mvec_decode.load(std::memory_order_relaxed));
+
+	checkbox_b("Reconstruct camera motion from depth", l.mvec_reconstruct, k_reset,
+		"Live, one Reset frame. OFF is a BRING-UP A/B ONLY and is WORSE than turning the decode "
+		"off entirely: valid velocity texels are decoded and every invalid one is written as "
+		"EXACTLY ZERO, which under UE 4.27 is still the whole static world, the sky, translucency "
+		"and every movable that did not move. Shipping that hands DLSS zero motion for most of the "
+		"frame. It exists so the two halves can be isolated on hardware, nothing else.");
+
+	checkbox_b("Dilate the velocity lookup (UE's AA_CROSS nearest-depth)", l.mvec_dilate, k_reset,
+		"Live, one Reset frame - it changes the CONTENT of the guide under an accumulated history. "
+		"OFF by default: UE dilates for its own single-tap history, NVIDIA's DLSS plugin defaults "
+		"to the NON-dilated branch, and DLSS does its own neighbourhood work, so pre-dilated "
+		"vectors smear object silhouettes. Here so it can be A/B'd independently of the encoding "
+		"fix.");
+
+	checkbox_action("Transpose ClipToPrevClip", l.mvec_clip_transpose,
+		a_clear_clip, "mvec_clip_transpose", k_reset,
+		"Live, and it ALSO clears the plausibility latch, which is what makes it a real control "
+		"rather than a one-shot.\n\n"
+		"A wrong transpose fails the plausibility check; thirty consecutive failures set "
+		"view_layout_failed and clip_ok=false PERMANENTLY for the resolution, and until this "
+		"ladder existed those were cleared only by a full feature release. So the FIRST bad value "
+		"killed the knob for the rest of the session and every later change to it did nothing - a "
+		"control that lies, which is the one outcome this panel exists to prevent. Now each change "
+		"clears the latch and re-arms its one-shot log line, so you can try both settings and read "
+		"the reason for each in ReShade.log.\n\n"
+		"If motion is roughly right at screen centre and wrong at the edges - and worse under "
+		"camera ROLL - this is the knob. A near-identity matrix cannot tell the two apart, which "
+		"is why this exists rather than a self-test.");
+
+	slider_u32("Pin the ClipToPrevClip row (0 = discover it)", l.mvec_clip_row, 0, 511,
+		a_clear_clip, "mvec_clip_row", k_reset,
+		"Live, and it clears the same latches as Transpose above and for the same reason: an "
+		"out-of-range pin sets view_layout_failed immediately and permanently.\n\n"
+		"0 is the RECOMMENDED setting and means \"discover it and VALIDATE it\": the row is derived "
+		"twice independently - a 26-constraint content signature over the View constant buffer, and "
+		"this project's own DXBC instruction analysis - and the two must AGREE or the "
+		"reconstruction is refused. STRAY measured 122 both ways. A pinned row SKIPS the content "
+		"signature entirely, so it is as loud in the log as shader_hash=0 is.");
+
+	ImGui::EndDisabled();
+
+	// ---- identification --------------------------------------------------------------------------
+	ImGui::SeparatorText("Identification - which dispatch this add-on hooks");
+
+	overlay_imgui::textf_colored(col::amber,
+		"These five decide WHICH dispatch is treated as the game's TAA pass. Getting them wrong "
+		"does not crash anything - the pass simply stops running, and the status line above says "
+		"WAITING FOR GAME DLSS - but writing the denoised image over the wrong render target would "
+		"look like a game bug rather than an add-on bug, so nothing here is guessed.");
+
+	input_hash(l.shader_hash, "shader_hash");
+	ImGui::SetItemTooltip(
+		"Live. The exact DXBC hash of the target compute shader, as ReShade.log prints it.\n\n"
+		"It is the one identification input that is MEMOIZED per pipeline state object, so a live "
+		"change has to invalidate that memo on EVERY command list rather than on the next one - "
+		"which is what the identification epoch does: one atomic that each recording thread reads "
+		"for itself, next to a pointer compare that already runs on every dispatch. The armed "
+		"pristine copy is dropped in the same step, because an arm made under the old "
+		"identification must never be consumed under the new one.\n\n"
+		"0 means \"any shader that passes every census gate\", and it is NOT recommended: the "
+		"measured false positive 0x901e041a7cadc9db scores confidence 150 and would pass any "
+		"score-based test. The class quorum does reject it, but relying on the quorum alone gives "
+		"up the one identifier that is exact.");
+
+	slider_u32("srv_depth  (t)", l.srv_depth, 0, 63, 0u, "srv_depth", k_ident,
+		"Live. The t-register the TAA pass binds its DEPTH texture at. Changing it drops the armed "
+		"pristine copy and forces one Reset frame; the identification one-shot log lines are "
+		"re-armed too, so a wrong new value is REPORTED rather than rejected in silence.");
+	slider_u32("srv_velocity  (t)", l.srv_velocity, 0, 63, 0u, "srv_velocity", k_ident,
+		"Live. The t-register the TAA pass binds its VELOCITY texture at. The second measured "
+		"candidate in STRAY (0x52101a15e1a0c5cc) uses t3 here and t7 for colour.");
+	slider_u32("srv_colour  (t)", l.srv_colour, 0, 63, 0u, "srv_colour", k_ident,
+		"Live, and this is the one that MUST drop the armed pristine copy - which the ident rung "
+		"does, in the same begin_pass that applies the change.\n\n"
+		"srv_colour is not only an identification pin: it is ALSO the history-restore refusal "
+		"test. The restore arms on one frame and consumes on the next, so a change between the arm "
+		"and the consume could land last frame's image on this frame's scene-colour input - the "
+		"frozen, ghosted frame the restore path already refuses by name. It is the only setting in "
+		"the add-on that tears ACROSS frames, which no per-pass snapshot could fix.");
+	slider_u32("uav_output  (u)", l.uav_output, 0, 15, a_clear_failed, "uav_output", k_ident,
+		"Live. The u-register carrying the TAA output - UE 4.27's FTAAStandaloneCS declares "
+		"OutComputeTex at u0 and the optional OutComputeTexDownsampled at u1.\n\n"
+		"Changing it changes which resource the denoised image is written INTO, so the armed "
+		"pristine copy is dropped, the \"ambiguous output UAV\" and \"not a usable TAA output\" "
+		"one-shots are re-armed, and the ring of resources the copy-back has written into is "
+		"cleared - otherwise a recycled address from the old configuration could false-match the "
+		"temporal-feedback detector.");
+
+	// ---- NGX bring-up ------------------------------------------------------------------------------
+	ImGui::SeparatorText("NGX bring-up");
+
+	{
+		// AN APPLY BUTTON, NEVER A BARE CHECKBOX, and the reason is in the tooltip verbatim.
+		bool on = l.populate_parameters.load(std::memory_order_relaxed);
+		if (ImGui::Checkbox("Call the snippet's PopulateParameters_Impl", &on))
+			l.populate_parameters.store(on, std::memory_order_relaxed);
+		ImGui::SetItemTooltip(
+			"Live, but only when you press Apply beside it - deliberately not on the click.\n\n"
+			"PopulateParameters_Impl is a GATED export whose EXACT SIGNATURE HAS NOT BEEN VERIFIED "
+			"AGAINST THIS SNIPPET BUILD (addon_config.hpp:92-95). Nothing in the documented flow "
+			"needs it, which is why it is off by default. A checkbox that fired on click would let "
+			"a stray tick call an unverified gated export mid-frame; an Apply button makes it a "
+			"decision.\n\n"
+			"OFF-to-ON is one call on the existing parameter block: no NGX re-init, no teardown. "
+			"ON-to-OFF cannot be un-called, so it needs a FRESH parameter block - which needs the "
+			"feature released first, because CreateFeature was handed the old one. That is the "
+			"full rebuild, and it is what Apply does.");
+		ImGui::SameLine();
+		if (ImGui::Button("Apply PopulateParameters"))
+			request(a_reconcile, "populate_parameters", k_rebuild);
+		ImGui::SetItemTooltip(
+			"Applies the checkbox to the left. Off-to-on calls PopulateParameters_Impl once. "
+			"On-to-off releases the NGX feature and allocates a fresh parameter block, because the "
+			"call cannot be undone on the block it was made against.");
+	}
+
 	ImGui::EndDisabled();   // !usable
+
+	// ---- diagnostics ---------------------------------------------------------------------------
+	// OUTSIDE the !usable block on purpose. Every control here is read-only instrumentation that
+	// works whether or not NGX ever armed - and the case where NGX did NOT arm is exactly when a
+	// user wants the shader census turned on.
+	ImGui::SeparatorText("Diagnostics (read-only instrumentation; never touches the render path)");
+
+	checkbox_action("Shader census, root-signature and SRV-table dumps", l.diagnostics,
+		0u, "diagnostics", k_plain,
+		"Live, and it is the ONE setting that could never have come through the per-pass snapshot: "
+		"it is read on EVERY draw and EVERY dispatch in the process, on arbitrary recording "
+		"threads, outside the accepted-pass lock. So it is a relaxed atomic load at each of those "
+		"three sites instead - which costs a load per draw and makes the control real. The old "
+		"reason for greying it out (\"threads this overlay must not race with\") was an argument "
+		"for using an atomic, not for having no control.\n\n"
+		"It writes to ReShade.log and touches nothing else, in either position.");
+
+	checkbox_action("DXR dispatch census (rt_census)", l.rt_census,
+		a_apply_census, "rt_census", k_plain,
+		"Live. Off means off: every census entry point returns after ONE relaxed atomic load, "
+		"nothing is counted, named, logged or allocated, and the dispatch_rays handler returns "
+		"false so ReShade issues the game's own DispatchRays exactly as with no add-on present. "
+		"The census allocates NOTHING at any time, on or off - every table it keeps is a "
+		"fixed-size array.\n\n"
+		"ONE HONEST LIMIT: the counters are CUMULATIVE FROM THE FIRST TIME IT WAS ARMED and are "
+		"not reset when you toggle it off and on. A summary block after a re-tick therefore "
+		"includes dispatches counted before it. Read the deltas between summaries, not the "
+		"totals.");
+
+	ImGui::BeginDisabled(!l.rt_census.load(std::memory_order_relaxed));
+	slider_u32("Presents between RT census summaries", l.rt_census_frames, 60, 6000,
+		a_apply_census, "rt_census_frames", k_plain,
+		"Live. 600 is ten seconds at 60 fps. A summary is also emitted at destroy_device "
+		"regardless of this.");
+	ImGui::EndDisabled();
+
+	checkbox_action("Refuse to run without remix_nvngx.dll (require_trampoline)", l.require_trampoline,
+		a_reconcile, "require_trampoline", k_plain,
+		"HALF LIVE, AND THE UI SAYS WHICH HALF.\n\n"
+		"1 -> 0 IS LIVE, and only matters in the session where the snippet FAILED to load for "
+		"exactly this reason: load_snippet already called unload() on that path, so nothing is "
+		"loaded and re-running it is clean. Unticking this and letting the service re-arm is the "
+		"same action as ticking `enabled` above.\n\n"
+		"0 -> 1 NEEDS A RELAUNCH when the snippet is already loaded, and here is the specific "
+		"reason: honouring it would mean UNLOADING an initialised snippet, and this tree has no "
+		"in-process unload path anywhere. stray_dlssnr.cpp:4339-4341 declines to FreeLibrary even "
+		"at device teardown - \"a 166 MB module that may still hold worker threads\". So the value "
+		"is remembered and saved, and it takes effect next launch. Nothing about the current "
+		"session changes, and the panel does not pretend otherwise.\n\n"
+		"What it is FOR: every gated snippet export resolves its caller's module from the return "
+		"address and rejects anything whose path does not contain \"nvngx.dll\" with 0xbad00002, "
+		"and Init_Ext and CreateFeature are both gated. A resolve-time probe cannot detect that, "
+		"because GetProcAddress succeeds and only the calls fail - so turning this off buys a "
+		"silent 0xbad00002 instead of a clear message.");
 
 	// ---- persistence -------------------------------------------------------------------------
 	ImGui::Separator();
@@ -1736,62 +2547,58 @@ inline void draw_controls(const host_facts &f)
 }
 
 // ---------------------------------------------------------------------------------------------
-// The settings that exist but cannot be changed while the game is running. Shown GREYED rather
-// than hidden: a user must be able to read what the ini said without alt-tabbing, and must be able
-// to see WHY each one is not a control. Every reason here is a specific line of the add-on, not a
-// general caution.
+// WHAT IS LEFT THAT A RELAUNCH IS STILL NEEDED FOR - AND IT IS TWO THINGS, NOT TEN.
+//
+// This section used to list ten keys. Eight of them are now real controls above, reached through
+// the reconfigure ladder. These two remain, and each one states the SPECIFIC line of this add-on
+// that makes it so, in the control's own tooltip as well as on screen - a reason that lives only
+// in a header comment is a reason the user never reads.
+//
+// The bar for being in this list is proof, not convenience. "A lazy classification is not
+// acceptable" is the standing rule, and the reasoning for each of these is written out in full in
+// the ladder section at the top of this file.
 // ---------------------------------------------------------------------------------------------
 inline void draw_load_only(const host_facts &f)
 {
-	if (!ImGui::CollapsingHeader("Load-only settings (edit stray_dlssnr.ini and restart)"))
+	if (!ImGui::CollapsingHeader("Settings a relaunch is still needed for (2)"))
 		return;
 
-	char buf[128];
+	char buf[160];
 
-	ImGui::TextWrapped("These are read once, at load. Nothing in this panel can change them, and a "
-	                   "control that looked like it could would be worse than none.");
+	ImGui::TextWrapped("Everything else in stray_dlssnr.ini is a live control above. These two are "
+	                   "not, for the reasons given - and the reason is specific in each case, not a "
+	                   "general caution.");
 	ImGui::Spacing();
 
-	load_only("enabled", f.enabled_at_load ? "1" : "0",
-		"read once in nr_init_device and never again; nothing on the render path consults it. The "
-		"master switch above is a separate per-dispatch bypass, which is why it works and this "
-		"would not.");
-
-	load_only("hdr_codec", f.hdr_codec_at_load ? "1" : "0",
-		"cannot be flipped in place in EITHER direction. Off-to-on is impossible - hdr_codec=0 at "
-		"load latches codec_failed, which is deliberately never cleared - and on-to-off would "
-		"silently kill the copy-back, because out_tex was created r16g16b16a16_float for the codec "
-		"and keeps that format for its lifetime, so it would no longer match the frame it is copied "
-		"into. Use HDR Transfer Strength = 0 for a live, exact bypass of the denoise instead.");
-
-	std::snprintf(buf, sizeof(buf), "0x%016llx", (unsigned long long)f.shader_hash);
-	load_only("shader_hash", buf,
-		"memoized per pipeline state object: the lookup is guarded by nr_checked != pso and cached "
-		"in nr_is_target. Changing it at runtime would take effect on some command lists and not "
-		"others - non-deterministic, which is the one thing worse than not editable.");
-
-	std::snprintf(buf, sizeof(buf), "t%u / t%u / t%u -> u%u",
-		(unsigned)f.srv_depth, (unsigned)f.srv_velocity, (unsigned)f.srv_colour, (unsigned)f.uav_output);
-	load_only("srv_depth / srv_velocity / srv_colour / uav_output", buf,
-		"identification pins. srv_colour is ALSO the history-restore refusal test, so changing it "
-		"between the arm and the consume could land last frame's image on this frame's scene-colour "
-		"input - the frozen, ghosted frame the restore path refuses by name.");
-
-	load_only("diagnostics", f.diagnostics ? "1" : "0",
-		"read on the draw and dispatch paths from threads this overlay must not race with, for the "
-		"sake of a log knob. It never touches the render path either way.");
-
-	load_only("require_trampoline", f.require_trampoline ? "1" : "0",
-		"consumed once, at the LoadLibrary of the snippet.");
-	load_only("populate_parameters", f.populate_parameters ? "1" : "0",
-		"consumed once, right after the parameter block is allocated.");
-
 	std::snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)f.app_id);
-	load_only("app_id", buf, "consumed once, at NVSDK_NGX_D3D12_Init_Ext.");
+	load_only("app_id", buf,
+		"NGX application id. It has NO render-path effect whatsoever: the snippet resolves its "
+		"weights from its own embedded WEIGHTS_HT resource, so this only names the log file the "
+		"snippet writes beside the add-on.\n\n"
+		"The MECHANISM to change it in place does exist - Shutdown1 is resolved, is required at "
+		"load, and is already called in-process at device teardown, so Shutdown1 followed by "
+		"Init_Ext would be one more action on the reconfigure service. What is NOT proven is that "
+		"Init_Ext survives a SECOND call, and the only measurement this project has of its "
+		"fragility is that it HANGS when called at a moment the snippet does not tolerate: the log "
+		"stops between \"loaded nvngx_dlssnr.dll\" and the Init_Ext result, the process sits at "
+		"~2% CPU, and the title never reaches its menu.\n\n"
+		"A hang is not a failure that degrades, and the standing rule for this ladder is that a "
+		"reconfigure which fails must leave the previous working state. So an unverified in-process "
+		"NGX re-init is not offered, to rename a log file. Edit app_id in stray_dlssnr.ini and "
+		"relaunch. If this is ever measured on hardware, the action bit is a few lines.");
+
+	load_only("require_trampoline: 0 -> 1 only", live_require_trampoline() ? "1" : "0",
+		"The 1 -> 0 direction IS live and has a real checkbox under Diagnostics above. Only 0 -> 1 "
+		"needs a relaunch, and only when the snippet is already loaded: honouring it then would "
+		"mean UNLOADING an initialised snippet, and there is no in-process unload path anywhere in "
+		"this tree - stray_dlssnr.cpp:4339-4341 declines to FreeLibrary even at device teardown, "
+		"because a 166 MB module may still hold worker threads. The new value is saved and takes "
+		"effect next launch.");
 
 	load_only("stray_dlssnr.ini", f.ini_found ? "found" : "NOT FOUND (every setting is at its built-in default)",
-		"a missing file is not an error - every default in addon_config.hpp is the shipping default, "
-		"so the add-on behaves identically with and without it.");
+		"Not a setting. A missing file is not an error - every default in addon_config.hpp is the "
+		"shipping default, so the add-on behaves identically with and without it. Pressing Save "
+		"above will create one.");
 }
 
 // ---------------------------------------------------------------------------------------------

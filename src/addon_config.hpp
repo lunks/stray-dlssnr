@@ -4,9 +4,30 @@
 // get_config_value keys off ReShade.ini, which the user is also editing for effects, and a
 // missing key there silently yields a default with no diagnostic. Here every parse is reported.
 //
-// Read ONCE, at the first init_device. There is no hot reload: a knob that changed halfway
-// through a frame would produce an evaluate whose create-time and evaluate-time parameters
-// disagree, which is exactly the class of bug that is impossible to see in a screenshot.
+// PARSED once, at the first init_device - but this struct is NO LONGER a read-once snapshot, and
+// the sentence that used to stand here ("There is no hot reload") is now false. Every key below
+// except app_id is a live control in the overlay.
+//
+// The concern that sentence recorded is real and is still honoured, just differently. A knob that
+// changed halfway through a frame would produce an evaluate whose create-time and evaluate-time
+// parameters disagree - a bug that is impossible to see in a screenshot. So a live change never
+// touches this struct mid-pass: overlay_ui::begin_pass copies the overlay's atomics into it ONCE
+// per accepted dispatch, on the render thread, under the lock that pass already holds, and every
+// read inside the pass then sees one coherent set of values. Anything that cannot be applied that
+// way - a different texture format, a pipeline that does not exist yet, a snippet that is not
+// loaded - is deferred to nr_service_reconfigure on the next present.
+//
+// TWO CONSEQUENCES FOR ANYONE EDITING THIS FILE:
+//   * A NEW KEY IS NOT LIVE BY DEFAULT. Adding it here and to the parser gets it parsed and
+//     nothing more. It needs an atomic in overlay_ui::live_block, a line in
+//     OVERLAY_OWNED_FIELDS, a line in begin_pass's snapshot, and a control - or it is a setting
+//     the ini can express and the UI silently cannot.
+//   * READING A FIELD OF THIS STRUCT OFF THE RENDER THREAD IS NOW A DATA RACE. begin_pass writes
+//     it on a recording thread. The main-thread readers that used to exist were removed for
+//     exactly this reason; use the overlay_ui::live_*() accessors instead.
+//
+// The full per-key ladder, with the read site of every key and the reason for its rung, is in the
+// header comment of src/overlay_ui.hpp.
 
 #pragma once
 

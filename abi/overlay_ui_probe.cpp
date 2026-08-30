@@ -30,16 +30,15 @@ extern "C" __declspec(dllexport) bool overlay_ui_install_probe()
 // side of that contract changes without the other, this stops compiling.
 extern "C" __declspec(dllexport) bool overlay_ui_pass_probe()
 {
-    static cfg::config c;
-    static bool        need_reset = false;
-    static uint64_t    pending_res = 0;
-    static bool        pending_teardown = false;
-    static bool        feature_failed = false;
+    static cfg::config             c;
+    static overlay_ui::seen_epochs seen_pass;
+    static bool                    need_reset = false;
+    static uint64_t                pending_res = 0;
 
     overlay_ui::seed_from_config(c, L"C:\\nowhere\\");
 
-    const bool run = overlay_ui::begin_pass(c, need_reset, pending_res, pending_teardown,
-                                            feature_failed, true, false, true);
+    const bool run = overlay_ui::begin_pass(c, seen_pass, need_reset, pending_res,
+                                            true, false, true);
 
     overlay_ui::publish_evaluate(0u, "Success", true, 1920u, 1080u,
                                  "r16g16b16a16_float", "r16g16b16a16_float",
@@ -47,8 +46,40 @@ extern "C" __declspec(dllexport) bool overlay_ui_pass_probe()
 
     (void)overlay_ui::live_copy_back();
     (void)overlay_ui::live_history_restore();
+    (void)overlay_ui::live_mvec_decode();
+    (void)overlay_ui::live_mvec_reconstruct();
+    (void)overlay_ui::live_diagnostics();
+    (void)overlay_ui::live_enabled();
+    (void)overlay_ui::live_hdr_codec();
+    (void)overlay_ui::live_require_trampoline();
+    (void)overlay_ui::live_populate_parameters();
+    (void)overlay_ui::live_rt_census();
+    (void)overlay_ui::live_rt_census_frames();
     (void)overlay_ui::dirty();
     return run;
+}
+
+// The RECONFIGURE contract, with exactly the shapes nr_service_reconfigure uses. Same argument as
+// above, and it matters more here: this half runs on the PRESENT thread, so a signature drift
+// between the two would otherwise only show up as a compile error inside the add-on build - which
+// is continue-on-error under mingw, the toolchain shipping on hardware today.
+extern "C" __declspec(dllexport) unsigned overlay_ui_reconfigure_probe()
+{
+    static overlay_ui::seen_epochs seen_service;
+
+    const overlay_ui::ident_view id = overlay_ui::read_ident();
+
+    overlay_ui::request(overlay_ui::a_teardown | overlay_ui::a_clear_failed |
+                        overlay_ui::a_clear_clip | overlay_ui::a_apply_census |
+                        overlay_ui::a_reconcile,
+                        "overlay_ui_reconfigure_probe", overlay_ui::k_rebuild);
+
+    const overlay_ui::reconfig_request r = overlay_ui::take_reconfigure(seen_service);
+
+    overlay_ui::publish_reconfig_pending(r.bits != 0);
+    overlay_ui::publish_reconfigure(true, "overlay_ui_reconfigure_probe");
+
+    return r.bits ^ id.epoch ^ (unsigned)id.shader_hash ^ (r.ident_changed ? 1u : 0u);
 }
 
 // The ini writer, so its Win32 surface (MoveFileExW, _wfopen) is type-checked on both toolchains

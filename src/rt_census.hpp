@@ -351,6 +351,21 @@ inline void arm(bool enable, uint32_t report_every_frames, LogFn log)
 	}
 }
 
+/// LIVE re-arm, from the overlay's reconfigure service. The same two stores arm() makes, and
+/// deliberately WITHOUT its banner: arm()'s message describes the whole gate and the fact that it
+/// is being armed once at start-up, which would be a wrong and noisy thing to repeat every time a
+/// checkbox moves. The caller logs the change itself, once per change.
+///
+/// The two counters are NOT reset here, and the UI says so: they are cumulative from the first
+/// arm, so a summary printed after an off/on cycle includes dispatches counted before it. Zeroing
+/// them would need the two mutexes this function deliberately does not take.
+inline void set_live(bool enable, uint32_t report_every_frames)
+{
+	state &s = get();
+	s.report_every.store(report_every_frames != 0 ? report_every_frames : 600, std::memory_order_relaxed);
+	s.enabled.store(enable, std::memory_order_relaxed);
+}
+
 // =============================================================================================
 // init_pipeline. Call this BEFORE the PS/CS filter, so DXR sub-objects stop being invisible.
 // =============================================================================================

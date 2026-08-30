@@ -85,6 +85,16 @@ static bool has_line(const std::string &hay, const std::string &needle)
 // A fixture with every hazard the shipped ini actually has: a header comment block, a section
 // header, CRLF endings, column-aligned keys, a key we do NOT own, a trailing comment on a value
 // line, the British spelling alias, and one owned key that is absent entirely.
+//
+// WHAT THE OVERLAY OWNS CHANGED WITH THE RECONFIGURE LADDER, and this fixture changed with it.
+// shader_hash, srv_*, enabled, hdr_codec and the rest used to be checked here as keys the writer
+// must NEVER round-trip - which was the right test while they were load-only, because clobbering
+// a hand-measured identification pin from a panel that could not change it would only ever be a
+// bug. They are live controls now, so the writer owns them, and the property worth testing is the
+// opposite one: a pin the user CHANGED must reach the file, and a pin they did not change must
+// come back byte-identical. app_id is the one setting that is still not a control at all (see
+// overlay_ui.hpp's ladder: NGX cannot be re-inited in-process with any evidence that it survives
+// a second Init_Ext), so it takes over as the key that proves the not-owned path still works.
 static const char *const kFixture =
     "; stray_dlssnr.ini - hand-written, do not reflow.\r\n"
     ";\r\n"
@@ -93,11 +103,14 @@ static const char *const kFixture =
     "\r\n"
     "[stray_dlssnr]\r\n"
     "\r\n"
-    "; The identification pins. The overlay must never round-trip these.\r\n"
+    "; The identification pins. Live controls now, so the overlay owns them.\r\n"
     "shader_hash = 0x1708ec956099e259\r\n"
     "srv_velocity = 2\r\n"
     "enabled = 1\r\n"
     "hdr_codec = 1\r\n"
+    "\r\n"
+    "; NOT owned by the overlay, in either direction. It must come back byte for byte.\r\n"
+    "app_id = 0x24480451\r\n"
     "\r\n"
     "copy_back = 1   ; a trailing comment on an owned key\r\n"
     "history_restore = 1\r\n"
@@ -150,6 +163,10 @@ int main()
     l.style.store(2u, std::memory_order_relaxed);
     l.mvec_scale_x.store(1.5f, std::memory_order_relaxed);
     l.ui_correction.store(1u, std::memory_order_relaxed);
+    // The reconfigure ladder's keys: one identification pin the user CHANGED, and one they did
+    // not. Both have to survive correctly, and for opposite reasons.
+    l.srv_velocity.store(3u, std::memory_order_relaxed);
+    l.hdr_codec.store(false, std::memory_order_relaxed);
 
     check(overlay_ui::dirty(), "dirty() reports the pending edits");
 
@@ -167,10 +184,7 @@ int main()
     check(has_line(out, "; stray_dlssnr.ini - hand-written, do not reflow."), "the header comment survived");
     check(has_line(out, ";      keep me exactly as I am."), "an oddly indented comment survived byte for byte");
     check(has_line(out, "[stray_dlssnr]"), "the section header survived");
-    check(has_line(out, "shader_hash = 0x1708ec956099e259"), "shader_hash was NOT round-tripped");
-    check(has_line(out, "srv_velocity = 2"), "srv_velocity was NOT round-tripped");
-    check(has_line(out, "enabled = 1"), "enabled (load-only) was NOT round-tripped");
-    check(has_line(out, "hdr_codec = 1"), "hdr_codec (load-only) was NOT round-tripped");
+    check(has_line(out, "app_id = 0x24480451"), "app_id (not an overlay control) was NOT round-tripped");
     check(has_line(out, "totally_unknown_key = 42"), "an unrecognised key survived untouched");
     check(has_line(out, "; ui_correction is deliberately ABSENT, so the append path is exercised too."),
           "the comment above the absent key survived");
@@ -189,6 +203,17 @@ int main()
           "no duplicate American-spelling key was appended alongside it");
     check(has_line(out, "ui_correction = 1"), "the absent owned key was appended");
 
+    // --- the reconfigure ladder's keys ---
+    check(has_line(out, "srv_velocity = 3"), "a CHANGED identification pin reached the file");
+    check(has_line(out, "shader_hash = 0x1708ec956099e259"),
+          "an UNCHANGED shader hash came back byte for byte, in hex, not as a decimal");
+    check(has_line(out, "hdr_codec = 0"), "hdr_codec, now a live control, took the new value");
+    check(has_line(out, "enabled = 1"), "enabled, now a live control, kept its value");
+    check(has_line(out, "srv_colour = 5"), "an owned key absent from the file was appended");
+    check(has_line(out, "diagnostics = 1"), "diagnostics was appended");
+    check(out.find("srv_color = ") == std::string::npos,
+          "no duplicate American spelling of srv_colour was appended");
+
     check(out.find("\r\n") != std::string::npos, "CRLF line endings survived on the lines we rewrote");
 
     // --- and it must still parse back to exactly what we set ---
@@ -204,8 +229,12 @@ int main()
         check(back.mvec_scale_x == 1.5f,              "reparse: mvec_scale_x");
         check(back.ui_correction == 1u,               "reparse: ui_correction");
         // The pins must be exactly what the fixture said, not what the overlay's defaults are.
-        check(back.shader_hash == 0x1708ec956099e259ull, "reparse: shader_hash is untouched");
-        check(back.srv_velocity == 2u,                   "reparse: srv_velocity is untouched");
+        check(back.shader_hash == 0x1708ec956099e259ull, "reparse: shader_hash round-tripped exactly");
+        check(back.srv_velocity == 3u,                   "reparse: the changed srv_velocity pin");
+        check(back.hdr_codec == false,                   "reparse: hdr_codec");
+        check(back.enabled == true,                      "reparse: enabled");
+        check(back.srv_colour == 5u,                     "reparse: the appended srv_colour");
+        check(back.app_id == 0x24480451ull,              "reparse: app_id is untouched");
     }
 
     // ---------------------------------------------------------------- case B: no file at all
