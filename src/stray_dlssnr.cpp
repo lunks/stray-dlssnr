@@ -1674,6 +1674,7 @@ struct nr_state
 	bool logged_mvec_format      = false;
 	bool logged_feedback_loop    = false;
 	bool logged_owned_throw      = false;
+	bool logged_output_binding   = false;
 	bool logged_copy_fmt         = false;
 	bool logged_identity         = false;
 	// The graft-mode log line is NOT a one-shot: hdr_graft is a tier-0 root constant whose entire
@@ -3812,7 +3813,7 @@ static void nr_codec_decode(command_list *cmd, nr_state &st, resource_view origi
 	if (g_cfg.nr_probe != 0 && st.probe.ready && st.out_uav.handle != 0)
 	{
 		nr_probe::frame(cmd->get_device(), cmd, st.probe, st.probe_run,
-		                original_srv, st.out_uav, st.out_w, st.out_h,
+		                original_srv, st.out_uav, st.out_tex, st.out_w, st.out_h,
 		                g_cfg.nr_probe_frames, g_cfg.nr_probe_warmup,
 		                [](const char *fmt, auto... args) {
 			                logf(reshade::log::level::info, fmt, args...);
@@ -3961,6 +3962,17 @@ static ngx::Result nr_evaluate(nr_state &st, ID3D12GraphicsCommandList *cl, cons
 	nr_set_resource(p, s_depth,  a.depth,  a.depth_w, a.depth_h);
 	nr_set_resource(p, s_mvec,   a.mvec,   a.mvec_w,  a.mvec_h);
 	nr_set_resource(p, s_output, a.output, a.out_w,   a.out_h);
+	// BOUNDARY EVIDENCE, once per run. Every explanation tried for the unwritten output assumes
+	// the resource handed to NGX here is the same object the add-on later reads back; nothing
+	// has verified it. Compare this pointer against the one logged when out_tex was created.
+	if (!st.logged_output_binding)
+	{
+		st.logged_output_binding = true;
+		LOGI("DLSS-NR: DLSSNR.Output <- ID3D12Resource=0x%llx at %ux%u. out_tex handle=0x%llx. "
+		     "If these name different objects, NGX is writing something this add-on never reads.",
+		     (unsigned long long)reinterpret_cast<uintptr_t>(a.output), a.out_w, a.out_h,
+		     (unsigned long long)st.out_tex.handle);
+	}
 	// Written EVERY frame even though this add-on never binds one - see nr_clear_resource.
 	nr_clear_resource(p, s_mask);
 

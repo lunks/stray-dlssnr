@@ -351,8 +351,23 @@ inline void clear(command_list *cmd, pipeline_set &p)
 // Both SRVs must already be in shader_resource_non_pixel. The caller runs this immediately after
 // the codec's decode, which has already transitioned out_tex for exactly that reason.
 inline void dispatch(command_list *cmd, pipeline_set &p, resource_view in_srv, resource_view out_uav,
+                     resource out_uav_res,
                      uint32_t width, uint32_t height)
 {
+	// UAV BARRIER ON out_tex BEFORE WE READ IT.
+	//
+	// NGX writes out_tex from its OWN dispatch on this list. The decode is synchronised against
+	// that write by its unordered_access -> shader_resource_non_pixel transition; this probe sits
+	// BEFORE that transition and had nothing, so its read could legally observe memory from
+	// before NGX's dispatch retired - which reads as zero. That is a candidate explanation for
+	// the probe reporting OUT == 0 while the decode, reading the same texture after the
+	// transition, plainly gets real content (the grafted frame is dark, not black, and a
+	// genuinely zero neural would subtract several times the proxy and crush it to black).
+	//
+	// A UAV-to-UAV barrier is exactly the "wait for the previous writer" edge, with no state
+	// change - which is what is missing here.
+	cmd->barrier(out_uav_res, resource_usage::unordered_access, resource_usage::unordered_access);
+
 	cmd->bind_descriptor_tables(shader_stage::all_compute, p.layout, 0, 0, nullptr);
 	cmd->bind_pipeline(pipeline_stage::all_compute, p.pso);
 
@@ -434,7 +449,7 @@ static constexpr uint32_t kReadbackDelay = 4;
 
 template <typename LogFn>
 inline void frame(device *dev, command_list *cmd, pipeline_set &p, run_state &r,
-                  resource_view in_srv, resource_view out_uav,
+                  resource_view in_srv, resource_view out_uav, resource out_uav_res,
                   uint32_t width, uint32_t height, uint32_t frames_per_step,
                   uint32_t warmup_needed, LogFn log)
 {
@@ -563,7 +578,7 @@ inline void frame(device *dev, command_list *cmd, pipeline_set &p, run_state &r,
 	if (r.frames_in_step == 0)
 		clear(cmd, p);
 
-	dispatch(cmd, p, in_srv, out_uav, width, height);
+	dispatch(cmd, p, in_srv, out_uav, out_uav_res, width, height);
 	r.frames_in_step++;
 
 	if (r.frames_in_step >= frames_per_step)
