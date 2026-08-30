@@ -731,13 +731,30 @@ inline bool save_ini(std::string &err)
 			std::string all;
 			char chunk[4096];
 			size_t got;
+			bool   oversize = false;
 			while ((got = std::fread(chunk, 1, sizeof(chunk), f)) > 0)
 			{
 				all.append(chunk, got);
 				if (all.size() > 4u * 1024u * 1024u)   // a stray_dlssnr.ini is ~12 KB
+				{
+					oversize = true;
 					break;
+				}
 			}
 			std::fclose(f);
+
+			// ABORT, do not continue with the prefix. save_ini rewrites the file ATOMICALLY from
+			// `lines`, so parsing a truncated read and saving it would permanently discard
+			// everything past the cutoff - comments, the identification pins (shader_hash, srv_*,
+			// app_id), every key we do not own. Refusing to save is always recoverable; a
+			// truncating save is not. Reported via `err` so the overlay says why.
+			if (oversize)
+			{
+				err = "stray_dlssnr.ini is larger than 4 MiB, which it should never be. "
+				      "Refusing to save rather than rewrite the file from a truncated read - "
+				      "nothing has been changed on disk. Check the file.";
+				return false;
+			}
 
 			size_t start = 0;
 			while (start <= all.size())
@@ -1109,9 +1126,26 @@ inline void checkbox_b(const char *label, std::atomic<bool> &a, uint32_t kind, c
 inline void combo_u32(const char *label, std::atomic<uint32_t> &a, const char *const *items,
                       int count, uint32_t kind, const char *help)
 {
-	int v = static_cast<int>(a.load(std::memory_order_relaxed));
-	if (v < 0) v = 0;
-	if (v >= count) v = count - 1;
+	const uint32_t raw = a.load(std::memory_order_relaxed);
+	int v = static_cast<int>(raw);
+
+	// A value outside the listed choices is PRESERVED and sent to NGX by the render path, so
+	// clamping it here (the old behaviour) made the panel claim the last item while the network
+	// received something else. This overlay exists to say what is actually being sent; a combo
+	// that lies about it is worse than no combo. Show the real number instead, and only replace
+	// it when the user deliberately picks from the list.
+	if (v < 0 || v >= count)
+	{
+		char unknown[64];
+		std::snprintf(unknown, sizeof(unknown), "%u  (not a listed value - sent as-is)", (unsigned)raw);
+		ImGui::TextUnformatted(label);
+		ImGui::SameLine();
+		overlay_imgui::textf_colored(col::amber, "%s", unknown);
+		if (help != nullptr)
+			ImGui::SetItemTooltip("%s", help);
+		return;
+	}
+
 	if (ImGui::Combo(label, &v, items, count))
 	{
 		a.store(static_cast<uint32_t>(v < 0 ? 0 : v), std::memory_order_relaxed);
@@ -1601,11 +1635,23 @@ inline void draw_controls(const host_facts &f)
 			(double)s.auto_scale_x.load(std::memory_order_relaxed),
 			(double)s.auto_scale_y.load(std::memory_order_relaxed));
 
+		// These two keep k_reset even though slider_f bumps on every frame of a drag - the only
+		// two sliders that do. It is not the oversight the tuning sliders were: each intermediate
+		// value really IS a different motion-vector grid from the one the history accumulated
+		// against, so a reset on each of those frames is the correct answer rather than a
+		// distortion of what the user is looking at. The tooltip says so plainly instead of
+		// promising "one" reset, which is only true if you click rather than drag.
 		ImGui::BeginDisabled(automatic);
 		slider_f("Motion Scale X", l.mvec_scale_x, 0.05f, 4.0f, "%.3f", k_reset,
-			"Live, and it forces one reset frame. Overrides the derived colour/mvec grid ratio.");
+			"Live, and it forces a DLSSNR.Reset frame on EVERY frame the value moves - so a drag "
+			"resets continuously and the image will look un-accumulated until you let go. That is "
+			"correct here: each value in between is a different grid from the one the history was "
+			"built on. Overrides the derived colour/mvec grid ratio.");
 		slider_f("Motion Scale Y", l.mvec_scale_y, 0.05f, 4.0f, "%.3f", k_reset,
-			"Live, and it forces one reset frame. Overrides the derived colour/mvec grid ratio.");
+			"Live, and it forces a DLSSNR.Reset frame on EVERY frame the value moves - so a drag "
+			"resets continuously and the image will look un-accumulated until you let go. That is "
+			"correct here: each value in between is a different grid from the one the history was "
+			"built on. Overrides the derived colour/mvec grid ratio.");
 		ImGui::EndDisabled();
 	}
 
