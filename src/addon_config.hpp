@@ -713,6 +713,11 @@ struct config
 	uint32_t ngx_logging     = 0;
 	uint32_t nr_probe        = 0;
 	uint32_t nr_probe_frames = 120;
+	// Evaluates to skip before the sweep starts. Evaluates begin during LOADING, and the first
+	// run of this probe spent four of five steps on a uniform load screen (IN read a single
+	// constant, 4729.601562, across every sampled texel). 1800 is ~15-30s depending on frame
+	// rate, which clears Stray's load comfortably.
+	uint32_t nr_probe_warmup = 1800;
 
 	// =======================================================================================
 	// DLSS SUPER RESOLUTION (NGX feature 1, nvngx_dlss.dll). See STAGING-sr.md.
@@ -1103,6 +1108,7 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "ngx_logging")              c.ngx_logging = static_cast<uint32_t>(parse_u64(v, c.ngx_logging));
 		else if (key == "nr_probe")                 c.nr_probe = static_cast<uint32_t>(parse_u64(v, c.nr_probe));
 		else if (key == "nr_probe_frames")          c.nr_probe_frames = static_cast<uint32_t>(parse_u64(v, c.nr_probe_frames));
+		else if (key == "nr_probe_warmup")          c.nr_probe_warmup = static_cast<uint32_t>(parse_u64(v, c.nr_probe_warmup));
 		else if (key == "app_id")                   c.app_id = parse_u64(v, c.app_id);
 		else if (key == "dlss_sr")                  c.dlss_sr = parse_bool(v, c.dlss_sr);
 		else if (key == "dlss_nr")                  c.dlss_nr = parse_bool(v, c.dlss_nr);

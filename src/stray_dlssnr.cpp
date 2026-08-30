@@ -3847,7 +3847,7 @@ static void nr_codec_decode(command_list *cmd, nr_state &st, resource_view origi
 	{
 		nr_probe::frame(cmd->get_device(), cmd, st.probe, st.probe_run,
 		                original_srv, st.out_srv, st.out_w, st.out_h,
-		                g_cfg.nr_probe_frames,
+		                g_cfg.nr_probe_frames, g_cfg.nr_probe_warmup,
 		                [](const char *fmt, auto... args) {
 			                logf(reshade::log::level::info, fmt, args...);
 		                });

@@ -253,6 +253,14 @@ struct pipeline_set
 struct run_state
 {
 	bool     active          = false;
+	// Frames seen since arming, used ONLY to hold the sweep off until the game is actually
+	// rendering a scene. Evaluates begin during LOADING, and the first run of this probe spent
+	// four of its five steps on a uniform loading screen: IN read [4729.601562 .. 4729.601562],
+	// a single constant across every sampled texel, and OUT read 0 - which is what a load screen
+	// looks like, not what the network does. Only step 5 caught real content, at IN
+	// [0.798239 .. 4729.601562]. The depth_detect measurement has the identical bug and gives up
+	// after 8 windows for the identical reason.
+	uint32_t warmup_frames   = 0;
 	uint32_t step            = 0;
 	uint32_t frames_in_step  = 0;
 	bool     awaiting_copy   = false;
@@ -421,7 +429,8 @@ static constexpr uint32_t kReadbackDelay = 4;
 template <typename LogFn>
 inline void frame(device *dev, command_list *cmd, pipeline_set &p, run_state &r,
                   resource_view in_srv, resource_view out_srv,
-                  uint32_t width, uint32_t height, uint32_t frames_per_step, LogFn log)
+                  uint32_t width, uint32_t height, uint32_t frames_per_step,
+                  uint32_t warmup_needed, LogFn log)
 {
 	if (!r.active || r.complete || !p.ready)
 		return;
@@ -533,6 +542,16 @@ inline void frame(device *dev, command_list *cmd, pipeline_set &p, run_state &r,
 			}
 		}
 		return;   // no accumulation while a step's result is in flight
+	}
+
+	// Hold off until the scene is real. A loading screen is uniform, so the cheap structural
+	// test is "did the PREVIOUS step see any contrast at all" - but on the very first step there
+	// is no previous reading, so a frame count carries it instead. Both are needed: the count
+	// alone would still fire on a long load, and the contrast test alone cannot start.
+	if (r.warmup_frames < warmup_needed)
+	{
+		r.warmup_frames++;
+		return;
 	}
 
 	if (r.frames_in_step == 0)
