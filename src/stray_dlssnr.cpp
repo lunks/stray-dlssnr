@@ -1453,6 +1453,30 @@ static std::atomic<bool> g_nr_pending_init{ false };
 // thread. Atomics because of that crossing, relaxed because nothing is ordered against them.
 static std::atomic<bool>     g_nr_init_failed{ false };
 static std::atomic<uint32_t> g_nr_init_result{ 0 };
+
+// ---- HAS nr_lazy_ngx_init FINISHED, WHATEVER IT DECIDED? -------------------------------------
+// SEPARATE FROM g_nr_init_failed ON PURPOSE, and the separation is the fix for a real defect.
+//
+// nr_service_reconfigure's "initialisation is in flight" branch needs one thing: is lazy init
+// still running? It used to ask g_nr_init_failed, which was a sound proxy only while every
+// record_init_failure was immediately followed by `return false`. DLSS-SR broke that: the two
+// calls in the DLSS-NR block now RECORD AND CARRY ON, because the SR half may still arm. That
+// opened a window - the codec D3DCompile, the mvec D3DCompile and SR's Init_Ext into a 59 MB DLL,
+// i.e. exactly the several hundred milliseconds the branch exists to cover - in which
+// g_nr_init_failed was true while init was still running, so the branch was skipped, the drained
+// action bits were dropped on the floor and the rebuild gate was opened early.
+//
+// The opposite hole was just as real: a pure-SR run (dlss_nr=0) whose SR Init_Ext fails records
+// NO failure at all, so g_nr_init_failed stayed false for ever, the branch matched for ever, and
+// every later request was queued into a pending_work that only a true init_complete can drain.
+// The panel sat at REBUILDING for the rest of the session.
+//
+// This flag answers only the question actually being asked. It is set from a scope guard so that
+// EVERY exit of nr_lazy_ngx_init sets it, including one a later edit adds without reading this.
+// RELEASE-stored, ACQUIRE-loaded, and the guard is declared before the init lock so it fires
+// after st->mutex is released: when the service observes it, the state is settled and free.
+static std::atomic<bool>     g_nr_init_settled{ false };
+
 static bool nr_lazy_ngx_init(device *dev);
 // Defined with the rest of the DLSS-SR pass; forward-declared because the teardown path above it
 // hands it to dlss_sr::destroy_resources.
@@ -5400,6 +5424,16 @@ static void nr_init_device(device *dev)
 // constructed device, which is exactly what init_device does not give us.
 static bool nr_lazy_ngx_init(device *dev)
 {
+	// FIRST STATEMENT, so it is destroyed LAST - after the init lock below has been released and
+	// after init_complete has been stored. Every exit of this function, present or future,
+	// therefore publishes "lazy init is no longer in flight", which is the single question
+	// nr_service_reconfigure's in-flight branch asks. See g_nr_init_settled for the two ways the
+	// old g_nr_init_failed proxy for this got it wrong once DLSS-SR could arm independently.
+	struct settled_guard
+	{
+		~settled_guard() { g_nr_init_settled.store(true, std::memory_order_release); }
+	} settled;
+
 	const std::wstring dir = ngx::module_directory_of(reinterpret_cast<const void *>(&nr_init_device));
 
 	auto *st = probe::pd_create<nr_state>(dev, kNrStateGuid);
@@ -5721,9 +5755,18 @@ static bool nr_lazy_ngx_init(device *dev)
 		// already changed it - and reporting the ini's value for a setting the user has edited is
 		// the sort of small lie this log exists to not tell. The keys that are NOT live yet are
 		// still read from g_cfg, because for those g_cfg IS the only value there is.
+		// THROUGH read_ident/want_hash, not g_cfg, and this line is why the rule above is stated
+		// rather than assumed: shader_hash and sr_shader_hash are LIVE, but they are deliberately
+		// absent from the per-pass snapshot (their read site, read_ident(), runs before begin_pass),
+		// so g_cfg still holds whatever the ini said. A user who pastes the MainUpsampling hash in,
+		// presses Apply SR hash and then arms would have read the OLD value here - from the one
+		// line they look at to confirm the re-pin took, while the render path at nr_try_run was
+		// already matching against the new one. ONE ident_view feeds both, so the banner and the
+		// identification path cannot disagree.
+		const overlay_ui::ident_view banner_ident = overlay_ui::read_ident();
 		LOGI("  target shader   0x%016llx%s",
-		     (unsigned long long)(g_cfg.sr_shader_hash != 0 ? g_cfg.sr_shader_hash : g_cfg.shader_hash),
-		     (g_cfg.sr_shader_hash != 0) ? "  (sr_shader_hash)" : "  (shader_hash - re-pin with sr_shader_hash after flipping r.TemporalAA.Upsampling)");
+		     (unsigned long long)overlay_ui::want_hash(banner_ident),
+		     (banner_ident.sr_shader_hash != 0) ? "  (sr_shader_hash)" : "  (shader_hash - re-pin with sr_shader_hash after flipping r.TemporalAA.Upsampling)");
 		LOGI("  geometry        output %s, view rect %s, tile %u",
 		     (g_cfg.sr_out_width != 0 || g_cfg.sr_out_height != 0)
 		        ? "PINNED by sr_out_width/sr_out_height" : "derived from the dispatch group counts",
@@ -6169,27 +6212,23 @@ static void nr_service_reconfigure(device *dev)
 	//
 	// The rebuild gate is NOT opened and reconfig_pending is NOT cleared, both deliberately: the
 	// work really is still owed, the pass must stay skipped until it is done, and REBUILDING is
-	// exactly what is happening. The escape hatch is g_nr_init_failed - an initialisation that
-	// died can never publish init_complete, so without that test this branch would hold the panel
-	// at REBUILDING for the rest of the session.
+	// exactly what is happening.
+	//
+	// THE ESCAPE HATCH IS g_nr_init_settled, NOT g_nr_init_failed. The question this branch asks
+	// is "is nr_lazy_ngx_init still running", and g_nr_init_failed stopped answering it the moment
+	// the DLSS-NR half learned to record a failure and CARRY ON so the SR half could still arm.
+	// Asking the failure flag was wrong in both directions - it skipped this branch during the
+	// whole SR tail of a run whose NR Init_Ext had failed (dropping the drained bits and opening
+	// the gate early), and it matched for ever on a pure-SR run whose SR init failed without
+	// recording anything (holding the panel at REBUILDING and queueing every later request into a
+	// pending_work that only a true init_complete can drain). g_nr_init_settled is set from a
+	// scope guard on every exit of nr_lazy_ngx_init, so it means exactly what is being asked.
 	if (st == nullptr && st_raw != nullptr &&
-	    !g_nr_init_failed.load(std::memory_order_relaxed))
+	    !g_nr_init_settled.load(std::memory_order_acquire))
 	{
 		// The census is already applied, above; re-queuing it would just re-log it.
 		st_raw->pending_work.fetch_or(work & ~overlay_ui::a_apply_census,
 		                              std::memory_order_relaxed);
-		return;
-	}
-
-	if (st == nullptr)
-	{
-		// Nothing else can be done on this device yet: nr_lazy_ngx_init creates nr_state, and it
-		// runs on the next dispatch now that the arm above has set g_nr_pending_init. The gate is
-		// opened here too: with no serviceable nr_state there is nothing to release, so the
-		// rebuild IS done, and leaving it shut would wedge the pass before it had ever run.
-		overlay_ui::publish_serviced_rebuild(req.rebuild_epoch);
-		overlay_ui::publish_reconfigure(ok, ok ? why : fail_reason);
-		overlay_ui::publish_reconfig_pending(false);
 		return;
 	}
 
@@ -6201,6 +6240,14 @@ static void nr_service_reconfigure(device *dev)
 	// nr_arm_sr_snippet only ever runs at launch and its header says why: honouring this here would
 	// mean a SECOND NVSDK_NGX_D3D12_Init_Ext in the session, and the one measured fact about
 	// Init_Ext's fragility is that it can HANG.
+	//
+	// IT SITS ABOVE THE `st == nullptr` RETURN, and that placement is load-bearing: on a pure-SR
+	// run (dlss_nr=0) whose SR init failed there IS no serviceable nr_state, so the return below
+	// is the one this request takes - and without the diagnostic in front of it that return would
+	// publish the reconfigure as APPLIED for a change that reaches a bail. It is deliberately
+	// BELOW the in-flight branch above, because g_sr_armed is stored near the END of
+	// nr_lazy_ngx_init: firing this while init is still in flight would burn the one-shot on a
+	// feature that is about to arm perfectly well.
 	//
 	// It is reported rather than silently half-done. Without this the banner would say
 	// "reconfigure APPLIED: \"dlss_sr\" -> tier 1" for a change that reaches a bail, which is the
@@ -6240,6 +6287,18 @@ static void nr_service_reconfigure(device *dev)
 		}
 	}
 
+	if (st == nullptr)
+	{
+		// Nothing else can be done on this device yet: nr_lazy_ngx_init creates nr_state, and it
+		// runs on the next dispatch now that the arm above has set g_nr_pending_init. The gate is
+		// opened here too: with no serviceable nr_state there is nothing to release, so the
+		// rebuild IS done, and leaving it shut would wedge the pass before it had ever run.
+		overlay_ui::publish_serviced_rebuild(req.rebuild_epoch);
+		overlay_ui::publish_reconfigure(ok, ok ? why : fail_reason);
+		overlay_ui::publish_reconfig_pending(false);
+		return;
+	}
+
 	// ---- REFUSE RATHER THAN RUN A RELEASE WITH NO IDLE -----------------------------------------
 	// nr_release_feature_and_output idles the GPU through g_queue, and g_queue is cleared at
 	// on_destroy_command_queue. With it null the release would destroy resources the GPU may
@@ -6250,7 +6309,13 @@ static void nr_service_reconfigure(device *dev)
 	const bool want_teardown = (work & overlay_ui::a_teardown) != 0u;
 	if (want_teardown && g_queue.load(std::memory_order_relaxed) == nullptr)
 	{
-		st->pending_work.fetch_or(work, std::memory_order_relaxed);
+		// a_apply_census is MASKED OUT, exactly as the in-flight branch above masks it and for the
+		// same reason: the census was applied at the top of this function, above every early
+		// return, and re-queuing the bit only makes the next present re-run rt_census::set_live and
+		// re-print its LOGI. Revert raises a_teardown and a_apply_census in one word, so a Revert
+		// pressed in the window between on_destroy_command_queue and on_init_command_queue is a
+		// reachable way to get the census line logged twice for one click.
+		st->pending_work.fetch_or(work & ~overlay_ui::a_apply_census, std::memory_order_relaxed);
 		overlay_ui::publish_reconfigure(false,
 			"there is no graphics queue to idle the GPU with, so nothing was released - the "
 			"reconfigure is still queued and will be applied as soon as one exists");
@@ -6304,6 +6369,13 @@ static void nr_service_reconfigure(device *dev)
 		// ticked and doing nothing. Re-arming it on any reconcile can at worst print the line
 		// twice, which is the right side of that trade.
 		st->logged_sr_suppress = false;
+		// AND THE MOTION-GUIDE LATCH, for the identical reason and as of the same pass.
+		// sr_mvec_decode is a live control raising a_reconcile now, so the guide can fall back to
+		// the game's raw encoded velocity, be read about, be fixed and fall back again inside one
+		// session - and this one-shot would make every fallback after the first SILENT while the
+		// checkbox sat there ticked. It stays in the teardown arm too: it is also a statement
+		// about resources a release destroys. Worst case it prints twice.
+		st->logged_sr_mvec_off = false;
 
 		if (overlay_ui::live_hdr_codec() && !st->codec.ok && !st->codec_failed)
 		{

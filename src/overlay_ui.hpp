@@ -2332,6 +2332,34 @@ inline void draw_controls(const host_facts &f)
 	// choice, and it is not copied.
 	const bool usable = f.valid && live_enabled() && f.snippet_loaded && f.armed;
 
+	// THREE SCOPES, NOT ONE, AND THE SPLIT IS A FIX RATHER THAN A TIDY-UP.
+	//
+	// `usable` above is a statement about DLSS-NR and only about DLSS-NR: f.snippet_loaded is
+	// g_snippet.available, i.e. nvngx_dlssnr.dll. One BeginDisabled(!usable) used to run from the
+	// "DLSS 5 Neural Rendering" separator all the way past the identification block, which put the
+	// whole DLSS-SR section inside it - and ImGui's disabled state is a stack that a nested
+	// BeginDisabled(false) does not cancel, so on the merge's own headline configuration
+	// (dlss_nr=0, dlss_sr=1) every SR control was inert. That configuration never loads the NR
+	// snippet by design, so `usable` is false however perfectly DLSS-SR armed. The user got a
+	// greyed-out dlss_sr checkbox - the control whose OFF direction is the fully live one and the
+	// one an A/B actually reaches for - with no explanation, because the hint line above is gated
+	// on snippet_reason and no load was attempted, and no way back to dlss_nr=1 short of editing
+	// the ini by hand.
+	//
+	// sr_section_live is deliberately NOT "SR is armed". Ticking dlss_sr while nvngx_dlss.dll was
+	// never loaded is the documented save-and-relaunch path, and the amber status line right under
+	// the box tells the user to do exactly that - so the box has to be clickable in precisely the
+	// state where SR is not running. What must NOT be clickable in that state is everything
+	// downstream of a live SR feature, and that is the inner BeginDisabled the section already has.
+	const bool sr_usable       = f.valid && live_enabled() && f.sr_snippet_loaded && f.sr_armed;
+	const bool sr_section_live = f.valid && live_enabled();
+	// Identification is SHARED and always was: want_hash() folds shader_hash, dlss_sr and
+	// sr_shader_hash into one value read at nr_try_run BEFORE the NR/SR branch is taken, and the
+	// srv_/uav_ registers resolve the same descriptors for both features. Gating it on the NR
+	// snippet meant a pure-SR run could not re-pin the shader it was failing to identify, which is
+	// the one control that state needs. Either feature being armed is enough.
+	const bool ident_usable    = usable || sr_usable;
+
 	// ---- THE ADD-ON ITSELF ---------------------------------------------------------------------
 	// OUTSIDE the BeginDisabled below, and that is the whole point of it. Everything else greys out
 	// when NGX is not armed; this is the control that ARMS it, so greying it out with the rest
@@ -2778,9 +2806,15 @@ inline void draw_controls(const host_facts &f)
 
 	ImGui::EndDisabled();
 
+	// THE DLSS-NR SCOPE ENDS HERE. Everything from here down is either DLSS-SR's, shared between
+	// the two, or launch-time - and none of it may be gated on the DLSS-NR snippet. See the three
+	// predicates at the top of this function.
+	ImGui::EndDisabled();   // !usable
+
 	// ---- DLSS Super Resolution --------------------------------------------------------------------
 	ImGui::SeparatorText("DLSS Super Resolution (NGX feature 1, nvngx_dlss.dll)");
 
+	ImGui::BeginDisabled(!sr_section_live);
 	{
 		const bool want_sr    = l.dlss_sr.load(std::memory_order_relaxed);
 		// f.valid is false when the DllMain hook has not run, which is the ABI probe's case. Treat
@@ -2863,7 +2897,17 @@ inline void draw_controls(const host_facts &f)
 			"ratio selects, which is why a preset set for the wrong ratio silently does nothing. "
 			"0 = auto, i.e. let the snippet choose.");
 
-		checkbox_b("Decode UE4's velocity encoding for SR (sr_mvec_decode)", l.sr_mvec_decode, k_reset,
+		// a_reconcile, NOT a bare bump. This tooltip promises that ticking the box asks the service
+		// to BUILD the shared mvec pipeline, and checkbox_b cannot ask the service anything: it
+		// stores the atomic and bumps an epoch, so action_bits stays empty, k_reset never moves the
+		// rebuild epoch, take_reconfigure returns bits==0 with ident_changed false, and
+		// nr_service_reconfigure leaves at its `work == 0u && !req.ident_changed` early exit -
+		// above the a_reconcile block that was written for exactly this case and even names it.
+		// The DLSS-NR twin above is wired with checkbox_action for the same reason; this was an
+		// asymmetry rather than a decision. nr_build_mvec_pipeline returns early on st.mvec.ok, so
+		// the common case where the pipeline already exists still costs nothing.
+		checkbox_action("Decode UE4's velocity encoding for SR (sr_mvec_decode)", l.sr_mvec_decode,
+			a_reconcile, "sr_mvec_decode", k_reset,
 			"Live, one Reset frame. Independent of the DLSS-NR mvec_decode above in VALUE, but the "
 			"two share ONE compiled pipeline: the root signature, the PSO and the DXBC are a single "
 			"set, built when EITHER feature asks for it, and each feature writes into its own target "
@@ -2891,9 +2935,15 @@ inline void draw_controls(const host_facts &f)
 			"DLSS-NR half is released and rebuilt with it, because they share one teardown.");
 
 		ImGui::EndDisabled();
+	}
+	ImGui::EndDisabled();   // !sr_section_live
 
-		// dlss_nr is NOT inside the disabled block: it is the key a user reaches for precisely when
-		// they want SR alone, i.e. while SR is not yet armed.
+	// dlss_nr is OUTSIDE EVERY DISABLED SCOPE, which is what its comment always claimed and what it
+	// now actually is: it used to sit outside the SR section's inner block but inside the DLSS-NR
+	// `usable` block, so on a dlss_nr=0 run - the only run in which anyone wants this control - it
+	// was greyed out and there was no way back to 1 without hand-editing the ini. It is the key a
+	// user reaches for precisely when nothing is armed.
+	{
 		checkbox_action("Load and initialise DLSS-NR at all (dlss_nr)", l.dlss_nr,
 			0u, "dlss_nr", k_plain,
 			"LAUNCH-TIME, AND THIS IS THE ONE PLACE THAT SAYS SO. Unlike every other control on this "
@@ -2910,6 +2960,9 @@ inline void draw_controls(const host_facts &f)
 	}
 
 	// ---- identification --------------------------------------------------------------------------
+	// Shared by both features - see ident_usable at the top of this function.
+	ImGui::BeginDisabled(!ident_usable);
+
 	ImGui::SeparatorText("Identification - which dispatch this add-on hooks");
 
 	overlay_imgui::textf_colored(col::amber,
@@ -2963,10 +3016,10 @@ inline void draw_controls(const host_facts &f)
 		"cleared - otherwise a recycled address from the old configuration could false-match the "
 		"temporal-feedback detector.");
 
-	// ---- NGX bring-up ------------------------------------------------------------------------------
 	// The DLSS-SR re-pin sits HERE, beside the key it overrides, rather than in the DLSS-SR section
-	// below: it is an identification input, it goes through the identification epoch, and a reader
-	// looking for "which dispatch" must find both in one place.
+	// above: it is an identification input, it goes through the identification epoch, and a reader
+	// looking for "which dispatch" must find both in one place. It is also why this whole section
+	// cannot be gated on the DLSS-NR snippet - it is an SR control.
 	{
 		static char s_buf[32] = {};
 		static bool s_editing = false;
@@ -2984,6 +3037,14 @@ inline void draw_controls(const host_facts &f)
 		"silently stops being identified. DLSS-SR wants the MainUpsampling permutation, which is a "
 		"different shader from the one DLSS-NR is pinned to, so this carries its hash without "
 		"disturbing that pin and the two features can be A/B'd on one install.");
+
+	ImGui::EndDisabled();   // !ident_usable
+
+	// ---- NGX bring-up ------------------------------------------------------------------------------
+	// BACK UNDER `usable`, and this one genuinely is DLSS-NR-only: PopulateParameters_Impl is called
+	// on st->params, the DLSS-NR parameter block, which a dlss_nr=0 run never allocates at all
+	// (stray_dlssnr.cpp guards the call on st->params != nullptr for exactly that reason).
+	ImGui::BeginDisabled(!usable);
 
 	ImGui::SeparatorText("NGX bring-up");
 
