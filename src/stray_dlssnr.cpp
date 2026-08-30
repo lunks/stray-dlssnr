@@ -2195,7 +2195,7 @@ static bool nr_arm_snippet(const std::wstring &dir, const char *why)
 /// It arms g_nr_pending_init rather than a one-shot of its own because nr_lazy_ngx_init does BOTH
 /// halves - without this store a dlss_nr=0, dlss_sr=1 run would load nvngx_dlss.dll and then
 /// never call into it.
-static bool nr_arm_sr_snippet(const std::wstring &dir, const char *why)
+static bool nr_arm_sr_snippet(const std::wstring &dir, const char *why, const char *asked_for)
 {
 	if (g_sr_snippet.available)
 		return true;
@@ -2205,8 +2205,12 @@ static bool nr_arm_sr_snippet(const std::wstring &dir, const char *why)
 	{
 		// load_snippet has already called unload() on every failure path, so g_sr_snippet is clean.
 		LOGE("DLSS-SR not available (%s): %s", why, g_sr_snippet.not_available_reason.c_str());
-		LOGE("DLSS-SR: dlss_sr=1 was asked for and cannot be honoured. The game renders exactly as "
-		     "it would with the add-on unloaded (or with DLSS-NR alone, if dlss_nr=1).");
+		// `asked_for` rather than a hardcoded "dlss_sr=1". The caller already computes which key
+		// brought it here and passes it in `why`; this second line used to name dlss_sr
+		// unconditionally and so contradicted the line immediately above it on every
+		// dlss_sr=0, dlss_chain=1 run - the one configuration the chain is tested on.
+		LOGE("DLSS-SR: %s was asked for and cannot be honoured. The game renders exactly as "
+		     "it would with the add-on unloaded (or with DLSS-NR alone, if dlss_nr=1).", asked_for);
 		return false;
 	}
 	LOGI("DLSS-SR: loaded nvngx_dlss.dll%s (%s).",
@@ -3981,6 +3985,65 @@ static void sr_try_run(command_list *cmd, device *dev, probe::device_shadow &sh,
 		return;
 	}
 
+	// ---------------------------------------------------------------- create-param latch
+	//
+	// THE SAME SEAM AS THE TWO ABOVE, FOR THE CREATE PARAMS THAT ARE NOT EXTENTS. The descriptor is
+	// built HERE rather than beside CreateFeature so that this test can run BEFORE stage 1 records
+	// anything - the chained frame's DLSS-NR half included - and so that the values compared are
+	// bit-identical to the ones create_feature will be handed.
+	//
+	// WHY THIS TEST HAS TO EXIST. dlss_sr::feature_matches (src/dlss_sr.hpp) compares create_flags,
+	// perf_quality AND hw_depth as well as the four extents, and create_feature's answer to a
+	// mismatch on a LIVE handle is release_feature - whose header states the contract verbatim:
+	// "The CALLER must have idled the queue first - CreateFeature and EvaluateFeature both record
+	// real GPU work, so in-flight work can still reference it." sr_try_run runs on a COMMAND-LIST
+	// RECORDING THREAD, inside the host's capture/restore window, and cannot idle a queue. Before
+	// these keys were live the value could not move under a running feature, so the shape was
+	// unreachable; every one of them is live now - begin_pass writes them into g_cfg from the
+	// overlay's atomics on this very thread - so ticking IsHDR would have destroyed a feature the
+	// GPU was still reading from.
+	//
+	// The only wait_idle() in the tree is the one nr_release_feature_and_output takes on the MAIN
+	// thread from on_present, and kTeardown is how a recording thread reaches it. So a create-param
+	// edit now takes the IDENTICAL path a resolution change does, and the "Recreate the SR feature"
+	// button remains a second, equivalent route to the same seam rather than the only one.
+	//
+	// sr_render_preset is deliberately NOT covered, because feature_matches does not compare it:
+	// a preset change cannot make create_feature release anything, so it stays a button-only key.
+	dlss_sr::create_desc cd;
+	cd.render_w = render_w;
+	cd.render_h = render_h;
+	cd.out_w    = want_out_w;
+	cd.out_h    = want_out_h;
+	cd.perf_quality = g_cfg.sr_perf_quality;
+	cd.hw_depth     = g_cfg.sr_hw_depth;
+	cd.preset       = g_cfg.sr_render_preset;
+	cd.flags = (g_cfg.sr_hdr             ? dlss_sr::kFlagIsHDR          : 0u)
+	         | (g_cfg.sr_mv_lowres       ? dlss_sr::kFlagMVLowRes       : 0u)
+	         | (g_cfg.sr_mv_jittered     ? dlss_sr::kFlagMVJittered     : 0u)
+	         | (g_cfg.sr_depth_inverted  ? dlss_sr::kFlagDepthInverted  : 0u)
+	         | (g_cfg.sr_auto_exposure   ? dlss_sr::kFlagAutoExposure   : 0u)
+	         | (g_cfg.sr_alpha_upscaling ? dlss_sr::kFlagAlphaUpscaling : 0u);
+
+	// handle != nullptr is what makes this terminate: the teardown NULLS the handle, so the very
+	// next pass falls straight through to create_feature and builds the feature the new values ask
+	// for. It can never queue a second teardown for the same edit.
+	if (st.sr_feat.handle != nullptr && !dlss_sr::feature_matches(st.sr_feat, cd))
+	{
+		LOGI("DLSS-SR: a CREATE-LATCHED parameter moved (PerfQualityValue %u -> %u, "
+		     "DLSS.Use.HW.Depth %d -> %d, Create.Flags 0x%02x -> 0x%02x). These are latched into "
+		     "the feature at CreateFeature and there is no evaluate-time equivalent, so the "
+		     "feature is queued for release on the next present - the same seam a resolution "
+		     "change uses, and the only one that can idle the queue first. This frame runs the "
+		     "game's own TAA untouched; the next accepted dispatch creates the feature with the "
+		     "new values.",
+		     (unsigned)st.sr_feat.perf_quality, (unsigned)cd.perf_quality,
+		     (int)st.sr_feat.hw_depth, (int)cd.hw_depth,
+		     (unsigned)st.sr_feat.create_flags, (unsigned)cd.flags);
+		st.pending_work.fetch_or(kTeardown, std::memory_order_relaxed);
+		return;
+	}
+
 	// ---------------------------------------------------------------- SR-owned resources
 	SR_STAGE("about to create/validate the SR resources");
 	const bool direct = g_cfg.sr_direct_output;
@@ -4383,21 +4446,9 @@ static void sr_try_run(command_list *cmd, device *dev, probe::device_shadow &sh,
 	}
 
 	// ---- stage 2 of 2: CreateFeature + EvaluateFeature ------------------------------------------
-	dlss_sr::create_desc cd;
-	cd.render_w = render_w;
-	cd.render_h = render_h;
-	cd.out_w    = want_out_w;
-	cd.out_h    = want_out_h;
-	cd.perf_quality = g_cfg.sr_perf_quality;
-	cd.hw_depth     = g_cfg.sr_hw_depth;
-	cd.preset       = g_cfg.sr_render_preset;
-	cd.flags = (g_cfg.sr_hdr             ? dlss_sr::kFlagIsHDR          : 0u)
-	         | (g_cfg.sr_mv_lowres       ? dlss_sr::kFlagMVLowRes       : 0u)
-	         | (g_cfg.sr_mv_jittered     ? dlss_sr::kFlagMVJittered     : 0u)
-	         | (g_cfg.sr_depth_inverted  ? dlss_sr::kFlagDepthInverted  : 0u)
-	         | (g_cfg.sr_auto_exposure   ? dlss_sr::kFlagAutoExposure   : 0u)
-	         | (g_cfg.sr_alpha_upscaling ? dlss_sr::kFlagAlphaUpscaling : 0u);
-
+	// `cd` was built ABOVE, beside the geometry latch, and the create-param latch there has already
+	// refused this pass if it does not match a live feature. So by the time control reaches here
+	// create_feature can only CREATE - never release - and the contract in its header holds.
 	SR_STAGE("about to CreateFeature / EvaluateFeature");
 	if (dlss_sr::create_feature(g_sr_snippet, st.sr_feat, d3d12_cmd, cd, &sr_log))
 	{
@@ -4841,8 +4892,19 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	// nr_service_reconfigure instead - which runs from on_present UNCONDITIONALLY, so it works in
 	// the one case the button exists for and the old routing could not reach: the pass has wedged
 	// and begin_pass is no longer being called at all.
+	//
+	// st->sr_feat.need_reset RIDES ALONG as a second out-param, and it has to: begin_pass's reset
+	// consequence is the ONLY thing that turns a k_reset control into a Reset frame, and DLSS-SR's
+	// Reset is (ed.reset || st.sr_feat.need_reset) - a flag nothing else in this file raises except
+	// a feature release, the camera-cut path and the mvec-guide rejection. Five SR controls
+	// (sr_jitter_scale_x/y, sr_jitter_projection_only, sr_mv_scale_x/y) are wired at k_reset and
+	// none of them moves the output geometry, so sr_try_run's own key_moved/geometry_moved seams
+	// cannot stand in. Passing the flag here is what makes their "Live, one Reset frame" tooltip
+	// true - and it is deliberately a raise on the EDGE, not a mirror of st->need_reset's level;
+	// begin_pass's own header says why the level would be wrong in an SR-alone run.
 	if (!overlay_ui::begin_pass(g_cfg, st->cfg_scratch, st->seen_pass, st->need_reset,
-	                            st->pending_res, st->codec.ok, st->codec_failed, st->orig_ok))
+	                            st->sr_feat.need_reset, st->pending_res, st->codec.ok,
+	                            st->codec_failed, st->orig_ok))
 		return;
 	// ---- END overlay_ui hook ----
 
@@ -6302,7 +6364,10 @@ static void nr_init_device(device *dev)
 	if (overlay_ui::live_dlss_sr() || overlay_ui::live_dlss_chain())
 		nr_arm_sr_snippet(dir, overlay_ui::live_dlss_chain()
 		                       ? "dlss_chain=1 at load (the chain needs BOTH snippets)"
-		                       : "dlss_sr=1 at load");
+		                       : "dlss_sr=1 at load",
+		                       overlay_ui::live_dlss_chain()
+		                       ? "dlss_chain=1 (which needs BOTH snippets)"
+		                       : "dlss_sr=1");
 
 	// Neither snippet is present. This is the EXPECTED state for a stock install and is NOT an
 	// error - and it is stated rather than returned on, because there is nothing left to return
@@ -6589,7 +6654,13 @@ static bool nr_lazy_ngx_init(device *dev)
 				// RECOMMENDED render resolution and has no power whatsoever to make UE render at
 				// it - the only lever is r.ScreenPercentage. It runs on a SCRATCH block because
 				// Width/Height/OutWidth/OutHeight have INVERTED meaning there.
-				if (g_cfg.sr_optimal_settings && g_sr_snippet.populate_params != nullptr)
+				// live_sr_optimal_settings(), not g_cfg: this function runs BEFORE begin_pass has
+				// ever written g_cfg for this device, and the key is deliberately absent from the
+				// snapshot anyway, so g_cfg can only ever hold what the ini said. The neighbouring
+				// arm-time predicates - live_dlss_nr(), live_hdr_codec(), live_dlss_sr() - all go
+				// through the accessor for exactly this reason, and `enabled` 0 -> 1 from the panel
+				// re-runs this whole function in-session, which is the case it was written for.
+				if (overlay_ui::live_sr_optimal_settings() && g_sr_snippet.populate_params != nullptr)
 				{
 					ngx::parameter_block scratch;
 					const ngx::Result pr = g_sr_snippet.populate_params(&scratch);
@@ -6610,8 +6681,13 @@ static bool nr_lazy_ngx_init(device *dev)
 						{
 							// The DISPLAY dims go in as Width/Height here - the opposite of
 							// CreateFeature. sr_out_width/height, or 3840x2160 if unpinned.
-							const uint32_t disp_w = (g_cfg.sr_out_width  != 0) ? g_cfg.sr_out_width  : 3840u;
-							const uint32_t disp_h = (g_cfg.sr_out_height != 0) ? g_cfg.sr_out_height : 2160u;
+							// The overlay's atomics for the same reason the gate above uses them:
+							// g_cfg still holds the ini's numbers at arm time.
+							const overlay_ui::live_block &olb = overlay_ui::live();
+							const uint32_t pin_w = olb.sr_out_width.load(std::memory_order_relaxed);
+							const uint32_t pin_h = olb.sr_out_height.load(std::memory_order_relaxed);
+							const uint32_t disp_w = (pin_w != 0) ? pin_w : 3840u;
+							const uint32_t disp_h = (pin_h != 0) ? pin_h : 2160u;
 							ngx::set_u32(&scratch, dlss_sr::kParamWidth,  disp_w);
 							ngx::set_u32(&scratch, dlss_sr::kParamHeight, disp_h);
 							ngx::set_u32(&scratch, dlss_sr::kParamPerfQuality,
@@ -6673,14 +6749,36 @@ static bool nr_lazy_ngx_init(device *dev)
 		LOGI("  target shader   0x%016llx%s",
 		     (unsigned long long)overlay_ui::want_hash(banner_ident),
 		     (banner_ident.sr_shader_hash != 0) ? "  (sr_shader_hash)" : "  (shader_hash - re-pin with sr_shader_hash after flipping r.TemporalAA.Upsampling)");
+		// ONE reference to the live block for the whole banner, exactly as the DLSS-NR banner below
+		// takes one. Seventeen keys on the lines that follow - the output geometry, the ladder, all
+		// six create flags, sr_hw_depth, the jitter pair, sr_jitter_projection_only and the mvec
+		// scale pair - were moved into OVERLAY_OWNED_FIELDS and the per-pass snapshot by the same
+		// pass that wrote the rule at the top of this block, and every one of them was still being
+		// printed from g_cfg. g_cfg has exactly two writers, cfg::load and begin_pass, and this
+		// function runs from nr_try_run's one-shot ABOVE the begin_pass call - so at banner time
+		// g_cfg holds the ini's values and never the user's. The banner is the bring-up instrument
+		// for the very A/B rungs these keys exist to drive, and it was reporting the numbers the
+		// file shipped with while the next dispatch used the ones on screen.
+		const overlay_ui::live_block &sb = overlay_ui::live();
+		const uint32_t ban_out_w = sb.sr_out_width.load(std::memory_order_relaxed);
+		const uint32_t ban_out_h = sb.sr_out_height.load(std::memory_order_relaxed);
+		const float    ban_jit_x = sb.sr_jitter_scale_x.load(std::memory_order_relaxed);
+		const float    ban_jit_y = sb.sr_jitter_scale_y.load(std::memory_order_relaxed);
+		const bool     ban_hdr   = sb.sr_hdr.load(std::memory_order_relaxed);
+		const bool     ban_mvlr  = sb.sr_mv_lowres.load(std::memory_order_relaxed);
+		const bool     ban_mvj   = sb.sr_mv_jittered.load(std::memory_order_relaxed);
+		const bool     ban_dinv  = sb.sr_depth_inverted.load(std::memory_order_relaxed);
+		const bool     ban_ae    = sb.sr_auto_exposure.load(std::memory_order_relaxed);
+		const bool     ban_alpha = sb.sr_alpha_upscaling.load(std::memory_order_relaxed);
 		LOGI("  geometry        output %s, view rect %s, tile %u",
-		     (g_cfg.sr_out_width != 0 || g_cfg.sr_out_height != 0)
+		     (ban_out_w != 0 || ban_out_h != 0)
 		        ? "PINNED by sr_out_width/sr_out_height" : "derived from the dispatch group counts",
-		     g_cfg.sr_use_view_rect ? "from ViewSizeAndInvSize" : "the colour TEXTURE extent",
-		     g_cfg.sr_group_tile);
+		     sb.sr_use_view_rect.load(std::memory_order_relaxed)
+		        ? "from ViewSizeAndInvSize" : "the colour TEXTURE extent",
+		     (unsigned)sb.sr_group_tile.load(std::memory_order_relaxed));
 		LOGI("  ladder          sr_suppress_taa=%d sr_direct_output=%d sr_copy_back=%d",
-		     (int)overlay_ui::live_sr_suppress_taa(), (int)g_cfg.sr_direct_output,
-		     (int)g_cfg.sr_copy_back);
+		     (int)overlay_ui::live_sr_suppress_taa(), (int)overlay_ui::live_sr_direct_output(),
+		     (int)overlay_ui::live_sr_copy_back());
 		if (overlay_ui::live_dlss_chain())
 			LOGI("  CHAIN MODE      dlss_chain=1: DLSS-NR runs FIRST, at the render extent, and its "
 			     "denoised result becomes this feature's COLOUR INPUT. DLSS-NR is %s. The chain is "
@@ -6689,25 +6787,27 @@ static bool nr_lazy_ngx_init(device *dev)
 			     (st->params != nullptr) ? "ARMED" : "NOT ARMED, so the chain will NOT run");
 		LOGI("  create          PerfQualityValue=%s DLSS.Use.HW.Depth=%d Create.Flags=0x%02x "
 		     "[IsHDR=%d MVLowRes=%d MVJittered=%d DepthInverted=%d AutoExposure=%d AlphaUpscaling=%d]",
-		     dlss_sr::perf_quality_name(overlay_ui::live_sr_perf_quality()), (int)g_cfg.sr_hw_depth,
-		     (unsigned)((g_cfg.sr_hdr             ? dlss_sr::kFlagIsHDR          : 0u)
-		              | (g_cfg.sr_mv_lowres       ? dlss_sr::kFlagMVLowRes       : 0u)
-		              | (g_cfg.sr_mv_jittered     ? dlss_sr::kFlagMVJittered     : 0u)
-		              | (g_cfg.sr_depth_inverted  ? dlss_sr::kFlagDepthInverted  : 0u)
-		              | (g_cfg.sr_auto_exposure   ? dlss_sr::kFlagAutoExposure   : 0u)
-		              | (g_cfg.sr_alpha_upscaling ? dlss_sr::kFlagAlphaUpscaling : 0u)),
-		     (int)g_cfg.sr_hdr, (int)g_cfg.sr_mv_lowres, (int)g_cfg.sr_mv_jittered,
-		     (int)g_cfg.sr_depth_inverted, (int)g_cfg.sr_auto_exposure, (int)g_cfg.sr_alpha_upscaling);
+		     dlss_sr::perf_quality_name(overlay_ui::live_sr_perf_quality()),
+		     (int)sb.sr_hw_depth.load(std::memory_order_relaxed),
+		     (unsigned)((ban_hdr   ? dlss_sr::kFlagIsHDR          : 0u)
+		              | (ban_mvlr  ? dlss_sr::kFlagMVLowRes       : 0u)
+		              | (ban_mvj   ? dlss_sr::kFlagMVJittered     : 0u)
+		              | (ban_dinv  ? dlss_sr::kFlagDepthInverted  : 0u)
+		              | (ban_ae    ? dlss_sr::kFlagAutoExposure   : 0u)
+		              | (ban_alpha ? dlss_sr::kFlagAlphaUpscaling : 0u)),
+		     (int)ban_hdr, (int)ban_mvlr, (int)ban_mvj,
+		     (int)ban_dinv, (int)ban_ae, (int)ban_alpha);
 		LOGI("  jitter          scale=(%.3f, %.3f)%s tier=%s",
-		     g_cfg.sr_jitter_scale_x, g_cfg.sr_jitter_scale_y,
-		     (g_cfg.sr_jitter_scale_x != 1.0f || g_cfg.sr_jitter_scale_y != 1.0f)
+		     (double)ban_jit_x, (double)ban_jit_y,
+		     (ban_jit_x != 1.0f || ban_jit_y != 1.0f)
 		        ? "  <-- OVERRIDDEN, this is the sign A/B" : "",
-		     g_cfg.sr_jitter_projection_only ? "projection_only permitted" : "strict (full/no_params)");
+		     sb.sr_jitter_projection_only.load(std::memory_order_relaxed)
+		        ? "projection_only permitted" : "strict (full/no_params)");
 		LOGI("  motion guide    sr_mvec_decode=%d sr_mvec_reconstruct=%d (pipeline %s) scale=%s/%s",
 		     (int)overlay_ui::live_sr_mvec_decode(), (int)overlay_ui::live_sr_mvec_reconstruct(),
 		     st->mvec.ok ? "built" : "NOT BUILT",
-		     g_cfg.sr_mv_scale_x != 0.0f ? "OVERRIDDEN" : "auto",
-		     g_cfg.sr_mv_scale_y != 0.0f ? "OVERRIDDEN" : "auto");
+		     sb.sr_mv_scale_x.load(std::memory_order_relaxed) != 0.0f ? "OVERRIDDEN" : "auto",
+		     sb.sr_mv_scale_y.load(std::memory_order_relaxed) != 0.0f ? "OVERRIDDEN" : "auto");
 		LOGW("DLSS-SR: the confirmation that the feature actually RAN is the line "
 		     "\"DLSS-SR: EVALUATE #1 OK\", printed from the branch immediately after "
 		     "EvaluateFeature returned Success, and the periodic \"--- DLSS-SR @ frame N\" census "
@@ -7305,12 +7405,22 @@ static void nr_service_reconfigure(device *dev)
 			}
 		}
 
-		// The SAME shared-pipeline predicate nr_lazy_ngx_init uses. One root signature, one PSO, one
-		// DXBC, two targets - so ticking sr_mvec_decode with mvec_decode off has to build it here
-		// too, or the SR guide would silently fall back to the game's raw encoded velocity with no
-		// diagnostic that names the reason.
+		// The SAME shared-pipeline predicate nr_lazy_ngx_init uses - and it is now actually the
+		// same. One root signature, one PSO, one DXBC, two targets, so ticking sr_mvec_decode with
+		// mvec_decode off has to build it here too, or the SR guide would silently fall back to the
+		// game's raw encoded velocity with no diagnostic that names the reason.
+		//
+		// dlss_chain IS PART OF THE PREDICATE, exactly as it is in nr_lazy_ngx_init's copy, and it
+		// was missing here while the comment above already claimed the two were identical. The
+		// configuration it stranded is the one the chain is meant to be tested on: dlss_chain=1,
+		// dlss_sr=0, both decode keys off at launch, so the pipeline is never built - then the
+		// player ticks sr_mvec_decode, sr_mvec_decode's a_reconcile reaches this arm, live_dlss_sr()
+		// is 0, the predicate is false, the pipeline is never built, mvec_wanted stays false for the
+		// rest of the run, and the banner reports the reconfigure APPLIED over a chained frame still
+		// being guided by the game's raw encoded velocity.
 		if ((overlay_ui::live_mvec_decode() ||
-		     (overlay_ui::live_dlss_sr() && overlay_ui::live_sr_mvec_decode())) &&
+		     ((overlay_ui::live_dlss_sr() || overlay_ui::live_dlss_chain()) &&
+		      overlay_ui::live_sr_mvec_decode())) &&
 		    !st->mvec.ok && !st->mvec_failed)
 		{
 			if (!nr_build_mvec_pipeline(dev, *st, dir))
@@ -7788,10 +7898,14 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 		// state. Both read the overlay's atomics instead, which are authoritative anyway - they
 		// are what g_cfg is written FROM.
 		//
-		// sr_direct_output and sr_copy_back are deliberately still read from g_cfg: neither is in
-		// OVERLAY_OWNED_FIELDS or in the snapshot, so nothing ever writes them after cfg::load and
-		// reading them here is a main-thread read of a main-thread-written value. If either is
-		// made live, it joins the two above IN THIS LINE.
+		// sr_direct_output and sr_copy_back ARE LIVE TOO, and this line used to carry a comment
+		// saying the opposite - that neither was in OVERLAY_OWNED_FIELDS or the snapshot, so
+		// reading them from g_cfg here was a main-thread read of a main-thread-written value, and
+		// that if either were made live it would join the others IN THIS LINE. Both were made live
+		// in the same pass that wrote it (OVERLAY_OWNED_FIELDS and the tier-0 snapshot block both
+		// carry them) and this line was not updated with them, leaving a C++ data race on two
+		// non-atomic bools that could report the pre-edit state for the rest of the run. They read
+		// the atomics now, like every other value on this line.
 		//
 		// dlss_chain joins the gate for the same reason it joins every other one: with dlss_sr=0
 		// and dlss_chain=1 the SR feature is armed and evaluating, and a census that stayed silent
@@ -7804,8 +7918,9 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 			     (unsigned long long)sr_suppressed, (unsigned long long)sr_mvec,
 			     sr_rw, sr_rh, sr_ow, sr_oh,
 			     (int)g_sr_armed.load(std::memory_order_relaxed),
-			     (int)overlay_ui::live_sr_suppress_taa(), (int)g_cfg.sr_direct_output,
-			     (int)g_cfg.sr_copy_back);
+			     (int)overlay_ui::live_sr_suppress_taa(),
+			     (int)overlay_ui::live_sr_direct_output(),
+			     (int)overlay_ui::live_sr_copy_back());
 		// THE CHAIN'S PROOF-OF-LIFE LINE. chained= is incremented on the ONE branch where BOTH
 		// EvaluateFeature calls returned Success on the same dispatch, so a non-zero value is
 		// evidence the chain RAN. Zero with dlss_chain=1 means it did not, and one of the

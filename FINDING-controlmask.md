@@ -1,52 +1,58 @@
-# Verified difference against the reference: we write ControlMask, renodx never does
+# RESOLVED: the ControlMask hypothesis is dead, and the real gate is a `dynamic_cast`
 
-Measured by the parent session, 2026-08-30, before the diagnosis workflow reported.
+Raised 2026-08-30 by the parent session; closed the same day against the deployed snippet,
+`nvngx_dlssnr.dll` md5 `eea91faf55a8993656c66815f0497b3b`. Kept as a record of a refuted
+hypothesis, because the *shape* of the mistake recurred twice more in the same investigation.
 
-| | |
-|---|---|
-| **ours** | `nr_clear_resource(p, s_mask)` at `src/stray_dlssnr.cpp:4438`, called on **every accepted evaluate**. It does `ngx::set_res(p, "DLSSNR.ControlMask", (ID3D12Resource*)nullptr)` plus four `set_u32` zeros for the subrect family. |
-| **renodx** | `strings -a renodx-dlss5-v2.5.addon64 \| grep -c "DLSSNR.ControlMask"` → **0**. The string is not in the binary. It never sets the key in any form. |
+## The hypothesis
 
-## Why this is the leading hypothesis
+We write `DLSSNR.ControlMask` as an explicit null on every evaluate; renodx never writes the key
+at all (`strings -a renodx-dlss5-v2.5.addon64 | grep -c "DLSSNR.ControlMask"` → 0). If the
+snippet's test were "did `GetResource` succeed" rather than "is the pointer non-null", the null
+would read as *present*, force `UseAutoMask = 0`, and bypass both structure strengths.
 
-`nr_clear_resource`'s own comment already documents the mechanism, and a previous author wrote the
-null **specifically to avoid it**:
+## Why it is refuted
 
-> *"Leaving the previous frame's pointer there both dangles and, for the control mask specifically,
-> keeps the snippet forcing UseAutoMask to 0 (which kills BOTH structure strengths) long after the
-> mask went away."*
+Two independent mechanisms, either one sufficient:
 
-That fix rests on an unverified assumption: **that a present-but-null entry is equivalent to an
-absent one.** If the snippet's test is "did `GetResource` succeed" rather than "is the returned
-pointer non-null", then writing null every frame makes the mask *present*, forces
-`UseAutoMask = 0`, and takes the constant path that bypasses both structure strengths —
-matching the user's report exactly, including which controls survived.
-
-Disassembly that motivates it (`nvngx_dlssnr.dll`, md5 `eea91faf…`):
 ```asm
-cmp  QWORD PTR [rdi+0x60], 0
-je   keep
-mov  DWORD PTR [rdi+0xf0], r12d   ; r12d = 0  ->  UseAutoMask := 0
-keep:
-cmp  DWORD PTR [rdi+0xf0], 0
-je   use_constant                 ; bypasses BOTH structure strengths
+0x180019f7d  movups xmmword ptr [rdi+0x60], xmm0   ; zeroed on entry, before the key is read
+0x18001a4c6  mov    qword ptr [rdi+0x60], r14      ; the ABSENT path stores a null itself
+0x18001aa4b  cmp    qword ptr [rdi+0x60], 0
+0x18001aa50  je     0x18001aa59                    ; NULL -> the force-off is SKIPPED
+0x18001aa52  mov    dword ptr [rdi+0xf0], r12d     ; only a NON-NULL mask sets UseAutoMask := 0
 ```
 
-## What must be established, not assumed
+Absent leaves the zero in place; present-but-null stores a zero over a zero. Both reach
+`0x18001aa4b` with `[rdi+0x60] == 0`. The two are exactly equivalent, so the write is safe and
+removing it to match renodx would change nothing. `tools/ngx_paramblock_selftest.cpp` sections 4,
+6 and 7 keep all three cases covered.
 
-1. **Is `+0x60` actually the ControlMask slot?** The parent session assumed it. Prove it by finding
-   where `[reg+0x60]` is written and correlating with the resource-getter call for that key.
-2. **How does the snippet distinguish absent from present-but-null?** Look at the getter's return
-   handling at the call site: `and eax,0xfff00000 / cmp eax,0xbad00000` is the failure test used
-   everywhere else. If the ControlMask read uses that test and null still returns success, the
-   hypothesis holds.
-3. **`Intensity` at `+0xdc` had ZERO `movss` sites** — it may not live where assumed. Pin it
-   separately; it is one of the five dead controls and may have a different cause.
+## What actually gates the three controls
 
-## The cheap experiment
+Not the mask. `use_auto_mask` only *selects* what the effective structure pair at `+0xf8`/`+0xfc`
+becomes. That pair is consumed at exactly one site, behind two `dynamic_cast` null tests
+(`0x18007f5cc` is `__RTDynamicCast`):
 
-Stop writing the key at all when no mask is bound — i.e. match renodx exactly — and keep the
-subrect zeros only if they are separately required. If the five controls come alive, done.
+| gate | cast at | tested at | target type |
+|---|---|---|---|
+| network | `0x180021cc8` | `0x18002253f` | `.?AVCCNetwork@HNetCpp@@` |
+| layer | `0x18003f5e8` | `0x18003f5f3` | `.?AVCCTinlayoutFusedPreBlockSwin1HLayer@HNetCpp@@` |
 
-**Check every other parameter written as an explicit null or zero for the same hazard** before
-concluding. This is a class of bug, not one instance.
+If either returns null, `call 0x180061710` — the pure setter that stores the pair at `cb+0x98` /
+`cb+0x9c` — never runs, and Local Structure, Skin Structure and Automatic Mask are inert
+**together**. See `src/addon_config.hpp` for the full derivation.
+
+## The recurring mistake, stated plainly
+
+All three wrong answers in this investigation shared one shape: **a path was traced and reported
+as a behaviour.**
+
+1. "present-but-null makes the mask bound" — assumed the *test*, never read it.
+2. "Intensity ≥ 1.0 skips the pass" — read `0x18001f51a`'s `je` and stopped, without checking
+   that its caller stores the result to a flag at `0x1800191bd` and falls through.
+3. "the structure strengths are proven to reach the network" — walked the call edges
+   `0x19f30 → 0x21bb0 → 0x3f490 → 0x61710` and never looked at the guards sitting on them.
+
+Reachability is not liveness. A call edge existing is not the edge being taken. Before claiming a
+parameter is live, read every `test`/`cmp` between the parameter and its consumer.
