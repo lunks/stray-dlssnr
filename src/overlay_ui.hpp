@@ -906,10 +906,28 @@ inline void publish_codec_build(bool graft_available, bool decode_overridden)
 	s.codec_decode_overridden.store(decode_overridden, std::memory_order_relaxed);
 }
 
+// need_reset and sr_need_reset are BOTH out-params, and there are TWO rather than one because
+// there are two features with two independent Reset flags and no relationship between them that
+// the call site could derive. DLSS-NR's st.need_reset is cleared by nr_evaluate; DLSS-SR's
+// st.sr_feat.need_reset is cleared by dlss_sr::evaluate_feature. Mirroring the LEVEL of one onto
+// the other at the call site would be wrong, and dangerously so in one direction: in a dlss_nr=0,
+// dlss_sr=1 run nr_evaluate never runs, so st.need_reset never falls back to false and DLSS-SR
+// would be handed Reset=1 on EVERY frame - not "a reset frame" but no temporal accumulation at
+// all. Raising both on the same EDGE, here, is the only shape that gives each feature exactly one
+// reset frame per user action.
+//
+// Every rung that raises one raises the other: the two rebuild-gate skips (the resources under
+// the feature are about to be replaced), the ident change, the flush, and k_reset itself. k_reset
+// is the one this was added for - sr_jitter_scale_x/y, sr_jitter_projection_only and
+// sr_mv_scale_x/y are all wired at k_reset with a "Live, one Reset frame" tooltip, and none of
+// them moves the output geometry, so sr_try_run's key_moved/geometry_moved seams do not cover
+// them either. Before this parameter existed the rung raised only DLSS-NR's flag and those five
+// controls changed the jitter convention mid-history with Reset=0 on every subsequent evaluate.
 inline bool begin_pass(cfg::config &c,
                        cfg::config &scratch,
                        seen_epochs &seen,
                        bool &need_reset,
+                       bool &sr_need_reset,
                        uint64_t &pending_res,
                        bool codec_pipelines_ok,
                        bool codec_failed,
@@ -951,6 +969,7 @@ inline bool begin_pass(cfg::config &c,
 	{
 		pending_res = 0;
 		need_reset  = true;
+		sr_need_reset = true;
 		return false;
 	}
 
@@ -1107,6 +1126,7 @@ inline bool begin_pass(cfg::config &c,
 	{
 		pending_res = 0;
 		need_reset  = true;
+		sr_need_reset = true;
 		return false;
 	}
 
@@ -1132,6 +1152,7 @@ inline bool begin_pass(cfg::config &c,
 		// scene-colour input" hazard the restore path already refuses by name at :3249-3260.
 		pending_res = 0;
 		need_reset  = true;
+		sr_need_reset = true;
 	}
 	else if (flush_e != seen.flush)
 	{
@@ -1142,11 +1163,13 @@ inline bool begin_pass(cfg::config &c,
 		// thing that armed it.
 		pending_res = 0;
 		need_reset  = true;
+		sr_need_reset = true;
 	}
 	else if (reset_e != seen.reset)
 	{
 		seen.reset = reset_e;
 		need_reset = true;
+		sr_need_reset = true;
 	}
 
 	// ---- the two switches ---------------------------------------------------------------------
@@ -1447,6 +1470,14 @@ inline bool     live_sr_suppress_taa()     { return live().sr_suppress_taa.load(
 inline uint32_t live_sr_perf_quality()     { return live().sr_perf_quality.load(std::memory_order_relaxed); }
 inline uint32_t live_sr_render_preset()    { return live().sr_render_preset.load(std::memory_order_relaxed); }
 inline uint64_t live_sr_shader_hash()      { return live().sr_shader_hash.load(std::memory_order_relaxed); }
+// THESE TWO EXIST FOR ONE READ SITE EACH, AND IT IS NOT A SNAPSHOT SITE. Both keys are in
+// OVERLAY_OWNED_FIELDS and in begin_pass's per-pass snapshot, so g_cfg's copies are written on a
+// RECORDING thread - and on_present's DLSS-SR census line runs on the MAIN thread, holding neither
+// st->mutex nor any overlay lock. Reading g_cfg there would be a data race on two non-atomic bools
+// and could report the pre-edit state indefinitely. That is the identical race the census's
+// history_restore/copy_back and mvec_decode/mvec_reconstruct lines already read atomics to avoid.
+inline bool     live_sr_direct_output()    { return live().sr_direct_output.load(std::memory_order_relaxed); }
+inline bool     live_sr_copy_back()        { return live().sr_copy_back.load(std::memory_order_relaxed); }
 // dlss_chain has read sites on BOTH sides of begin_pass, so like dlss_sr it needs an accessor as
 // well as a snapshot line: nr_init_device and nr_lazy_ngx_init decide whether to LoadLibraryW
 // nvngx_dlss.dll and whether to Init_Ext through slot B, and both of those run before any pass.
@@ -3195,10 +3226,11 @@ inline void draw_controls(const host_facts &f)
 			"3  UltraPerformance", "4  UltraQuality", "5  DLAA",
 		};
 		combo_u32("PerfQualityValue (sr_perf_quality)", l.sr_perf_quality, perf_items, 6, k_plain,
-			"Live, at the cost of ONE feature recreate - which is what the Apply below is for. It is "
-			"latched into the DLSS create-params at CreateFeature and there is no evaluate-time "
-			"equivalent, so the value cannot be re-read without releasing the feature. Changing it "
-			"here stores the value; press \"Recreate the SR feature\" to make it take.\n\n"
+			"Live, at the cost of ONE feature recreate, and the render path arranges that itself. It "
+			"is latched into the DLSS create-params at CreateFeature and there is no evaluate-time "
+			"equivalent, so the value cannot be re-read without releasing the feature - and a release "
+			"needs an idled queue, which only the present thread can do. Changing it here queues that "
+			"release; the next accepted dispatch creates the feature with the new value.\n\n"
 			"It does NOT choose the render preset - the snippet picks that slot from Width/OutWidth. "
 			"0 is right for 1920 -> 3840; use 5 (DLAA) when you run r.ScreenPercentage=100.");
 
@@ -3323,42 +3355,58 @@ inline void draw_controls(const host_facts &f)
 			"the pass simply stops running.");
 
 		// ---- THE CREATE FLAGS. Tier 1: latched at CreateFeature, no evaluate-time equivalent. -----
-		// These do NOT auto-rebuild the way the geometry above does, because nothing in the render
-		// path compares them against what the live feature was created with. The recreate button
-		// below is the mechanism, and every tooltip here says so rather than leaving the user to
-		// discover it - a control that silently needs a button is the failure this panel exists to
-		// remove, and saying which is the difference between that and an honest one.
-		ImGui::SeparatorText("DLSS-SR create flags - press \"Recreate the SR feature\" to apply");
+		// These DO auto-rebuild, exactly as the geometry above does, and by the same mechanism:
+		// dlss_sr::feature_matches compares create_flags, perf_quality and hw_depth as well as the
+		// four extents, and sr_try_run's create-param latch tests the descriptor it is about to
+		// build against the live feature and queues kTeardown when they differ.
+		//
+		// An earlier revision of this comment claimed the opposite - "nothing in the render path
+		// compares them against what the live feature was created with" - and that was false in
+		// this tree even then. What was missing was not the COMPARISON but a SAFE PLACE TO ACT ON
+		// IT: create_feature's answer to a mismatch is release_feature, whose header requires an
+		// idled queue, and sr_try_run runs on a command-list recording thread that cannot idle
+		// one. The latch routes the release to the present thread instead, which is the only seam
+		// that can. The recreate button below still works and reaches that same seam.
+		//
+		// k_plain and no action bit is therefore right: the render path notices the change by
+		// itself, and raising the bits here as well would queue a redundant second teardown.
+		ImGui::SeparatorText("DLSS-SR create flags - applied on the next accepted dispatch");
 
 		checkbox_b("IsHDR (sr_hdr)", l.sr_hdr, k_plain,
-			"CREATE-TIME. Stored live and coherently; it TAKES on the next feature create, so press "
-			"\"Recreate the SR feature\" below.\n\n"
+			"CREATE-TIME, and LIVE: it is latched into the feature at CreateFeature, so the render "
+			"path queues the feature's release on the next present and the dispatch after that "
+			"creates it with the new value. One rebuilt feature per change, no button needed.\n\n"
 			"It selects the HDR-TRAINED KERNEL. It is NOT an exposure gate and it does not change "
 			"what is bound - the colour input is whatever the pass already had.");
 		checkbox_b("MVLowRes - the guide is on the render grid (sr_mv_lowres)", l.sr_mv_lowres, k_plain,
-			"CREATE-TIME - press \"Recreate the SR feature\" below.\n\n"
+			"CREATE-TIME, and LIVE - the render path rebuilds the feature itself, once per change.\n\n"
 			"ON tells DLSS the motion vectors are at the RENDER extent, which is what UE 4.27 "
 			"produces and what our own decode writes. OFF claims they are at the display extent; "
 			"with a render-grid guide that is a mis-declaration, not an option.");
 		checkbox_b("MVJittered - the guide carries the jitter (sr_mv_jittered)", l.sr_mv_jittered,
 			k_plain,
-			"CREATE-TIME - press \"Recreate the SR feature\" below. OFF is correct for UE 4.27: the "
+			"CREATE-TIME, and LIVE - the render path rebuilds the feature itself. OFF is correct for "
+			"UE 4.27: the "
 			"velocity pass writes unjittered motion and the jitter is delivered separately through "
 			"Jitter.Offset.X/Y.");
 		checkbox_b("DepthInverted (sr_depth_inverted)", l.sr_depth_inverted, k_plain,
-			"CREATE-TIME - press \"Recreate the SR feature\" below. ON is correct for UE 4.27, which "
+			"CREATE-TIME, and LIVE - the render path rebuilds the feature itself. ON is correct for "
+			"UE 4.27, which "
 			"uses reversed-Z. This is the SR feature's own flag and is independent of the DLSS-NR "
 			"depth_inverted above; they are two features being told about the same buffer.");
 		checkbox_b("AutoExposure (sr_auto_exposure)", l.sr_auto_exposure, k_plain,
-			"CREATE-TIME - press \"Recreate the SR feature\" below. ON lets the snippet compute "
+			"CREATE-TIME, and LIVE - the render path rebuilds the feature itself. ON lets the snippet "
+			"compute "
 			"exposure itself, which is what a run that does not bind an exposure texture wants - and "
 			"this add-on does not bind one.");
 		checkbox_b("AlphaUpscaling (sr_alpha_upscaling)", l.sr_alpha_upscaling, k_plain,
-			"CREATE-TIME - press \"Recreate the SR feature\" below. OFF is the default and is right "
+			"CREATE-TIME, and LIVE - the render path rebuilds the feature itself. OFF is the default "
+			"and is right "
 			"unless the colour input's alpha is meaningful coverage rather than whatever the render "
 			"target happened to leave there.");
 		checkbox_b("DLSS.Use.HW.Depth (sr_hw_depth)", l.sr_hw_depth, k_plain,
-			"CREATE-TIME - press \"Recreate the SR feature\" below. It tells the snippet the depth "
+			"CREATE-TIME, and LIVE - the render path rebuilds the feature itself. It tells the snippet "
+			"the depth "
 			"SRV is a hardware depth buffer rather than a linearised copy. ON is correct here: the "
 			"resource bound is the game's own depth target.");
 
@@ -3367,7 +3415,9 @@ inline void draw_controls(const host_facts &f)
 			"ARM-TIME ONLY, AND THAT IS THE WHOLE OF IT - the same shape dlss_nr has. Its one read "
 			"site is in the deferred initialiser, which runs once per process on the first accepted "
 			"dispatch, so there is no second read a live value could reach. It is saved and reverted "
-			"like every other key and it takes effect next launch.\n\n"
+			"like every other key, and it takes on the NEXT ARM - which is next launch in an ordinary "
+			"run, but is also this session if the deferred initialiser has not run yet, because "
+			"turning `enabled` on from 0 runs it.\n\n"
 			"It is a DIAGNOSTIC. It asks the snippet for a RECOMMENDED render resolution and prints "
 			"it; it has no power whatsoever to make UE render at it - the only lever for that is "
 			"r.ScreenPercentage. Off by default because it runs on a scratch parameter block whose "
