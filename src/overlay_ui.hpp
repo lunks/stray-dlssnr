@@ -82,8 +82,11 @@
 //                         Enabled/RenderPreset/ScalingRatio/node-masks/FreeMemOnRelease
 //                         (:1899-1918). Not one tuning knob is baked at create time, so these
 //                         sliders are honest with no extra machinery.
-//   LIVE + SNAPSHOT       paper_white_scale, transfer_strength, color_strength,
-//                         restore_graphics_root (see rule 3).
+//   LIVE + SNAPSHOT       paper_white_scale, transfer_strength, color_strength, hdr_graft,
+//                         restore_graphics_root (see rule 3). hdr_graft is a ROOT CONSTANT in the
+//                         decode's own constant block - it replaced a pad word, so the constant
+//                         count, the root signature, the pipeline layout and both PSOs are
+//                         unchanged and there is nothing to rebuild when it moves.
 //   LIVE + ONE RESET      depth_inverted, mvec_scale_x, mvec_scale_y. Changing the depth
 //                         convention or the motion-vector grid invalidates the accumulated
 //                         temporal history; :2794-2800 already forces a reset frame when the
@@ -253,6 +256,9 @@ struct live_block
 	std::atomic<float>    paper_white_scale{ 1.0f };
 	std::atomic<float>    transfer_strength{ 1.0f };
 	std::atomic<float>    color_strength{ 1.0f };
+	// cfg::hdr_graft. Live at tier 0: it is a root constant in the decode's own constant block,
+	// snapshotted with the rest of the pass, so nothing is rebuilt when it changes.
+	std::atomic<uint32_t> hdr_graft{ 0 };
 
 	std::atomic<bool>     depth_inverted{ true };
 	std::atomic<float>    mvec_scale_x{ 0.0f };
@@ -315,6 +321,19 @@ struct status_block
 	std::atomic<bool>         codec_failed{ false };
 	std::atomic<bool>         codec_pipelines_ok{ false };
 	std::atomic<bool>         orig_ok{ false };
+
+	// Whether the DECODE IN HAND can actually do hdr_graft = 1. Two separate ways it cannot, and
+	// in both the combo would otherwise be a control wired to nothing while every status line
+	// reported the mode as active - the exact defect this panel exists to prevent.
+	//   codec_graft_available   false when the decode was built from the survival source, i.e.
+	//                           the compile WITH the reference graft failed on this machine and
+	//                           hdr_codec::build fell back so the default would survive.
+	//   codec_decode_overridden true when the decode came from a user-supplied
+	//                           stray_dlssnr_decode.dxbc. That blob is whatever the user built;
+	//                           it may predate g_hdrGraft entirely and read the constant not at
+	//                           all. We cannot know, so we say we cannot know.
+	std::atomic<bool>         codec_graft_available{ true };
+	std::atomic<bool>         codec_decode_overridden{ false };
 
 	std::atomic<float>        auto_scale_x{ 0.0f }, auto_scale_y{ 0.0f };
 	std::atomic<uint64_t>     hist_applied{ 0 }, hist_dropped{ 0 };
@@ -419,6 +438,7 @@ inline void seed_from_config(const cfg::config &c, const std::wstring &directory
 	l.paper_white_scale.store(c.paper_white_scale, std::memory_order_relaxed);
 	l.transfer_strength.store(c.transfer_strength, std::memory_order_relaxed);
 	l.color_strength.store(c.color_strength, std::memory_order_relaxed);
+	l.hdr_graft.store(c.hdr_graft, std::memory_order_relaxed);
 	l.depth_inverted.store(c.depth_inverted, std::memory_order_relaxed);
 	l.mvec_scale_x.store(c.mvec_scale_x, std::memory_order_relaxed);
 	l.mvec_scale_y.store(c.mvec_scale_y, std::memory_order_relaxed);
@@ -455,6 +475,16 @@ inline void seed_from_config(const cfg::config &c, const std::wstring &directory
 // assignment block at the top of the pass fixes every one of them at once and leaves the reads
 // alone. The cost is one documented writer of g_cfg; see the note on the census line below.
 // ---------------------------------------------------------------------------------------------
+// Published ONCE, from the codec build site in nr_lazy_ngx_init, rather than through begin_pass:
+// it is settled before the first dispatch and never changes for the run, and threading it through
+// begin_pass would widen a signature that other work is editing.
+inline void publish_codec_build(bool graft_available, bool decode_overridden)
+{
+	status_block &s = status();
+	s.codec_graft_available.store(graft_available, std::memory_order_relaxed);
+	s.codec_decode_overridden.store(decode_overridden, std::memory_order_relaxed);
+}
+
 inline bool begin_pass(cfg::config &c,
                        bool &need_reset,
                        uint64_t &pending_res,
@@ -532,6 +562,7 @@ inline bool begin_pass(cfg::config &c,
 	c.paper_white_scale        = l.paper_white_scale.load(std::memory_order_relaxed);
 	c.transfer_strength        = l.transfer_strength.load(std::memory_order_relaxed);
 	c.color_strength           = l.color_strength.load(std::memory_order_relaxed);
+	c.hdr_graft                = l.hdr_graft.load(std::memory_order_relaxed);
 	c.depth_inverted           = l.depth_inverted.load(std::memory_order_relaxed);
 	c.mvec_scale_x             = l.mvec_scale_x.load(std::memory_order_relaxed);
 	c.mvec_scale_y             = l.mvec_scale_y.load(std::memory_order_relaxed);
@@ -661,7 +692,7 @@ inline void fmt_float(char *buf, size_t n, float v)
 	std::snprintf(buf, n, "%.9g", static_cast<double>(v));
 }
 
-/// The 16 keys the overlay owns. Returns nullptr for anything else.
+/// The 17 keys the overlay owns. Returns nullptr for anything else.
 inline bool owned_value(const std::string &key_lower, const live_block &l, std::string &out)
 {
 	char buf[64];
@@ -680,6 +711,7 @@ inline bool owned_value(const std::string &key_lower, const live_block &l, std::
 	if (key_lower == "local_tone_strength")      { fmt_float(buf, sizeof(buf), l.local_tone_strength.load(std::memory_order_relaxed)); out = buf; return true; }
 	if (key_lower == "local_structure_strength") { fmt_float(buf, sizeof(buf), l.local_structure_strength.load(std::memory_order_relaxed)); out = buf; return true; }
 	if (key_lower == "skin_structure_strength")  { fmt_float(buf, sizeof(buf), l.skin_structure_strength.load(std::memory_order_relaxed)); out = buf; return true; }
+	if (key_lower == "hdr_graft")                { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.hdr_graft.load(std::memory_order_relaxed)); out = buf; return true; }
 	if (key_lower == "style")                    { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.style.load(std::memory_order_relaxed)); out = buf; return true; }
 	if (key_lower == "ui_correction")            { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.ui_correction.load(std::memory_order_relaxed)); out = buf; return true; }
 	return false;
@@ -690,7 +722,7 @@ inline const char *const *owned_keys(size_t &n)
 {
 	static const char *const keys[] = {
 		"copy_back", "history_restore", "restore_graphics_root",
-		"paper_white_scale", "transfer_strength", "color_strength",
+		"paper_white_scale", "transfer_strength", "color_strength", "hdr_graft",
 		"depth_inverted", "mvec_scale_x", "mvec_scale_y",
 		"intensity", "local_tone_strength", "local_structure_strength",
 		"skin_structure_strength", "style", "use_auto_mask", "ui_correction",
@@ -908,6 +940,7 @@ inline bool save_ini(std::string &err)
 	b.paper_white_scale        = l.paper_white_scale.load(std::memory_order_relaxed);
 	b.transfer_strength        = l.transfer_strength.load(std::memory_order_relaxed);
 	b.color_strength           = l.color_strength.load(std::memory_order_relaxed);
+	b.hdr_graft                = l.hdr_graft.load(std::memory_order_relaxed);
 	b.depth_inverted           = l.depth_inverted.load(std::memory_order_relaxed);
 	b.mvec_scale_x             = l.mvec_scale_x.load(std::memory_order_relaxed);
 	b.mvec_scale_y             = l.mvec_scale_y.load(std::memory_order_relaxed);
@@ -934,6 +967,7 @@ inline bool dirty()
 	    || l.paper_white_scale.load(std::memory_order_relaxed)        != b.paper_white_scale
 	    || l.transfer_strength.load(std::memory_order_relaxed)        != b.transfer_strength
 	    || l.color_strength.load(std::memory_order_relaxed)           != b.color_strength
+	    || l.hdr_graft.load(std::memory_order_relaxed)                != b.hdr_graft
 	    || l.depth_inverted.load(std::memory_order_relaxed)           != b.depth_inverted
 	    || l.mvec_scale_x.load(std::memory_order_relaxed)             != b.mvec_scale_x
 	    || l.mvec_scale_y.load(std::memory_order_relaxed)             != b.mvec_scale_y
@@ -1183,6 +1217,7 @@ inline void revert_to_baseline()
 	l.paper_white_scale.store(b.paper_white_scale, std::memory_order_relaxed);
 	l.transfer_strength.store(b.transfer_strength, std::memory_order_relaxed);
 	l.color_strength.store(b.color_strength, std::memory_order_relaxed);
+	l.hdr_graft.store(b.hdr_graft, std::memory_order_relaxed);
 	l.depth_inverted.store(b.depth_inverted, std::memory_order_relaxed);
 	l.mvec_scale_x.store(b.mvec_scale_x, std::memory_order_relaxed);
 	l.mvec_scale_y.store(b.mvec_scale_y, std::memory_order_relaxed);
@@ -1562,7 +1597,89 @@ inline void draw_controls(const host_facts &f)
 		slider_f("Color Strength", l.color_strength, 0.0f, 1.0f, "%.2f", k_plain,
 			"Live. 0.0 keeps the original's chromaticity exactly and transfers only the network's "
 			"luminance change; 1.0 takes the network's colour too. Lower it if the image picks up a "
-			"colour cast.");
+			"colour cast.\n\n"
+			"NOT ORTHOGONAL TO THE GRAFT BELOW, BUT NOT A CONTROL FOR IT EITHER. At 0.0 both grafts "
+			"reduce to \"rescale the original to the new luminance\" and their new luminances are the "
+			"same number, so on ORDINARY pixels the two modes agree to well under one 8-bit code "
+			"value. They do NOT agree in SHADOWS: mode 0 has a chroma floor that hands a near-black "
+			"pixel over to the network's own colour below Y = 0.001/s, and mode 1 has no such floor "
+			"at all, so it keeps the original's chromaticity and rescales it by an unbounded ratio. "
+			"Measured over 400,000 dark chromatic pixels at 0.0: worst 27.6 code values, 42.5%% of "
+			"them differing by 2 or more.\n\n"
+			"So A/B the grafts at 1.0 for the HIGHLIGHT difference and at 0.0 on a DARK, COLOURED "
+			"area - shadowed alley walls, unlit interiors - for the shadow difference. Neither "
+			"setting shows both.");
+
+		{
+			// The graft-back selector. Both items are REAL and both are exercised by the same
+			// dispatch - this is a root constant the decode reads, not a second code path that
+			// could be left uncalled.
+			//
+			// TWO WAYS THE DECODE IN HAND CANNOT HONOUR IT, both said out loud rather than left
+			// for the user to discover by seeing nothing change. Neither is hypothetical: the
+			// first is what keeps a compiler that cannot build the OkLab matrices from taking the
+			// DEFAULT graft down with it, and the second is the documented workflow for a machine
+			// with no working D3DCompile at all.
+			const bool graft_avail   = s.codec_graft_available.load(std::memory_order_relaxed);
+			const bool decode_overri = s.codec_decode_overridden.load(std::memory_order_relaxed);
+			if (!graft_avail)
+				overlay_imgui::textf_colored(col::amber,
+					"The decode was built WITHOUT the reference graft (it did not compile here), so "
+					"hdr_graft is pinned to 0 for this run. Mode 0 is unaffected - see ReShade.log.");
+			else if (decode_overri)
+				overlay_imgui::textf_colored(col::amber,
+					"A user-supplied stray_dlssnr_decode.dxbc is in use. If it was not built from "
+					"this add-on's shader source it does not read hdr_graft at all, and this control "
+					"will do nothing however it reads. Delete the .dxbc to be sure.");
+
+			static const char *const graft_items[] = {
+				"0 - Additive residual (ours, default)",
+				"1 - renodx UpgradeToneMap (OkLab hue lock)",
+			};
+			ImGui::BeginDisabled(!graft_avail);
+			combo_u32("HDR Graft", l.hdr_graft, graft_items, 2, k_plain,
+				"Live, and free: it is one root constant in the decode's constant block, so the very "
+				"next frame uses the other graft. Nothing is recreated.\n\n"
+				"THE ENCODE IS THE SAME EITHER WAY. Same exact piecewise sRGB, same soft-clip knee "
+				"0.75 and shoulder 5.770780, so the network is shown the same proxy and returns the "
+				"same answer. Only the graft-back differs.\n\n"
+				"0 - ADDITIVE. result = original + (neural - proxy) / s. A scene-linear residual, "
+				"exactly +0.0 when the network asked for nothing - which is what makes "
+				"transfer_strength=0 a BIT-EXACT no-op at every paper_white_scale. RGB is scaled "
+				"uniformly, so the original's hue cannot drift.\n\n"
+				"1 - RENODX. Rebuilds the pixel from the network's answer: ratio = (neural_y + "
+				"max(0, original_y - proxy_y)) / neural_y, then HueOkLab(neural * ratio, neural) "
+				"with an AP1 negative clamp. Recovered verbatim from renodx-reference.addon64's own "
+				"embedded HLSL.\n\n"
+				"WHAT THE TRADE ACTUALLY IS - measured, not assumed. Luminance is linear, so their "
+				"headroom term max(0, original_y - proxy_y) is ALGEBRAICALLY our additive residual: "
+				"both modes deliver the SAME luminance gain at every source magnitude. The entire "
+				"difference is CHROMA. Where the soft clip has crushed the proxy to white the "
+				"network's answer is neutral, so mode 1 hue-locks to that neutral and drags a "
+				"clipped highlight toward the white point; mode 0 leaves its chromaticity exactly "
+				"alone. On a bright neon sign that is the difference between keeping its colour and "
+				"washing it out.\n\n"
+				"THE OTHER HALF OF THE DIFFERENCE IS IN THE SHADOWS, and it shows at Color Strength "
+				"0.0 rather than 1.0. Mode 0's chroma floor hands a near-black pixel over to the "
+				"network's colour below Y = 0.001/s; mode 1 has no floor and rescales the "
+				"original's chromaticity by an unbounded ratio. 400,000 dark chromatic pixels at "
+				"0.0: worst 27.6 code values, 42.5%% of them 2 or more.\n\n"
+				"SO THIS IS A COLOUR EXPERIMENT, NOT A HIGHLIGHT FIX. Neither mode recovers a "
+				"bright highlight, and the ceiling is LOWER than the soft clip suggests because "
+				"the proxy is stored in an FP16 surface: the encoded proxy quantises to exactly "
+				"1.0 at 1.81x paper white (the 3.47x figure is FP32 and is not the one that "
+				"governs), and of a requested +30%% gain the decode already delivers only ~50%% at "
+				"1.15x and ~5%% at 1.86x. Those are ratios TO paper white and do not move with "
+				"Scene Paper-White Scale - what moves is the scene-linear magnitude they land at, "
+				"in proportion (at 4.0, full gain reaches magnitude 3.17 instead of 0.79). If "
+				"highlights are being lost, the knee is in the wrong place, and that slider above "
+				"is exactly the right thing to raise.\n\n"
+				"Mode 1 is also NOT an exact bypass at transfer_strength=0: it works display-"
+				"referred throughout, so the result is (original * s) / s, exact only when s is a "
+				"power of two. Mode 0 is exact at every value, which is why it is the default and "
+				"why the identity A/B should be run on it.");
+			ImGui::EndDisabled();
+		}
 
 		ImGui::EndDisabled();
 	}
