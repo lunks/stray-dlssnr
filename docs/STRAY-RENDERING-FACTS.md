@@ -168,7 +168,7 @@ established twice independently — read out of `VIEW_UNIFORM_BUFFER_MEMBER_TABL
 | `ViewRectMin` | 129 | 2064 |
 | `ViewSizeAndInvSize` | 130 | 2080 |
 | `LightProbeSizeRatioAndInvSizeRatio` | 131 | 2096 |
-| `TemporalAAParams` | 152 | — |
+| `TemporalAAParams` | 152 | 2432 |
 
 The six rows a jitter recovery needs — `proj=28 noaa=32 clip=122 jitter=126 size=130 params=152` —
 were located in Stray's running View buffer and reported at the strongest tier (`tier=full`).
@@ -176,7 +176,7 @@ were located in Stray's running View buffer and reported at the strongest tier (
 `ClipToPrevClip` at row 122 was confirmed **in Stray's own TAA shader by pure DXBC instruction
 analysis**, with no reflection names involved.
 
-Two notes on reading this buffer, both observed:
+Three notes on reading this buffer:
 
 * `LightProbeSizeRatioAndInvSizeRatio` at row 131 is `(1,1,1,1)`, and is a decoy for a naive
   search that expects an identity-looking row.
