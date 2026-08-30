@@ -1850,6 +1850,9 @@ struct nr_state
 
 	// An SRV on our own NGX output, so the decode can read the network's answer.
 	resource_view out_srv    = { 0 };
+	// Diagnostic only (nr_probe): lets the probe read out_tex the way NGX wrote it, as a UAV,
+	// before the decode's barrier turns it into an SRV.
+	resource_view out_uav    = { 0 };
 
 	hdr_codec::pipelines codec;         // root signatures + PSOs, created once per device
 	bool codec_textures_ok = false;     // proxy/result/views exist at (out_w, out_h)
@@ -2465,6 +2468,7 @@ static void nr_release_feature_and_output(device *dev, nr_state &st, const char 
 		// leaking one leaks a pool slot for the life of the process. destroy_resource_view on a
 		// zero handle is not defined to be safe, so every one is guarded.
 		if (st.out_srv.handle    != 0) { dev->destroy_resource_view(st.out_srv);    st.out_srv    = { 0 }; }
+		if (st.out_uav.handle    != 0) { dev->destroy_resource_view(st.out_uav);    st.out_uav    = { 0 }; }
 		if (st.proxy_srv.handle  != 0) { dev->destroy_resource_view(st.proxy_srv);  st.proxy_srv  = { 0 }; }
 		if (st.proxy_uav.handle  != 0) { dev->destroy_resource_view(st.proxy_uav);  st.proxy_uav  = { 0 }; }
 		if (st.orig_srv.handle   != 0) { dev->destroy_resource_view(st.orig_srv);   st.orig_srv   = { 0 }; }
@@ -2792,6 +2796,9 @@ static void nr_ensure_aux(device *dev, nr_state &st)
 		stage = "create_resource_view(original SRV)";
 	else if (!dev->create_resource_view(st.out_tex,    resource_usage::shader_resource,  neural_view, &st.out_srv))
 		stage = "create_resource_view(neural SRV)";
+	else if (g_cfg.nr_probe != 0 &&
+	         !dev->create_resource_view(st.out_tex,    resource_usage::unordered_access, neural_view, &st.out_uav))
+		stage = "create_resource_view(neural UAV, probe only)";
 	else if (!dev->create_resource_view(st.result_tex, resource_usage::unordered_access, tex_view,   &st.result_uav))
 		stage = "create_resource_view(result UAV)";
 
@@ -3784,6 +3791,25 @@ static void nr_codec_decode(command_list *cmd, nr_state &st, resource_view origi
                             float proxy_scale, float transfer_strength, float color_strength,
                             uint32_t graft_mode, bool &out_in_srv)
 {
+	// ---- THE NR PROBE, BEFORE THE BARRIER (nr_probe=1 only) ---------------------------------
+	// Deliberately ahead of the transition below: out_tex is still in unordered_access, exactly
+	// as NGX left it, so this reads the texture through a UAV by the same route NGX wrote it.
+	//
+	// Reading it AFTER the barrier, through st.out_srv, returned EXACTLY zero on validated
+	// gameplay content (IN [0.786 .. 4912.7], OUT [0.0 .. 0.0], 1.7M samples/step, means
+	// agreeing with the extremes). That is either an empty texture or a broken SRV/state, and
+	// the two are indistinguishable from that side. This dispatch is the same texture in the
+	// same frame by the other route, which separates them.
+	if (g_cfg.nr_probe != 0 && st.probe.ready && st.out_uav.handle != 0)
+	{
+		nr_probe::frame(cmd->get_device(), cmd, st.probe, st.probe_run,
+		                original_srv, st.out_uav, st.out_w, st.out_h,
+		                g_cfg.nr_probe_frames, g_cfg.nr_probe_warmup,
+		                [](const char *fmt, auto... args) {
+			                logf(reshade::log::level::info, fmt, args...);
+		                });
+	}
+
 	// NGX wrote out_tex OUTSIDE anything that tracks it, so nothing knows the decode's read of
 	// it has to wait. This transition is that dependency, and it is also what makes the
 	// texture readable as an SRV. (rtx_neural_rendering.cpp:408-441 records the same two
@@ -3843,15 +3869,6 @@ static void nr_codec_decode(command_list *cmd, nr_state &st, resource_view origi
 	// The probe also DRIVES use_auto_mask / local_structure / skin_structure itself (see
 	// nr_evaluate), holding each setting for nr_probe_frames frames, so every step sees the same
 	// content and repeats its own baseline at the end as a noise floor.
-	if (g_cfg.nr_probe != 0 && st.probe.ready)
-	{
-		nr_probe::frame(cmd->get_device(), cmd, st.probe, st.probe_run,
-		                original_srv, st.out_srv, st.out_w, st.out_h,
-		                g_cfg.nr_probe_frames, g_cfg.nr_probe_warmup,
-		                [](const char *fmt, auto... args) {
-			                logf(reshade::log::level::info, fmt, args...);
-		                });
-	}
 }
 
 // --------------------------------------------------------------------------------------------

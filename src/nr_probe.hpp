@@ -122,9 +122,14 @@ inline uint32_t group_count(uint32_t extent)
 // t0 is what the network was handed, t1 is what it returned. Both are sampled with Load, not a
 // sampler: these are exact texel reads and no filtering may enter the statistic.
 static const char *const kShaderSource = R"HLSL(
-Texture2D<float4> t_in  : register(t0);
-Texture2D<float4> t_out : register(t1);
-RWBuffer<uint>    stats : register(u0);
+// out_tex is read through a UAV, NOT an SRV, and the dispatch is placed BEFORE the decode's
+// barrier - while NGX has just written it and it is still in unordered_access. The SRV read
+// after that barrier returned exactly zero on validated gameplay content; this is the same
+// texture in the same frame by a different route, which is what separates "the texture is
+// empty" from "our view or state transition of it is wrong".
+Texture2D<float4>   t_in  : register(t0);
+RWBuffer<uint>      stats : register(u0);
+RWTexture2D<float4> u_out : register(u1);
 
 cbuffer Args : register(b0)
 {
@@ -151,7 +156,7 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
 
     float3 a = t_in.Load(int3(p, 0)).rgb;
-    float3 b = t_out.Load(int3(p, 0)).rgb;
+    float3 b = u_out[p].rgb;
 
     float la = luma(a);
     float lb = luma(b);
@@ -282,7 +287,7 @@ inline bool build(device *dev, const std::vector<uint8_t> &dxbc, pipeline_set &p
 {
 	const char *stage = nullptr;
 
-	if      (!hdr_codec::make_layout(dev, 2, kConstantCount, p.layout)) stage = "create_pipeline_layout(probe)";
+	if      (!hdr_codec::make_layout(dev, 1, kConstantCount, p.layout, 2)) stage = "create_pipeline_layout(probe)";
 	else if (!hdr_codec::make_pipeline(dev, p.layout, dxbc, p.pso))     stage = "create_pipeline(probe)";
 
 	if (stage == nullptr)
@@ -345,23 +350,24 @@ inline void clear(command_list *cmd, pipeline_set &p)
 
 // Both SRVs must already be in shader_resource_non_pixel. The caller runs this immediately after
 // the codec's decode, which has already transitioned out_tex for exactly that reason.
-inline void dispatch(command_list *cmd, pipeline_set &p, resource_view in_srv, resource_view out_srv,
+inline void dispatch(command_list *cmd, pipeline_set &p, resource_view in_srv, resource_view out_uav,
                      uint32_t width, uint32_t height)
 {
 	cmd->bind_descriptor_tables(shader_stage::all_compute, p.layout, 0, 0, nullptr);
 	cmd->bind_pipeline(pipeline_stage::all_compute, p.pso);
 
-	const resource_view srvs[2] = { in_srv, out_srv };
 	descriptor_table_update srv_up = {};
-	srv_up.binding = 0; srv_up.array_offset = 0; srv_up.count = 2;
+	srv_up.binding = 0; srv_up.array_offset = 0; srv_up.count = 1;
 	srv_up.type = descriptor_type::shader_resource_view;
-	srv_up.descriptors = srvs;
+	srv_up.descriptors = &in_srv;
 	cmd->push_descriptors(shader_stage::compute, p.layout, kParamSrvTable, srv_up);
 
+	// u0 stats, u1 out_tex - one contiguous table, in declaration order.
+	const resource_view uavs[2] = { p.stats_uav, out_uav };
 	descriptor_table_update uav_up = {};
-	uav_up.binding = 0; uav_up.array_offset = 0; uav_up.count = 1;
+	uav_up.binding = 0; uav_up.array_offset = 0; uav_up.count = 2;
 	uav_up.type = descriptor_type::unordered_access_view;
-	uav_up.descriptors = &p.stats_uav;
+	uav_up.descriptors = uavs;
 	cmd->push_descriptors(shader_stage::compute, p.layout, kParamUavTable, uav_up);
 
 	args a = {};
@@ -428,7 +434,7 @@ static constexpr uint32_t kReadbackDelay = 4;
 
 template <typename LogFn>
 inline void frame(device *dev, command_list *cmd, pipeline_set &p, run_state &r,
-                  resource_view in_srv, resource_view out_srv,
+                  resource_view in_srv, resource_view out_uav,
                   uint32_t width, uint32_t height, uint32_t frames_per_step,
                   uint32_t warmup_needed, LogFn log)
 {
@@ -557,7 +563,7 @@ inline void frame(device *dev, command_list *cmd, pipeline_set &p, run_state &r,
 	if (r.frames_in_step == 0)
 		clear(cmd, p);
 
-	dispatch(cmd, p, in_srv, out_srv, width, height);
+	dispatch(cmd, p, in_srv, out_uav, width, height);
 	r.frames_in_step++;
 
 	if (r.frames_in_step >= frames_per_step)
