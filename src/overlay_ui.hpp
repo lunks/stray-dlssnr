@@ -40,9 +40,10 @@
 // THE THREE RULES THIS FILE OBEYS
 //
 // 1. THE OVERLAY TAKES NO MUTEX. Not nr_state::mutex, not the probe's g.mutex.
-//    stray_dlssnr.cpp:2201 takes st->mutex and then g.mutex at :2225, and on_present reads the
-//    DLSS-NR counters as ATOMICS specifically to avoid inverting that order (the comment at
-//    :1513-1516 spells out the AB/BA deadlock). The overlay callback runs on the present thread.
+//    nr_try_run takes st->mutex (its per-pass lock_guard) and then g.mutex (its resolve-the-SRVs
+//    block), and on_present reads the DLSS-NR counters as ATOMICS specifically to avoid
+//    inverting that order (nr_state's census-counter comments spell out the AB/BA deadlock).
+//    The overlay callback runs on the present thread.
 //    A lock here would join that ordering graph and the whole argument would have to be
 //    re-derived. Worse, nr_try_run holds st->mutex across CreateFeature (which uploads the
 //    network weights) and EvaluateFeature, so blocking Present behind it is a visible hitch.
@@ -58,22 +59,28 @@
 // 3. ONE SNAPSHOT PER PASS, WHICH IS A CORRECTNESS REQUIREMENT AND NOT TIDINESS.
 //    Several settings are read MORE THAN ONCE inside a single pass, and the two reads must agree:
 //
-//      restore_graphics_root   :2333 (capture_state) and :3033 (restore_state). A true->false
-//                              tear between them is CORRUPTING: d3d12_state.hpp:429-435 absorbs
-//                              the graphics heap only if(restore_graphics), :569-576 re-binds the
-//                              heaps UNCONDITIONALLY, replay_pipe_compute issues
-//                              SetComputeRootSignature (:507) which per that file's note at :243
-//                              invalidates ALL root arguments including graphics, and :583-584
-//                              then skips the graphics replay. That is precisely the corruption
-//                              this knob's default-ON exists to prevent. (false->true is benign:
-//                              plan.gfx.root_signature is null and :534-535 early-returns.)
-//      paper_white_scale       read TWICE inside one expression at :2646, feeding ea.proxy_scale
-//                              (:2747) AND da.proxy_scale (:2967). :2638-2640 calls a mismatch
-//                              between them "a correctness failure, not a tuning difference".
-//      transfer/color_strength read up to 3x each in their clamp expressions, :2647-2650.
-//      mvec_scale_x/y          read twice each, :2805-2808 (a !=0.0f test, then the value).
-//      copy_back               SIX sites in one pass: :1663 :2499 :2636 :2882 :3050 :3069.
-//      history_restore         SIX as well: :1663 :2499 :2636 :2883 :3093 :3127.
+//    (Cited by SYMBOL, deliberately: an earlier revision cited stray_dlssnr.cpp line numbers
+//    here, every one of which drifted onto unrelated code after the merges - and this same
+//    header records that a hook list naming stale lines is worse than one naming none.)
+//
+//      restore_graphics_root   read by probe::capture_state and again by probe::restore_state.
+//                              A true->false tear between them is CORRUPTING: capture absorbs
+//                              the graphics heap only if(restore_graphics), restore re-binds the
+//                              heaps UNCONDITIONALLY, replay_pipe_compute's
+//                              SetComputeRootSignature invalidates ALL root arguments including
+//                              graphics (d3d12_state.hpp's own note), and the graphics replay is
+//                              then skipped. That is precisely the corruption this knob's
+//                              default-ON exists to prevent. (false->true is benign: the plan's
+//                              gfx root signature is null and the replay early-returns.)
+//      paper_white_scale       read TWICE inside one expression in the NR codec block, feeding
+//                              ea.proxy_scale AND da.proxy_scale - whose neighbouring comment
+//                              calls a mismatch "a correctness failure, not a tuning difference"
+//                              - and again in the chain's copies of the same constants.
+//      transfer/color_strength read up to 3x each in their clamp expressions.
+//      mvec_scale_x/y          read twice each (a !=0.0f test, then the value).
+//      copy_back               and
+//      history_restore         a handful of sites each across one pass (the copy-back block,
+//                              the history-restore arming, and the banner).
 //
 //    Be precise about WHY rather than overclaiming: on x86-64 an aligned 4-byte load is atomic in
 //    hardware, so a physically torn float is not reachable. The two real problems are (i) a
@@ -143,11 +150,18 @@
 //               with no action bit from the control at all. Raising one here as well would cost a
 //               teardown per pixel of slider drag for no extra effect.
 //     CREATE    sr_hdr, sr_mv_lowres, sr_mv_jittered, sr_depth_inverted, sr_auto_exposure,
-//               sr_alpha_upscaling, sr_hw_depth, sr_perf_quality, sr_render_preset. Snapshotted for
-//               COHERENCE - the create-params block reads six of them in one expression - but
-//               latched at CreateFeature with no evaluate-time equivalent, and nothing in the
-//               render path compares them against what the live feature was created with. The
-//               "Recreate the SR feature" button is the mechanism and every tooltip says so.
+//               sr_alpha_upscaling, sr_hw_depth, sr_perf_quality. Snapshotted for COHERENCE - the
+//               create-params block reads six of them in one expression - and latched at
+//               CreateFeature with no evaluate-time equivalent. They AUTO-REBUILD: sr_try_run's
+//               create-param latch (dlss_sr::feature_matches compares create_flags, hw_depth and
+//               perf_quality) tests the descriptor against the live feature every pass and queues
+//               kTeardown itself, so these are wired k_plain with no action bits and their
+//               tooltips say "no button needed". sr_render_preset ALONE is button-only:
+//               feature_matches deliberately does not compare it, so only the "Recreate the SR
+//               feature" button (or any other teardown) makes a preset change take.
+//               (An earlier revision of this entry said nothing in the render path compares
+//               these - the control-site comment beside the create flags records that this was
+//               false in this tree even then.)
 //     R4+R5     dlss_chain - a_teardown | a_reconcile. 1 -> 0 is fully live; 0 -> 1 needs the SR
 //               snippet, which is a launch-time LoadLibraryW, on exactly the terms dlss_sr states.
 //               It has TWO read sites and therefore two mechanisms: chain_ok in nr_try_run is
@@ -159,8 +173,9 @@
 //               reach. Both controls say exactly that.
 //     R1        depth_inverted, mvec_scale_x, mvec_scale_y, mvec_dilate, mvec_reconstruct
 //     R1+latch  mvec_clip_row, mvec_clip_transpose - these two can PERMANENTLY latch
-//               view_layout_failed / clip_ok=false (stray_dlssnr.cpp:2589-2593, :2604-2612,
-//               :2640-2645), cleared only by nr_release_feature_and_output. Without a_clear_clip
+//               view_layout_failed / clip_ok=false (nr_update_clip_to_prev_clip's row-bounds
+//               check and its two 30-frame streak latches), cleared only by
+//               nr_release_feature_and_output and a_clear_clip. Without a_clear_clip
 //               the knob is dead after the first bad value: a control that lies.
 //     R2        copy_back, history_restore, and the master bypass
 //     R3        shader_hash, srv_depth, srv_velocity, srv_colour, uav_output
@@ -188,9 +203,11 @@
 //               rt_census / rt_census_frames
 //                            - live in rt_census's own atomics; the service stores them there.
 //
-//   RELAUNCH-ONLY, AND ONLY THESE TWO. Both say so in their own tooltip, with the evidence:
+//   RELAUNCH-ONLY, AND ONLY THESE TWO ARE FULLY SO (dlss_nr and dlss_sr join them in
+//   draw_load_only - four rows there - because their 0 -> 1 direction needs the relaunch, while
+//   1 -> 0 is live). Both say so in their own tooltip, with the evidence:
 //     require_trampoline 0->1  Honouring it means UNLOADING an already-initialised snippet, and
-//                              this tree has no in-process unload path: stray_dlssnr.cpp:4339-4341
+//                              this tree has no in-process unload path: nr_destroy_device
 //                              declines to FreeLibrary even at device teardown ("a 166 MB module
 //                              that may still hold worker threads"). 1->0 IS live - on that path
 //                              load_snippet already called s.unload() (ngx_interop.hpp:686), so
@@ -411,10 +428,12 @@ struct live_block
 	std::atomic<bool>     sr_suppress_taa{ false };
 	std::atomic<bool>     sr_mvec_decode{ true };
 	std::atomic<bool>     sr_mvec_reconstruct{ true };
-	// Tier 1. Both are latched into the DLSS create-params at CreateFeature and there is no
-	// evaluate-time equivalent, so a change needs the SR feature releasing before it can be read
-	// again. The controls raise a_teardown for that reason and nothing more: sr_try_run re-creates
-	// on the next accepted dispatch by itself, from the values the snapshot has already committed.
+	// Tier 1-adjacent, but the two are NOT wired alike, and the difference is feature_matches.
+	// sr_perf_quality IS compared by sr_try_run's create-param latch, so a change auto-queues the
+	// teardown from the render path itself - its control is k_plain with zero action bits.
+	// sr_render_preset is deliberately NOT compared (a preset change cannot make create_feature
+	// release anything), so it is BUTTON-ONLY: only "Recreate the SR feature" - or any other
+	// teardown - makes a changed preset take, and its tooltip says so.
 	std::atomic<uint32_t> sr_perf_quality{ 0 };
 	std::atomic<uint32_t> sr_render_preset{ 0 };
 
@@ -440,8 +459,10 @@ struct live_block
 
 	// ---- DLSS-SR, TIER 1. All seven are latched into the DLSS create-params at CreateFeature -
 	// cd.flags and cd.hw_depth - and there is no evaluate-time equivalent, so the snapshot makes
-	// the value COHERENT but only a feature release makes it TAKE. Their controls say exactly that
-	// and point at the recreate button, which is the same contract sr_perf_quality already ships.
+	// the value COHERENT and the feature release makes it TAKE. The release is AUTOMATIC:
+	// sr_try_run's create-param latch notices the mismatch and queues the teardown itself, which
+	// is why their controls are k_plain with no action bits and their tooltips say "no button
+	// needed" - the same contract sr_perf_quality ships.
 	std::atomic<bool>     sr_hdr{ true };
 	std::atomic<bool>     sr_mv_lowres{ true };
 	std::atomic<bool>     sr_mv_jittered{ false };
@@ -451,8 +472,10 @@ struct live_block
 	std::atomic<bool>     sr_hw_depth{ true };
 
 	// ---- DLSS-SR, TIER 2. These three decide the OUTPUT EXTENT, which picks the output UAV and
-	// then goes into CreateFeature, so a change is a geometry change: their controls raise
-	// a_teardown | a_reconcile at k_rebuild rather than asking the user to press anything.
+	// then goes into CreateFeature, so a change is a geometry change - and the render path
+	// notices it BY ITSELF: they feed want_out_w/h, sr_try_run's coarse key compares that against
+	// sr_seen_out_w/h every pass and queues kTeardown on a move. The controls are therefore wired
+	// k_reset with zero action bits (see the R1+auto ladder entry) rather than raising anything.
 	std::atomic<uint32_t> sr_group_tile{ 8 };
 	std::atomic<uint32_t> sr_out_width{ 0 };
 	std::atomic<uint32_t> sr_out_height{ 0 };
@@ -649,6 +672,10 @@ struct status_block
 	// what drives the REBUILDING rung now - a real fact published by the thread doing the work,
 	// not a three-second guess off a timestamp.
 	std::atomic<bool>         reconfig_pending{ false };
+	// DLSS-SR's run latch, mirrored out so the SR status line can say LATCHED OFF instead of
+	// "the branch is live now" while sr_try_run is bailing on every frame. Written by the render
+	// thread when the latch fires and by the service when a_clear_failed clears it.
+	std::atomic<bool>         sr_latched_off{ false };
 	// THE RENDER THREAD'S GATE, and it is what makes a rebuild ATOMIC with respect to the pass.
 	//
 	// Without it there is a window: the user clicks, the overlay bumps rebuild_epoch, and the next
@@ -711,7 +738,16 @@ struct host_facts
 	uint64_t app_id = 0;
 	bool     ini_found = false;
 
+	// dlss_nr as LOADED - launch-time by design (live_block::dlss_nr), so this is a stable fact
+	// rather than a mirrored setting. The status ladder needs it to tell "the NR snippet failed
+	// to load" (red) from "the NR snippet was deliberately never asked for" (the pure-SR
+	// configuration, where a red WAITING FOR NGX would be a misdiagnosis).
+	bool     nr_selected = true;
 	bool     snippet_loaded = false;
+	// True when remix_nvngx.dll is loaded and carrying EITHER snippet's calls - DLSS-NR's slot A
+	// or DLSS-SR's slot B. On a pure-SR run the NR snippet never loads, but the trampoline is
+	// still found and used; deriving this from the NR snippet alone made the panel claim it "was
+	// not found" while it was actively carrying every SR call.
 	bool     trampoline = false;
 	bool     armed = false;
 	// DLSS-SR's half of the same two facts. The SR section refuses to claim a live toggle it cannot
@@ -789,7 +825,8 @@ inline void bump(uint32_t kind);   // fwd
 // "Revert to stray_dlssnr.ini" - and before the reconfigure ladder each of them carried its own
 // copy of a sixteen-line block. A key added to three of the four is a Save button that never
 // lights up for it, or a Revert that leaves it behind: a silent, per-key failure with no
-// diagnostic. With the list at forty-one keys that stopped being a theoretical risk, so it is
+// diagnostic. At the list's current size (sixty-plus keys - count OVERLAY_OWNED_FIELDS, not this
+// comment) that stopped being a theoretical risk, so it is
 // spelled out in exactly one place and the four callers share it.
 //
 // app_id is deliberately absent from all of this. It is the one setting with no live control -
@@ -1353,6 +1390,13 @@ inline void publish_reconfig_pending(bool pending)
 	status().reconfig_pending.store(pending, std::memory_order_relaxed);
 }
 
+/// DLSS-SR's run latch, for the SR status line. True from sr_try_run when 8 consecutive
+/// EvaluateFeature failures latch the branch off; false from the service's a_clear_failed arm.
+inline void publish_sr_latched_off(bool latched)
+{
+	status().sr_latched_off.store(latched, std::memory_order_relaxed);
+}
+
 /// Stamped by the service when it has actually released the feature and the textures. Keeps
 /// teardown_ms meaning what its own comment says it means now that the Reset button no longer
 /// goes through begin_pass - and it is what keeps REBUILDING on screen long enough to read.
@@ -1509,7 +1553,8 @@ inline bool     live_sr_optimal_settings()  { return live().sr_optimal_settings.
 //     unrecognised line, every blank line and the original key order and spelling survive.
 //   * TEMP FILE + MoveFileExW(REPLACE_EXISTING). A half-written ini is worse than none: per
 //     addon_config.hpp:226-230 every key after the cut silently takes its built-in default.
-//   * EVERY KEY THE PANEL OWNS IS ROUND-TRIPPED, AND THAT IS NOW ALL 33 OF THEM - the
+//   * EVERY KEY THE PANEL OWNS IS ROUND-TRIPPED - ALL OF THEM, with OVERLAY_OWNED_FIELDS as
+//     the single source of truth for the count (sixty-two as of the DLSS-SR/chain merges) - the
 //     identification pins (shader_hash, srv_depth/velocity/colour, uav_output) included, along
 //     with enabled, diagnostics, hdr_codec, populate_parameters and require_trampoline. This
 //     bullet used to say the exact opposite, and it was left behind when the reconfigure ladder
@@ -2142,10 +2187,15 @@ inline void checkbox_action(const char *label, std::atomic<bool> &a, uint32_t bi
 inline void slider_u32(const char *label, std::atomic<uint32_t> &a, int lo, int hi,
                        uint32_t bits, const char *why, uint32_t rung, const char *help)
 {
-	int v = static_cast<int>(a.load(std::memory_order_relaxed));
-	// A value outside the range is SHOWN rather than clamped away, on the same argument
-	// combo_u32 makes above: the render path uses whatever is in the ini, and a widget that
-	// silently rewrote it would make the panel disagree with what is actually being matched.
+	const uint32_t stored = a.load(std::memory_order_relaxed);
+	int v = static_cast<int>(stored);
+	// The DISPLAY is clamped - SliderInt needs an in-range position - but the STORED value is
+	// preserved and, when it is out of range, said out loud in amber below, on the same argument
+	// combo_u32 makes above: the render path uses whatever is in the ini, and a panel that showed
+	// only the clamped number would disagree with what is actually being matched. (An earlier
+	// revision of this comment claimed the raw value was shown in the slider itself; it never
+	// was, and an ini pin like srv_colour=99 displayed as 63 with no indication which was live.)
+	const bool out_of_range = (v < lo || v > hi);
 	if (v < lo) v = lo;
 	if (v > hi) v = hi;
 	if (ImGui::SliderInt(label, &v, lo, hi))
@@ -2158,6 +2208,11 @@ inline void slider_u32(const char *label, std::atomic<uint32_t> &a, int lo, int 
 	}
 	if (help != nullptr)
 		ImGui::SetItemTooltip("%s", help);
+	if (out_of_range)
+		overlay_imgui::textf_colored(col::amber,
+			"    stored value %u is outside [%d, %d] and is being SENT AS-IS - the slider above "
+			"shows the nearest end of its range. Moving the slider overwrites it.",
+			(unsigned)stored, lo, hi);
 }
 
 /// The shader hash, as text. It is a 64-bit hex identifier the user copies out of ReShade.log, so
@@ -2347,6 +2402,21 @@ inline void draw_status(reshade::api::effect_runtime *rt, const host_facts &f)
 		}
 		return;
 	}
+	// THE PURE-SR RUNG, and it must come before the snippet check: with dlss_nr=0 the DLSS-NR
+	// snippet is DELIBERATELY never loaded, so "WAITING FOR NGX" in red - with a fabricated
+	// "could not be loaded" reason - would misreport a configuration the user chose as a load
+	// failure that never happened. This block is about DLSS-NR only; the DLSS-SR section below
+	// carries SR's own status.
+	if (!f.nr_selected)
+	{
+		overlay_imgui::textf_colored(col::dim,
+			"DLSS-NR is OFF by configuration (dlss_nr=0) - nvngx_dlssnr.dll was deliberately not "
+			"loaded.");
+		ImGui::TextWrapped("This line is about DLSS-NR only. DLSS-SR%s has its own status beside "
+		                   "its checkbox in the section below.",
+		                   live().dlss_chain.load(std::memory_order_relaxed) ? " (and the chain)" : "");
+		return;
+	}
 	if (!f.snippet_loaded)
 	{
 		overlay_imgui::textf_colored(col::red, "WAITING FOR NGX - the snippet is not loaded");
@@ -2439,6 +2509,17 @@ inline void draw_status(reshade::api::effect_runtime *rt, const host_facts &f)
 		                   "configured SRV registers. Check the shader identification below, and "
 		                   "ReShade.log for the one-shot \"pass did not run\" line that names the "
 		                   "exact reason.", (unsigned long long)live().shader_hash.load(std::memory_order_relaxed));
+	}
+	else if (evals == 0 &&
+	         live().dlss_sr.load(std::memory_order_relaxed) && f.sr_armed)
+	{
+		// dlss_nr=1 + dlss_sr=1: DLSS-SR TAKES the dispatch (its own tooltip says so), so the NR
+		// evaluate never runs and never publishes - by DESIGN, not by failure. Without this rung
+		// the headline below sat permanently red while DLSS-SR evaluated every frame. The chain
+		// is different: its NR half publishes through the same seam, so it keeps the red rung.
+		overlay_imgui::textf_colored(col::dim,
+			"NOT EVALUATING, by routing - dlss_sr=1, so the accepted dispatch goes to DLSS-SR and "
+			"the DLSS-NR evaluate does not run. See the DLSS-SR section below for its status.");
 	}
 	else if (evals == 0)
 	{
@@ -2610,7 +2691,7 @@ inline void draw_controls(const host_facts &f)
 			"FRAME when you tick this.\n\n"
 			"OFF releases the NGX feature, every view and every texture on the next present, so the "
 			"VRAM goes back. The snippet module itself stays loaded: this tree has no in-process "
-			"unload path (stray_dlssnr.cpp:4339-4341 declines to FreeLibrary even at device "
+			"unload path (nr_destroy_device declines to FreeLibrary even at device "
 			"teardown), and unloading a module that may still hold worker threads to save address "
 			"space would be a bad trade. Nothing on the render path reads it once it is off.\n\n"
 			"THE ONE CASE WHERE ON REACHES NOTHING, and the panel says so above rather than "
@@ -2639,11 +2720,12 @@ inline void draw_controls(const host_facts &f)
 	}
 	ImGui::SetItemTooltip(
 		"Releases the NGX feature, every view and every texture on the next present (on the main "
-		"thread, after the queue is idle), clears the latched create-failure AND the latched "
-		"View-CB / ClipToPrevClip failures, and rebuilds everything on the following dispatch. "
-		"This is the control to reach for when something has wedged - it is the single most useful "
-		"button in the reference add-on too, and unlike the reference it works even when the pass "
-		"is no longer being reached at all.");
+		"thread, after the queue is idle), clears the latched create-failure, the latched "
+		"View-CB / ClipToPrevClip failures AND the run latches - DLSS-SR's latched-off state, the "
+		"chain's NR-off state, and both rejected-guide latches - and rebuilds everything on the "
+		"following dispatch. This is the control to reach for when something has wedged - it is "
+		"the single most useful button in the reference add-on too, and unlike the reference it "
+		"works even when the pass is no longer being reached at all.");
 
 	ImGui::SameLine();
 	ImGui::BeginDisabled(!dirty());
@@ -2666,7 +2748,7 @@ inline void draw_controls(const host_facts &f)
 			l.bypass.store(!on, std::memory_order_relaxed);
 			// k_flush, both directions: the toggle must not leave a pending pristine copy armed.
 			// st->pending_res is a raw resource address held across a frame and UE 4.27 can
-			// recycle it (stray_dlssnr.cpp:3206-3210).
+			// recycle it (see nr_try_run's history-restore arming block).
 			bump(k_flush);
 		}
 		ImGui::SetItemTooltip(
@@ -3150,19 +3232,33 @@ inline void draw_controls(const host_facts &f)
 	//              fixes it with no new code at all: releasing out_tex zeroes out_w/out_h, so the
 	//              next accepted dispatch re-enters nr_ensure_output on the create branch and
 	//              re-decides the format against the new value.
+	//
+	// ONE RESIDUAL HAZARD, CLOSED IN nr_ensure_output RATHER THAN HERE: begin_pass's seqlock
+	// fallback can run the create-after-teardown pass on the PREVIOUS g_cfg (panel open, the
+	// snapshot colliding with draw_controls for all 8 attempts), re-creating out_tex against the
+	// STALE hdr_codec. nr_ensure_output's fast path now re-checks neural_fmt against the current
+	// value every pass and queues its own teardown on disagreement, so the worst case is one
+	// extra rebuild instead of a silently dead denoise - which is what lets this control stay
+	// live at all. The tooltip still steers A/Bs to transfer_strength = 0, which needs none of
+	// this machinery.
 	checkbox_action("HDR codec (feed the network a display-referred proxy)", l.hdr_codec,
 		a_teardown | a_reconcile, "hdr_codec", k_rebuild,
 		"Live in BOTH directions, and it costs one full rebuild each way - the NGX feature and "
 		"every texture are released on the next present and recreated on the following dispatch, "
 		"because the network's target texture has to be re-created in a DIFFERENT FORMAT. Expect a "
 		"visible hitch and one un-accumulated frame.\n\n"
+		"FOR AN A/B, PREFER \"HDR Transfer Strength\" = 0 INSTEAD OF THIS BOX. At 0 the decode is "
+		"result = lerp(original, graded, 0) = original, bit for bit (verified over 1,080,000 "
+		"cases), so the add-on's effect on the frame is OFF - same visible result as unticking "
+		"this - while the codec and every texture stay armed: no teardown, no format change, no "
+		"hitch, and sliding back is instant. Neutralising a value beats tearing down a pipeline.\n\n"
 		"ON: the pass builds a soft-clipped exact-piecewise-sRGB proxy, hands the PROXY to the "
 		"network as DLSSNR.Color, and carries the answer back onto the untouched original as an "
 		"additive residual. DLSS-NR is a display-referred network and UE4 SceneColor is linear and "
 		"unbounded, so this is what fixes README gap 1 - the darkening.\n\n"
 		"OFF: the raw TAA output is bound as DLSSNR.Color and the network's raw answer is copied "
-		"straight back. That is the A/B, and it is a genuinely different image - it is NOT the same "
-		"as HDR Transfer Strength = 0, which is an exact bypass of the DENOISE with the codec still "
+		"straight back. Tick this only when you specifically want THAT image - it is genuinely "
+		"different from Transfer Strength = 0, which bypasses the DENOISE with the codec still "
 		"running.");
 
 	checkbox_b("Restore the graphics root signature too", l.restore_graphics_root, k_plain,
@@ -3270,7 +3366,13 @@ inline void draw_controls(const host_facts &f)
 			"RELAUNCH REQUIRED rather than APPLIED.\n\n"
 			"NOTE: DLSS-SR TAKES the dispatch. With this on, the DLSS-NR evaluate does not run.");
 
-		if (want_sr && sr_armed)
+		if (want_sr && sr_armed && status().sr_latched_off.load(std::memory_order_relaxed))
+			overlay_imgui::textf_colored(col::red,
+				"    DLSS-SR is LATCHED OFF - EvaluateFeature failed 8 frames running, so the "
+				"branch bails every frame and the game's own TAA runs. Fix the setting that "
+				"caused it (ReShade.log names the failing check), then press \"Reset NR feature\" "
+				"above to clear the latch and retry.");
+		else if (want_sr && sr_armed)
 			overlay_imgui::textf_colored(col::green, "    DLSS-SR is ARMED - the branch is live now.");
 		else if (want_sr && sr_loaded)
 			overlay_imgui::textf_colored(col::red,
@@ -3362,8 +3464,9 @@ inline void draw_controls(const host_facts &f)
 
 		slider_u32("DLSS.Hint.Render.Preset (sr_render_preset, 0 = auto)", l.sr_render_preset, 0, 15,
 			0u, "sr_render_preset", k_plain,
-			"Live on the same terms as PerfQualityValue above: create-time, so it needs the recreate "
-			"button to take. The value goes into the ONE Hint.Render.Preset slot the render/display "
+			"Create-time, and UNLIKE PerfQualityValue above the render path does NOT notice a "
+			"change by itself (feature_matches deliberately skips the preset), so it needs the "
+			"recreate button to take. The value goes into the ONE Hint.Render.Preset slot the render/display "
 			"ratio selects, which is why a preset set for the wrong ratio silently does nothing. "
 			"0 = auto, i.e. let the snippet choose.");
 
@@ -3774,7 +3877,7 @@ inline void draw_controls(const host_facts &f)
 		"same action as ticking `enabled` above.\n\n"
 		"0 -> 1 NEEDS A RELAUNCH when the snippet is already loaded, and here is the specific "
 		"reason: honouring it would mean UNLOADING an initialised snippet, and this tree has no "
-		"in-process unload path anywhere. stray_dlssnr.cpp:4339-4341 declines to FreeLibrary even "
+		"in-process unload path anywhere. nr_destroy_device declines to FreeLibrary even "
 		"at device teardown - \"a 166 MB module that may still hold worker threads\". So the value "
 		"is remembered and saved, and it takes effect next launch. Nothing about the current "
 		"session changes, and the panel does not pretend otherwise.\n\n"
@@ -3839,10 +3942,12 @@ inline void draw_controls(const host_facts &f)
 }
 
 // ---------------------------------------------------------------------------------------------
-// WHAT IS LEFT THAT A RELAUNCH IS STILL NEEDED FOR - AND IT IS TWO THINGS, NOT TEN.
+// WHAT IS LEFT THAT A RELAUNCH IS STILL NEEDED FOR - AND IT IS FOUR ROWS, NOT TEN.
 //
-// This section used to list ten keys. Eight of them are now real controls above, reached through
-// the reconfigure ladder. These two remain, and each one states the SPECIFIC line of this add-on
+// This section used to list ten keys. Most are now real controls above, reached through the
+// reconfigure ladder. Four rows remain: two fully relaunch-only (app_id, require_trampoline's
+// 0 -> 1 direction) and two half-live (dlss_nr and dlss_sr, whose 0 -> 1 direction needs the
+// relaunch while 1 -> 0 is live). Each one states the SPECIFIC line of this add-on
 // that makes it so, in the control's own tooltip as well as on screen - a reason that lives only
 // in a header comment is a reason the user never reads.
 //
@@ -3885,7 +3990,7 @@ inline void draw_load_only(const host_facts &f)
 		"The 1 -> 0 direction IS live and has a real checkbox under Diagnostics above. Only 0 -> 1 "
 		"needs a relaunch, and only when the snippet is already loaded: honouring it then would "
 		"mean UNLOADING an initialised snippet, and there is no in-process unload path anywhere in "
-		"this tree - stray_dlssnr.cpp:4339-4341 declines to FreeLibrary even at device teardown, "
+		"this tree - nr_destroy_device declines to FreeLibrary even at device teardown, "
 		"because a 166 MB module may still hold worker threads. The new value is saved and takes "
 		"effect next launch.");
 

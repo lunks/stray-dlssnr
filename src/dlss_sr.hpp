@@ -495,14 +495,17 @@ struct feature
 
 	// The one-shot log latches. Same rule as everywhere else in this codebase: a message that
 	// could print every frame gets a latch, and the latch is named after the message.
+	//
+	// Five more used to sit below these (logged_first_eval, logged_jitter_zero, logged_no_jitter,
+	// logged_out_extent, logged_hw_depth). Their messages migrated to nr_state
+	// (logged_sr_no_jitter, logged_sr_out_extent) and jitter_source (logged_zero, logged_failed)
+	// during the dlss-sr merge, stranding these copies with zero readers or writers - while this
+	// comment went on promising each one guarded a message. Deleted: a latch that guards nothing
+	// is exactly the "compiles but never runs" shape this project documents as its recurring
+	// failure mode.
 	bool logged_create_fail  = false;
 	bool logged_eval_fail    = false;
 	bool logged_preset       = false;
-	bool logged_first_eval   = false;
-	bool logged_jitter_zero  = false;
-	bool logged_no_jitter    = false;
-	bool logged_out_extent   = false;
-	bool logged_hw_depth     = false;
 };
 
 // True when the currently live feature already matches this description.
