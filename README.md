@@ -173,15 +173,55 @@ silently taking a default.
 | `mvec_clip_row` | `0` | pin the `View.ClipToPrevClip` float4 row. `0` = discover **and** cross-check against this game's own TAA bytecode |
 | `mvec_clip_transpose` | `0` | read `ClipToPrevClip` transposed — the escape hatch for the matrix convention |
 | `mvec_scale_x` / `mvec_scale_y` | `0` / `0` | `0` = derive from extents (forced to `1.0` when `mvec_decode=1`). With the decode on, `-1` is the per-axis **sign A/B** |
-| `intensity`, `local_tone_strength`, `local_structure_strength` | `1.0` | the snippet's own fallbacks |
+| `intensity` | `1.0` | **conditional.** The snippet's own fallback. Slider range `[0,1]`; **the ini is NOT clamped**. An *attenuation*, not a gain: `1.0` = **full NR** (not "off") and you drag **down**. *Proven:* every value `>= 1.0` is byte-identical, and below `1.0` the selector moves mode `0 → 1` (the `cmovne` at `0x18001d53d` can only force mode 3 with a ControlMask bound, and this add-on binds a null one). *Not confirmed:* that mode 1 runs — `0x18001f500` gates it on a backend capability bit (`bt eax,0` at `0x1800295ff`) we cannot read |
+| `local_tone_strength` | `1.0` | **inert at `style = 0`.** The snippet does clamp it to `[0,1]` itself, so `>= 1.0` is byte-identical to `1.0` — but each of the 14 lerps it feeds is gated by a per-style bitmask (`mov eax, dword [rdx]` at `0x18001d606`) and this build's default mask at `0x1800b0da8` is `0x00000000`. **0 of 14 parameters move at the default style.** See below |
+| `local_structure_strength` | `1.0` | **conditional — see below.** Consumed only behind two `dynamic_cast` null tests; not clamped anywhere in the snippet |
 | `skin_structure_strength` | `-1.0` | negative = inherit local structure strength; `0.0` is **not** neutral |
-| `style` | `0` | uint. **Only `0` is known to exist in this snippet build** — `1`/`2` carry the reference add-on's names (Natural/Cinematic) and are unmeasured here |
-| `use_auto_mask` | `1` | gates both structure strengths |
+| `style` | `0` | uint. Unmeasured on hardware, but **the binary shows two enabled keyed sub-entries, keys `1` and `2`**, carrying local-tone masks `0x34` (3 of 14 params) and `0x20` (1 of 14) against the default record's `0x00000000`. If any index makes `local_tone_strength` bite, it is one of those. Whether `DLSSNR.Style` is the value compared against those keys is **untraced** |
+| `use_auto_mask` | `1` | **conditional.** Selects what both structure strengths become (`-1.0f` when off); shares their gate |
 | `ui_correction` | `0` | `DLSSNR.UICorrection`. A real parameter of this build (one exact-line match in `nvngx_dlssnr.dll`'s string table; read with a `0xbad00000` guard, fallback `0`). Written per evaluate. **Its visual effect on STRAY is unverified** — a diagnostic knob, not a tuning one |
 
 The five tuning knobs default to the snippet's **own internal fallbacks**, recovered from its
-disassembly. `1.0` is a fallback, **not a calibrated neutral midpoint**, and the scale these
-values sit on is not known. Change them one at a time.
+disassembly. Change them one at a time.
+
+**Two of the five are range-explained; three are gate-explained, and the gate is not ours.**
+
+`intensity` and `local_tone_strength` genuinely do nothing above `1.0`, and that is now the top of
+their sliders. But note what `intensity >= 1.0` actually does: `fn 0x18001d4d0` is a **mode
+selector** returning `0`, `1` or `3`, and mode `0` means *the optional attenuation pass is not
+enabled* — which at full strength is correct, because there is nothing to attenuate. Its caller's
+`false` is stored to a flag at `0x1800191bd` and the evaluate falls straight through it; **it is
+not an abort and the denoise is unaffected.** An earlier revision of this README and of the
+overlay said `>= 1.0` "skips the pass entirely" and logged the shipped default as `INERT`. That
+was wrong, and it told users their denoiser was off when it was at full strength.
+
+`local_tone_strength` is the one proven range claim: clamped to `[0,1]` at `0x18001d603` before
+being used as the lerp coefficient for 14 network parameters at `[rcx+0x124..0x158]`.
+
+**`local_structure_strength`, `skin_structure_strength` and `use_auto_mask` are gated on the
+loaded model, not on their values.** The effective pair the snippet computes at `+0xf8`/`+0xfc`
+has exactly one reader — an exhaustive scan of every `movss` in `.text` finds three sites per
+displacement and the other two are frame locals in a different function — and that reader sits
+behind two `dynamic_cast` null tests:
+
+| gate | site | test | target type |
+|---|---|---|---|
+| network | `0x180021cc8` | `0x18002253f` `test rcx,rcx / je` | `.?AVCCNetwork@HNetCpp@@` |
+| layer | `0x18003f5e8` | `0x18003f5f3` `test rax,rax / je` | `.?AVCCTinlayoutFusedPreBlockSwin1HLayer@HNetCpp@@` |
+
+If either cast returns null, `call 0x180061710` — the pure setter that stores the pair at
+`cb+0x98`/`cb+0x9c` — never runs, and **all three controls are inert together**. That is exactly
+the pattern reported from hardware. A previous diagnosis called these "proven to reach the network
+raw and unclamped"; it had walked the *call edges* and never looked at the guards on them, so it
+established reachability and reported it as liveness. Whether the shipped model satisfies both
+casts is **not settled from the binary** — it needs a run.
+
+**Nothing is clamped on load.** An earlier build clamped all four knobs in `cfg::load`. For
+`intensity` and `local_tone_strength` that changed no behaviour and only rewrote the user's file;
+for the two structure strengths it removed values the snippet is willing to accept, since
+`0x180061710` stores them raw. The sliders carry the conventional `[0,1]` domain — `-1.0f` is the
+snippet's own disabled sentinel and out-of-range conditioning of a trained network is undefined
+rather than "more" — and the ini is the unclamped escape hatch.
 
 ### Every setting is live — what each one costs, and the two that are not
 

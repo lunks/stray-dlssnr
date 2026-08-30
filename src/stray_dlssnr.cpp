@@ -1596,6 +1596,22 @@ struct nr_state
 	bool     feature_failed = false;     // latched per (out_w,out_h); cleared when they move
 	uint64_t evaluate_count = 0;
 
+	// ---- NGX getter trace ------------------------------------------------------------------
+	// The five NGX tuning parameters as they were on the evaluate we last traced. A change in any
+	// of them arms the trace for exactly ONE evaluate, which is the frame the user's slider drag
+	// lands on - the only frame where "did the snippet read my new value?" is the open question.
+	// Seeded to NaN-ish sentinels so the first evaluate always traces once.
+	float    traced_intensity        = -1e30f;
+	float    traced_local_tone       = -1e30f;
+	float    traced_local_structure  = -1e30f;
+	float    traced_skin_structure   = -1e30f;
+	uint32_t traced_use_auto_mask    = 0xFFFFFFFFu;
+	uint32_t traced_style            = 0xFFFFFFFFu;
+	// Rate limit: a slider drag is continuous, and one trace block per frame for a second would
+	// be thousands of lines. At most one every 30 evaluates, which is well under a drag's length
+	// and still catches the settled value.
+	uint64_t last_trace_evaluate     = 0;
+
 	// ---- THE DEFERRED-RECONFIGURE MASK --------------------------------------------------------
 	// This replaces the plain `bool pending_teardown`, and the change is a fix rather than a
 	// generalisation. That bool was READ UNLOCKED at :2739 and from the present thread, while being
@@ -2742,6 +2758,92 @@ static void nr_set_resource(ngx::parameter_block *p, const ngx::resource_param_n
 	ngx::set_u32(p, n.height.c_str(), h);
 }
 
+// --------------------------------------------------------------------------------------------
+// Dump one armed evaluate's worth of snippet-side Gets.
+//
+// THE FIVE KEYS ARE PRINTED WHETHER OR NOT THEY WERE READ, and that is the entire point: the
+// interesting outcome for a control that does nothing is the key that never appears, and a
+// listing that only shows what happened cannot show an absence. Everything else is summarised.
+//
+// Measured against the deployed snippet (nvngx_dlssnr.dll md5 eea91faf55a8993656c66815f0497b3b),
+// NVSDK_NGX_D3D12_EvaluateFeature reaches exactly one function that reads these keys
+// [BIN 0x1800159c0 -> 0x180018620 -> 0x180019f30], and that function issues 60 Gets per evaluate
+// (counted by walking every guard-dispatched vtable call in 0x180019f30..0x18001ac2a).
+// A trace that reports far fewer, or that reports these five as absent, is the finding.
+static void nr_log_get_trace(const nr_state &st, ngx::parameter_block &p)
+{
+	static const char *const kWatched[] = {
+		ngx::kParamIntensity,
+		ngx::kParamLocalToneStrength,
+		ngx::kParamLocalStructureStrength,
+		ngx::kParamSkinStructureStrength,
+		ngx::kParamUseAutoMask,
+		ngx::kParamStyle,
+		ngx::kParamControlMask,   // gates BOTH structure strengths inside the snippet
+	};
+
+	const int seen   = p.get_trace.seen();
+	const int stored = p.get_trace.stored();
+	LOGI("DLSS-NR: NGX getter trace, evaluate #%llu - the snippet issued %d Get call(s) against "
+	     "our parameter block%s. This records the CALLEE's reads; it is evidence the value "
+	     "REACHED the network, NOT that the network acted on it.",
+	     (unsigned long long)st.evaluate_count + 1, seen,
+	     (seen > stored) ? " (listing truncated)" : "");
+
+	for (const char *want : kWatched)
+	{
+		const ngx::parameter_block::trace::record *found = nullptr;
+		for (int i = 0; i < stored; ++i)
+		{
+			if (std::strcmp(p.get_trace.records[i].key, want) == 0)
+			{
+				found = &p.get_trace.records[i];
+				break;
+			}
+		}
+		if (found == nullptr)
+		{
+			LOGW("DLSS-NR:   %-32s NOT READ by the snippet during this evaluate. A control whose "
+			     "key the snippet never asks for cannot be live, whatever we write.", want);
+		}
+		else if (!found->hit)
+		{
+			LOGE("DLSS-NR:   %-32s %s -> MISS. The snippet asked and our block had no such key, so "
+			     "it substituted its own fallback. This is OUR bug: either the key is not written "
+			     "on the evaluate path, or it is spelled differently from the snippet's.",
+			     want, ngx::get_slot_name(found->slot));
+		}
+		else if (found->slot == 8 || found->slot == 9 || found->slot == 10)
+		{
+			LOGI("DLSS-NR:   %-32s %s -> HIT, stored as %s, returned %p.",
+			     want, ngx::get_slot_name(found->slot),
+			     ngx::value_kind_name(found->kind), found->pointer);
+		}
+		else
+		{
+			LOGI("DLSS-NR:   %-32s %s -> HIT, stored as %s, returned %.4f.",
+			     want, ngx::get_slot_name(found->slot),
+			     ngx::value_kind_name(found->kind), found->numeric);
+		}
+	}
+
+	// Every key the snippet asked for and we did not have. These are the ones where it falls back
+	// to an internal default, and the list is short enough to print in full.
+	int misses = 0;
+	for (int i = 0; i < stored; ++i)
+		if (!p.get_trace.records[i].hit)
+			++misses;
+	if (misses > 0)
+	{
+		LOGI("DLSS-NR:   %d of %d Get(s) MISSED. Each is a key the snippet reads and this add-on "
+		     "does not write, so the snippet used its own fallback:", misses, stored);
+		for (int i = 0; i < stored; ++i)
+			if (!p.get_trace.records[i].hit)
+				LOGI("DLSS-NR:     miss  %-40s %s",
+				     p.get_trace.records[i].key, ngx::get_slot_name(p.get_trace.records[i].slot));
+	}
+}
+
 // The parameter block outlives every evaluate - it is allocated once and reused - so an optional
 // resource that is not bound THIS frame must be cleared explicitly. Leaving the previous frame's
 // pointer there both dangles and, for the control mask specifically, keeps the snippet forcing
@@ -2749,6 +2851,28 @@ static void nr_set_resource(ngx::parameter_block *p, const ngx::resource_param_n
 //
 // The null is written through the ID3D12Resource* slot, not the void* slot, so the parameter
 // map's type tag stays consistent with the bound case.
+//
+// MEASURED, because an earlier note here rested on an assumption that turned out to be wrong.
+// It was suspected that writing DLSSNR.ControlMask as a PRESENT-BUT-NULL entry - which renodx
+// never does, it omits the key entirely - would read back as Success and so make the snippet
+// treat a mask as bound, forcing UseAutoMask off and bypassing both structure strengths. It does
+// not, and the reason is that the snippet zeroes the field before it ever reads the key:
+//
+//   [BIN 0x180019f7d]  movups xmmword ptr [rdi+0x60], xmm0    ; xmm0 = 0, on entry, every call
+//   [BIN 0x18001a3f0]  lea    r8,  [rdi+0x60]                 ; out-pointer for the mask
+//   [BIN 0x18001a3f4]  lea    rdx, [rip+0x94a15]              ; "DLSSNR.ControlMask"
+//   [BIN 0x18001a3fe]  mov    rax, qword ptr [rax+0x40]       ; slot 8, Get(const char*, void**)
+//   [BIN 0x18001a40d]  cmp    eax, 0xbad00000
+//   [BIN 0x18001a412]  je     0x18001a4c6                     ; a MISS skips the whole sub-block
+//   [BIN 0x18001aa4b]  cmp    qword ptr [rdi+0x60], 0
+//   [BIN 0x18001aa50]  je     0x18001aa59                     ; NULL -> the force-off is skipped
+//   [BIN 0x18001aa52]  mov    dword ptr [rdi+0xf0], r12d      ; non-null -> UseAutoMask := 0
+//
+// Absent leaves the zero in place; present-but-null stores a zero over a zero. Both reach
+// 0x18001aa4b with [rdi+0x60] == 0 and neither takes the force-off. The two are exactly
+// equivalent, so this write is safe - and removing it to match renodx would change nothing.
+// tools/ngx_paramblock_selftest.cpp checks both, and checks that a genuinely non-null mask DOES
+// trigger the bypass, so the mechanism stays covered.
 static void nr_clear_resource(ngx::parameter_block *p, const ngx::resource_param_names &n)
 {
 	ngx::set_res(p, n.resource.c_str(), static_cast<ID3D12Resource *>(nullptr));
@@ -3501,8 +3625,18 @@ static ngx::Result nr_evaluate(nr_state &st, ID3D12GraphicsCommandList *cl, cons
 	ngx::set_u32(p, ngx::kParamDepthInverted, g_cfg.depth_inverted ? 1u : 0u);
 	ngx::set_f32(p, ngx::kParamMVecScaleX,    a.scale_x);
 	ngx::set_f32(p, ngx::kParamMVecScaleY,    a.scale_y);
-	// Gates BOTH structure strengths. Binding a ControlMask would force it to 0 inside the
-	// snippet; this add-on binds none, so the two never conflict.
+	// SELECTS what BOTH structure strengths become, and does not by itself make them live.
+	// With UseAutoMask == 0 the snippet substitutes the constant -1.0f [BIN 0x18001aa84, loading
+	// 0x1800afc40] into both effective slots [BIN +0xf8 skin, +0xfc local]. With it set, +0xfc
+	// takes LocalStructureStrength and +0xf8 takes SkinStructureStrength unless that is negative,
+	// in which case it inherits LocalStructureStrength [BIN 0x18001aa6d comiss / 0x18001aa70 jae
+	// / 0x18001aa72]. Either way the pair is only READ behind two dynamic_cast null tests
+	// [BIN 0x18002253f and 0x18003f5f3] - see the tuning-knob note in addon_config.hpp. If those
+	// fail, this key and both strengths are inert together.
+	//
+	// Binding a ControlMask would ALSO force it to 0 [BIN 0x18001aa4b cmp / 0x18001aa52]; this
+	// add-on binds none. See nr_clear_resource for why writing the mask as an explicit null does
+	// not count as bound.
 	ngx::set_u32(p, ngx::kParamUseAutoMask,   g_cfg.use_auto_mask ? 1u : 0u);
 
 	ngx::set_f32(p, ngx::kParamIntensity,              g_cfg.intensity);
@@ -5647,6 +5781,49 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 		ea_nr.output = output_res;  ea_nr.out_w   = st->out_w;  ea_nr.out_h   = st->out_h;
 		ea_nr.scale_x = scale_x;    ea_nr.scale_y = scale_y;
 
+		// ---- BEGIN ngx getter trace ----------------------------------------------------------
+		// WHAT THIS ANSWERS, AND WHAT IT DELIBERATELY DOES NOT.
+		//
+		// The evaluate log line below prints the values the ADD-ON wrote. That is our side of the
+		// call and it proves nothing about the snippet: a parameter can be written perfectly and
+		// still never be read, or be read through a vtable slot our hand-laid table maps somewhere
+		// else, in which case the snippet silently substitutes its own fallback and the image does
+		// not move. Those two failures and "read correctly, but the network did not act on it"
+		// produce byte-identical add-on logs.
+		//
+		// The trace records the CALLEE's reads: for every Get the snippet issues during this one
+		// EvaluateFeature, the key it asked for, the slot it came through, whether our map had it,
+		// and the number we handed back. That separates the three:
+		//
+		//   key absent from the trace     -> the snippet never reads it; the control cannot be live
+		//   key present, MISS             -> our block did not serve it; the bug is ours
+		//   key present, HIT, right value -> the value reached the snippet, and anything still
+		//                                    wrong is downstream of the parameter block
+		//
+		// It is emphatically NOT proof that the IMAGE changed. Nothing on this side of the call
+		// can be - the only evidence for that is a pixel difference between two captures at
+		// different settings, which needs hardware.
+		const bool tuning_moved =
+			st->traced_intensity       != g_cfg.intensity              ||
+			st->traced_local_tone      != g_cfg.local_tone_strength    ||
+			st->traced_local_structure != g_cfg.local_structure_strength ||
+			st->traced_skin_structure  != g_cfg.skin_structure_strength ||
+			st->traced_use_auto_mask   != (g_cfg.use_auto_mask ? 1u : 0u) ||
+			st->traced_style           != g_cfg.style;
+		//
+		// st->params IS the block nr_evaluate writes into and hands to the snippet, so arming it
+		// here still traces the callee's reads even though the Set calls themselves now live
+		// inside nr_evaluate. It is re-read rather than captured because nr_evaluate is entitled
+		// to refuse the evaluate before touching it.
+		ngx::parameter_block *const p = st->params;
+		const bool trace_this_evaluate =
+			p != nullptr && tuning_moved &&
+			(st->evaluate_count == 0 ||
+			 st->evaluate_count - st->last_trace_evaluate >= 30);
+		if (trace_this_evaluate)
+			p->get_trace.arm();
+		// ---- END ngx getter trace ------------------------------------------------------------
+
 		// THE COLOUR RECT IS st->out_w/out_h, NOT taa_out.w/h. On this path the two are equal by
 		// construction - nr_ensure_output was called with taa_out.w/h a few lines above and returns
 		// false unless they match what out_tex was created at - so this is a provable no-op here.
@@ -5655,6 +5832,21 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 		// checks Color against Output) or a silent 2x-per-axis scale error.
 		bool nr_reset_sent = false;
 		const ngx::Result r = nr_evaluate(*st, d3d12_cmd, ea_nr, nr_reset_sent);
+
+		// ---- BEGIN ngx getter trace ----------------------------------------------------------
+		if (trace_this_evaluate)
+		{
+			p->get_trace.disarm();
+			st->traced_intensity       = g_cfg.intensity;
+			st->traced_local_tone      = g_cfg.local_tone_strength;
+			st->traced_local_structure = g_cfg.local_structure_strength;
+			st->traced_skin_structure  = g_cfg.skin_structure_strength;
+			st->traced_use_auto_mask   = g_cfg.use_auto_mask ? 1u : 0u;
+			st->traced_style           = g_cfg.style;
+			st->last_trace_evaluate    = st->evaluate_count;
+			nr_log_get_trace(*st, *p);
+		}
+		// ---- END ngx getter trace ------------------------------------------------------------
 
 		// ---- BEGIN overlay_ui hook ----
 		// Everything the overlay's status block needs, published as relaxed atomics that flow ONE way
@@ -5737,6 +5929,69 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 				     g_cfg.intensity, g_cfg.local_tone_strength, g_cfg.local_structure_strength,
 				     g_cfg.skin_structure_strength, g_cfg.style, (int)g_cfg.copy_back,
 				     (int)codec_encoded, (int)(g_cfg.history_restore && g_cfg.copy_back));
+
+				// THESE NOTES NAME A VALUE THE SNIPPET CANNOT DISTINGUISH FROM ITS NEIGHBOUR,
+				// at the moment the value itself is printed. They exist because the log line
+				// above faithfully printed Intensity=2.000 LocalTone=1.550 every time, which
+				// reads as proof the values did something - they arrived, but 2.0 and 1.0 drive
+				// identical code.
+				//
+				// THE INTENSITY NOTE FIRES ONLY ABOVE 1.0, NOT AT IT. An earlier revision tested
+				// `>= 1.0f` and called the result "INERT ... a range regression has landed". The
+				// shipped default IS 1.0, so that note fired on every stock install and told the
+				// user their denoiser was doing nothing. It is the opposite: 1.0 is full-strength
+				// denoise, and all the >= 1.0 branch turns off is the optional attenuation pass
+				// that has nothing left to attenuate [see addon_config.hpp; the false at
+				// 0x18001f51a is stored to a flag at 0x1800191bd, not returned as an abort].
+				//
+				// THE TEST FOR "SHOULD THIS NOTE EXIST" IS NOT "is the claim true" - it is "does
+				// it fire at a value the user did not choose, to report a fault that is not
+				// there". A note that fires at a default to report a REAL inertness (Style=0
+				// below) passes that test; one that fires at a default to report a fault it
+				// invented does not.
+				if (g_cfg.intensity > 1.0f)
+					LOGI("DLSS-NR:   NOTE Intensity=%.3f behaves exactly as 1.0. Above 1.0 the "
+					     "snippet takes the same branch [comiss/ja at 0x18001d50a], which is "
+					     "FULL denoise with no attenuation pass - not 'off'. Lower it below 1.0 "
+					     "to attenuate: that moves the selector from mode 0 to mode 1 (the "
+					     "ControlMask at [rcx+0x60] is null here, so the cmovne at 0x18001d53d "
+					     "cannot force mode 3). Whether mode 1 then RUNS is a backend capability "
+					     "bit we cannot read [bt eax,0 at 0x1800295ff]; judge it by eye.",
+					     g_cfg.intensity);
+				if (g_cfg.local_tone_strength > 1.0f)
+					LOGI("DLSS-NR:   NOTE LocalTone=%.3f behaves exactly as 1.0. The snippet "
+					     "clamps it to [0,1] itself at 0x18001d603, so this is byte-identical to "
+					     "the 1.0 default.", g_cfg.local_tone_strength);
+				// THE ONE NOTE THAT FIRES AT A SHIPPED DEFAULT ON PURPOSE, because at that default
+				// the control genuinely is inert and the user is entitled to know BEFORE they spend
+				// an evening dragging it. This is the opposite of the old ">= 1.0 INERT" note, which
+				// fired at the default to report a problem that was not there.
+				if (g_cfg.style == 0)
+					LOGI("DLSS-NR:   NOTE Style=0: LocalTone=%.3f MOVES NOTHING. Each of the 14 "
+					     "lerps at 0x18001d617.. is gated by the per-style bitmask loaded at "
+					     "0x18001d606, and this build's default mask [0x1800b0da8] is 0x00000000, "
+					     "so every gate is taken and no parameter is written. The only enabled "
+					     "sub-entries are key 1 (mask 0x34, 3 of 14) and key 2 (mask 0x20, 1 of "
+					     "14). Try Style 1 or 2 if you want this slider to do anything.",
+					     g_cfg.local_tone_strength);
+				if (!g_cfg.use_auto_mask)
+					LOGI("DLSS-NR:   NOTE UseAutoMask=0, so the snippet substitutes -1.0f for "
+					     "BOTH structure strengths at 0x18001aa84 and neither knob can matter.");
+				// THE GATE THAT IS NOT OURS TO CHECK. The effective structure pair is consumed
+				// at exactly one site, behind two dynamic_cast null tests (an HNetCpp::CCNetwork
+				// at 0x180021cc8 tested 0x18002253f, a CCTinlayoutFusedPreBlockSwin1HLayer at
+				// 0x18003f5e8 tested 0x18003f5f3). Nothing on this side of the call can observe
+				// whether they succeed. Say so once, so a hardware report of "the structure
+				// knobs do nothing" is read as evidence about the MODEL rather than as a bug in
+				// the parameter plumbing - which the getter trace has already cleared.
+				if (g_cfg.use_auto_mask)
+					LOGI("DLSS-NR:   NOTE LocalStructure/SkinStructure are CONDITIONAL. The "
+					     "snippet consumes them only if the loaded network dynamic_casts to "
+					     "HNetCpp::CCNetwork and the layer to CCTinlayoutFusedPreBlockSwin1HLayer "
+					     "[0x18002253f, 0x18003f5f3]. If either fails, both knobs and Automatic "
+					     "Mask are inert TOGETHER, and no value of any of them will change the "
+					     "image. This add-on cannot observe the cast; an A/B at 0.0 vs 1.0 with "
+					     "Automatic Mask ON is the measurement that settles it.");
 			}
 
 			// THE GRAFT IN EFFECT, RE-STATED WHENEVER IT CHANGES - deliberately NOT folded into

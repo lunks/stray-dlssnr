@@ -62,6 +62,7 @@
 
 #include <d3d12.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -250,6 +251,55 @@ struct parameter_block
 	std::mutex mutex;
 	std::unordered_map<std::string, value> map;
 
+	// ----------------------------------------------------------------------------------------
+	// THE GETTER TRACE. "Did the snippet actually ask us for this key, on this evaluate, through
+	// the slot we think it uses - and did we hand back the number the overlay is showing?"
+	//
+	// This exists because a log line printed on OUR side of the call proves only that WE wrote a
+	// value. It cannot distinguish the three ways a live control can die:
+	//     1. the snippet never reads the key      -> the key does not appear in the trace at all
+	//     2. the snippet reads it through a slot we mapped elsewhere, so our map misses and it
+	//        silently substitutes its own fallback   -> the key appears with hit=false
+	//     3. the snippet reads it, we answer correctly, and the image still does not move
+	//        -> the key appears with hit=true and the right value, and the fault is downstream
+	// Only the third case is a snippet/network question; the first two are ours. Nothing short of
+	// recording the callee's own reads separates them.
+	//
+	// CONSTRAINTS THIS DESIGN IS BOUND BY, all of them from the header comment above:
+	//   * the getters are called DIRECTLY by MSVC-built code with no unwind tables we can rely
+	//     on, so recording must be noexcept and must not allocate - hence a fixed-size array of
+	//     fixed-size records, claimed with one atomic fetch_add, and a name copied by hand;
+	//   * when disarmed it must cost one relaxed atomic load and a predictable branch, because
+	//     this is the dispatch path;
+	//   * it lives IN the block rather than in a global, so DLSS-NR's block and DLSS-SR's block
+	//     cannot pollute each other's trace.
+	struct trace
+	{
+		enum : int { kMaxRecords = 96, kMaxKey = 56 };
+
+		struct record
+		{
+			char          key[kMaxKey];
+			unsigned char slot;      // MSVC vtable slot index, 8..15
+			bool          hit;       // false => our map had no such key; snippet took its fallback
+			unsigned char kind;      // value::kind_t we had stored, when hit
+			double        numeric;   // what we returned, widened
+			const void   *pointer;   // what we returned, for the pointer getters
+		};
+
+		std::atomic<bool> armed{ false };
+		std::atomic<int>  count{ 0 };   // may exceed kMaxRecords; that means records were dropped
+		record            records[kMaxRecords];
+
+		void arm()     { count.store(0, std::memory_order_relaxed); armed.store(true,  std::memory_order_release); }
+		void disarm()  { armed.store(false, std::memory_order_release); }
+		bool is_armed() const { return armed.load(std::memory_order_relaxed); }
+		int  seen()    const { return count.load(std::memory_order_acquire); }
+		int  stored()  const { const int n = seen(); return n < kMaxRecords ? n : kMaxRecords; }
+	};
+
+	trace get_trace;
+
 	parameter_block();
 };
 
@@ -345,6 +395,41 @@ inline void *as_ptr(const parameter_block::value &v)
 	return (v.kind == parameter_block::value::k_ptr) ? v.p : nullptr;
 }
 
+// Records one Get the snippet made, if the trace is armed. NOEXCEPT and ALLOCATION-FREE for the
+// same reason store()/load() are: the caller is the snippet.
+//
+// The slot index is passed in by the caller rather than derived, because the whole point of the
+// trace is to report which of OUR vtable entries the snippet's `mov rax,[rax+NN]` actually landed
+// on. Deriving it here would report what we believe rather than what happened.
+inline void trace_get(const void *self, const char *name, unsigned char slot, bool hit,
+                      const parameter_block::value &v, double numeric, const void *pointer) noexcept
+{
+	if (self == nullptr)
+		return;
+	parameter_block *b = const_cast<parameter_block *>(pbc(self));
+	if (!b->get_trace.is_armed())
+		return;
+
+	// fetch_add always runs, so 'count' reports the TRUE number of Gets even when the array is
+	// full. A trace that silently stopped at 96 and said "96" would read as a complete list.
+	const int slot_index = b->get_trace.count.fetch_add(1, std::memory_order_acq_rel);
+	if (slot_index < 0 || slot_index >= parameter_block::trace::kMaxRecords)
+		return;
+
+	parameter_block::trace::record &r = b->get_trace.records[slot_index];
+	int n = 0;
+	if (name != nullptr)
+		for (; n < parameter_block::trace::kMaxKey - 1 && name[n] != '\0'; ++n)
+			r.key[n] = name[n];
+	r.key[n]  = '\0';
+	r.slot    = slot;
+	r.hit     = hit;
+	r.kind    = hit ? static_cast<unsigned char>(v.kind)
+	                : static_cast<unsigned char>(parameter_block::value::k_none);
+	r.numeric = numeric;
+	r.pointer = pointer;
+}
+
 // -------- Set (MSVC slots 0..7, i.e. REVERSE of the header's declaration order) --------
 
 inline void set_voidptr(void *self, const char *name, void *val)
@@ -412,8 +497,12 @@ inline Result get_voidptr(const void *self, const char *name, void **out)
 	if (out == nullptr)
 		return Result_FAIL_InvalidParameter;
 	if (!load(self, name, v))
+	{
+		trace_get(self, name, 8, false, v, 0.0, nullptr);
 		return Result_Fail;   // a MISS, not an invalid argument - see the note above
+	}
 	*out = as_ptr(v);
+	trace_get(self, name, 8, true, v, 0.0, *out);
 	return Result_Success;
 }
 inline Result get_d3d12(const void *self, const char *name, ID3D12Resource **out)
@@ -422,8 +511,12 @@ inline Result get_d3d12(const void *self, const char *name, ID3D12Resource **out
 	if (out == nullptr)
 		return Result_FAIL_InvalidParameter;
 	if (!load(self, name, v))
+	{
+		trace_get(self, name, 9, false, v, 0.0, nullptr);
 		return Result_Fail;   // a MISS, not an invalid argument - see the note above
+	}
 	*out = static_cast<ID3D12Resource *>(as_ptr(v));
+	trace_get(self, name, 9, true, v, 0.0, *out);
 	return Result_Success;
 }
 inline Result get_d3d11(const void *self, const char *name, void **out)
@@ -432,8 +525,12 @@ inline Result get_d3d11(const void *self, const char *name, void **out)
 	if (out == nullptr)
 		return Result_FAIL_InvalidParameter;
 	if (!load(self, name, v))
+	{
+		trace_get(self, name, 10, false, v, 0.0, nullptr);
 		return Result_Fail;   // a MISS, not an invalid argument - see the note above
+	}
 	*out = as_ptr(v);
+	trace_get(self, name, 10, true, v, 0.0, *out);
 	return Result_Success;
 }
 inline Result get_int(const void *self, const char *name, int *out)
@@ -442,8 +539,12 @@ inline Result get_int(const void *self, const char *name, int *out)
 	if (out == nullptr)
 		return Result_FAIL_InvalidParameter;
 	if (!load(self, name, v))
+	{
+		trace_get(self, name, 11, false, v, 0.0, nullptr);
 		return Result_Fail;   // a MISS, not an invalid argument - see the note above
+	}
 	*out = static_cast<int>(as_ull(v));
+	trace_get(self, name, 11, true, v, static_cast<double>(*out), nullptr);
 	return Result_Success;
 }
 inline Result get_uint(const void *self, const char *name, unsigned int *out)
@@ -452,8 +553,12 @@ inline Result get_uint(const void *self, const char *name, unsigned int *out)
 	if (out == nullptr)
 		return Result_FAIL_InvalidParameter;
 	if (!load(self, name, v))
+	{
+		trace_get(self, name, 12, false, v, 0.0, nullptr);
 		return Result_Fail;   // a MISS, not an invalid argument - see the note above
+	}
 	*out = static_cast<unsigned int>(as_ull(v));
+	trace_get(self, name, 12, true, v, static_cast<double>(*out), nullptr);
 	return Result_Success;
 }
 inline Result get_double(const void *self, const char *name, double *out)
@@ -462,8 +567,12 @@ inline Result get_double(const void *self, const char *name, double *out)
 	if (out == nullptr)
 		return Result_FAIL_InvalidParameter;
 	if (!load(self, name, v))
+	{
+		trace_get(self, name, 13, false, v, 0.0, nullptr);
 		return Result_Fail;   // a MISS, not an invalid argument - see the note above
+	}
 	*out = as_double(v);
+	trace_get(self, name, 13, true, v, *out, nullptr);
 	return Result_Success;
 }
 inline Result get_float(const void *self, const char *name, float *out)
@@ -472,8 +581,12 @@ inline Result get_float(const void *self, const char *name, float *out)
 	if (out == nullptr)
 		return Result_FAIL_InvalidParameter;
 	if (!load(self, name, v))
+	{
+		trace_get(self, name, 14, false, v, 0.0, nullptr);
 		return Result_Fail;   // a MISS, not an invalid argument - see the note above
+	}
 	*out = static_cast<float>(as_double(v));
+	trace_get(self, name, 14, true, v, static_cast<double>(*out), nullptr);
 	return Result_Success;
 }
 inline Result get_ull(const void *self, const char *name, unsigned long long *out)
@@ -482,8 +595,12 @@ inline Result get_ull(const void *self, const char *name, unsigned long long *ou
 	if (out == nullptr)
 		return Result_FAIL_InvalidParameter;
 	if (!load(self, name, v))
+	{
+		trace_get(self, name, 15, false, v, 0.0, nullptr);
 		return Result_Fail;   // a MISS, not an invalid argument - see the note above
+	}
 	*out = as_ull(v);
+	trace_get(self, name, 15, true, v, static_cast<double>(*out), nullptr);
 	return Result_Success;
 }
 
@@ -547,6 +664,41 @@ inline void set_u32   (parameter_block *p, const char *n, unsigned int v)   { de
 inline void set_f32   (parameter_block *p, const char *n, float v)          { detail::set_float(p, n, v); }
 inline void set_i32   (parameter_block *p, const char *n, int v)            { detail::set_int(p, n, v); }
 inline void set_res   (parameter_block *p, const char *n, ID3D12Resource *v){ detail::set_d3d12(p, n, v); }
+
+// Names for the trace dump. The slot names are the MSVC vtable order asserted at the top of this
+// file, so a trace that prints "slot 14 Get(float*)" for DLSSNR.Intensity is ALSO a live check
+// that the hand-laid table still lines up with what the snippet calls: if the two ever drifted,
+// the parameter would come back through a different slot name here and the mismatch would be on
+// the face of the log rather than buried in a wrong image.
+inline const char *get_slot_name(unsigned char s)
+{
+	switch (s)
+	{
+	case 8:  return "slot  8 Get(void**)";
+	case 9:  return "slot  9 Get(ID3D12Resource**)";
+	case 10: return "slot 10 Get(ID3D11Resource**)";
+	case 11: return "slot 11 Get(int*)";
+	case 12: return "slot 12 Get(unsigned*)";
+	case 13: return "slot 13 Get(double*)";
+	case 14: return "slot 14 Get(float*)";
+	case 15: return "slot 15 Get(unsigned long long*)";
+	default: return "slot ?? unknown";
+	}
+}
+
+inline const char *value_kind_name(unsigned char k)
+{
+	switch (static_cast<parameter_block::value::kind_t>(k))
+	{
+	case parameter_block::value::k_ull:    return "ull";
+	case parameter_block::value::k_float:  return "float";
+	case parameter_block::value::k_double: return "double";
+	case parameter_block::value::k_uint:   return "uint";
+	case parameter_block::value::k_int:    return "int";
+	case parameter_block::value::k_ptr:    return "ptr";
+	default:                               return "none";
+	}
+}
 
 // ------------------------------------------------------------------------------------------
 // The snippet.

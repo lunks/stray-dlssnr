@@ -167,7 +167,10 @@ int main()
     overlay_ui::seed_from_config(c, dir);
 
     overlay_ui::live_block &l = overlay_ui::live();
-    l.intensity.store(1.25f, std::memory_order_relaxed);
+    // 0.25, not 1.25: intensity lives on [0,1] and the loader clamps above 1.0 - see the
+    // tuning-knob note in addon_config.hpp. Same width, so the alignment check below is
+    // unaffected. The clamp itself is asserted separately at the end of the reparse block.
+    l.intensity.store(0.25f, std::memory_order_relaxed);
     l.local_structure_strength.store(0.5f, std::memory_order_relaxed);
     l.skin_structure_strength.store(-1.0f, std::memory_order_relaxed);
     l.color_strength.store(0.75f, std::memory_order_relaxed);
@@ -225,7 +228,7 @@ int main()
           "the comment above the absent keys survived");
 
     // --- what we do own must change, without reflowing ---
-    check(has_line(out, "intensity                = 1.25"), "intensity took the new value AND kept its column alignment");
+    check(has_line(out, "intensity                = 0.25"), "intensity took the new value AND kept its column alignment");
     check(has_line(out, "local_structure_strength = 0.5"), "local_structure_strength kept its alignment");
     check(has_line(out, "skin_structure_strength  = -1"), "a negative sentinel round-trips as -1");
     check(has_line(out, "style = 2"), "style took the new value");
@@ -273,7 +276,7 @@ int main()
     {
         cfg::config back;
         cfg::load(back, dir, [](const char *) {});
-        check(back.intensity == 1.25f,                "reparse: intensity");
+        check(back.intensity == 0.25f,                "reparse: intensity");
         check(back.local_structure_strength == 0.5f,  "reparse: local_structure_strength");
         check(back.skin_structure_strength == -1.0f,  "reparse: skin_structure_strength sentinel");
         check(back.color_strength == 0.75f,           "reparse: colour_strength alias");
@@ -282,6 +285,42 @@ int main()
         check(back.mvec_scale_x == 1.5f,              "reparse: mvec_scale_x");
         check(back.ui_correction == 1u,               "reparse: ui_correction");
         check(back.hdr_graft == 1u,                   "reparse: hdr_graft");
+
+        // THE LOADER MUST NOT REWRITE THE TUNING VALUES, on the path that actually matters: a
+        // hand-edited ini, or one written by an older build that offered 0..2 sliders.
+        //
+        // AN EARLIER REVISION CLAMPED ALL FOUR HERE and this test asserted the clamp. Both were
+        // wrong. Intensity 2.0 and LocalTone 1.55 drive exactly the same snippet code as 1.0
+        // (tools/ngx_paramblock_selftest.cpp section 10 replays both transforms), so clamping
+        // them changed no behaviour and only rewrote the user's file. The two STRUCTURE strengths
+        // were worse: the snippet does not clamp them anywhere - 0x180061710 is a pure setter -
+        // so clamping on load removed values the binary is willing to accept, which is the one
+        // thing a range fix must never do. The sliders carry the conventional [0,1] domain; the
+        // ini is the unclamped escape hatch, and this is the test that keeps it one.
+        {
+            // A DETERMINISTIC subdirectory, deliberately not a second make_temp_dir(): that
+            // helper names the directory from GetTickCount64(), whose resolution is ~15ms, so a
+            // second call here would almost certainly hand back case A's directory - and this
+            // fixture would then be sitting in it when case B asserts that no ini exists yet.
+            const std::wstring sdir = dir + L"stale\\";
+            CreateDirectoryW(sdir.c_str(), nullptr);
+            const char *stale =
+                "intensity                = 2.0\r\n"
+                "local_tone_strength      = 1.55\r\n"
+                "local_structure_strength = 1.93\r\n"
+                "skin_structure_strength  = -0.5\r\n";
+            if (!write_file(sdir + L"stray_dlssnr.ini", stale))
+            {
+                std::printf("  FAIL  could not write the out-of-range fixture\n");
+                return 1;
+            }
+            cfg::config st;
+            cfg::load(st, sdir, [](const char *) {});
+            check(st.intensity == 2.0f,                "load: intensity = 2.00 survives verbatim");
+            check(st.local_tone_strength == 1.55f,     "load: local_tone_strength = 1.55 survives verbatim");
+            check(st.local_structure_strength == 1.93f,"load: local_structure_strength = 1.93 is NOT clamped");
+            check(st.skin_structure_strength == -0.5f, "load: a negative skin strength keeps its exact value");
+        }
         // The pins must be exactly what the fixture said, not what the overlay's defaults are.
         check(back.shader_hash == 0x1708ec956099e259ull, "reparse: shader_hash round-tripped exactly");
         check(back.srv_velocity == 3u,                   "reparse: the changed srv_velocity pin");
@@ -321,7 +360,7 @@ int main()
         cfg::load(back, dir, [](const char *) {});
         check(back.ini_found,                     "the created file is found by the parser");
         check(back.transfer_strength == 0.0f,     "reparse: transfer_strength = 0 (the exact-bypass value)");
-        check(back.intensity == 1.25f,            "reparse: intensity survived into the new file");
+        check(back.intensity == 0.25f,            "reparse: intensity survived into the new file");
         check(back.style == 2u,                   "reparse: style survived into the new file");
         check(back.hdr_graft == 1u,               "reparse: hdr_graft survived into the new file");
     }

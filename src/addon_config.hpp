@@ -320,8 +320,274 @@ struct config
 	// ---- the five tuning knobs -----------------------------------------------------------
 	// These defaults are the snippet's OWN fallbacks, recovered from the disassembly: each read
 	// is followed by a `cmp eax,0xbad00000` test that substitutes the value below when the host
-	// supplied nothing. 1.0 is therefore the fallback, NOT a calibrated neutral midpoint, and the
-	// scale these values sit on is not known.
+	// supplied nothing.
+	//
+	// WHAT EACH OF THESE ACTUALLY DOES, re-derived from the deployed snippet
+	// (nvngx_dlssnr.dll, md5 eea91faf55a8993656c66815f0497b3b) with exact function bounds taken
+	// from the .pdata RUNTIME_FUNCTION table. An earlier revision of this comment said "the scale
+	// these values sit on is not known" and the overlay ran 0..2 sliders on the strength of it;
+	// the revision after that overcorrected and claimed Intensity >= 1.0 "skips the whole pass".
+	// BOTH WERE WRONG. What follows is what the instructions do.
+	//
+	// ---- intensity: an ATTENUATION, 1.0 (the default) is FULL denoise, and the SLIDER ITSELF
+	// ---- only matters when qword [rcx+0x60] is NULL -----------------------------------------
+	//
+	// 1.0 does NOT disable anything. It disables the OPTIONAL ATTENUATION PASS, because at full
+	// strength there is nothing to attenuate. fn 0x18001d4d0 is a MODE SELECTOR returning 0, 1
+	// or 3 - not a boolean - and 0x18001f500 is the "should this optional pass be enabled and can
+	// the backend do it" query. HERE IS THE SELECTOR WITH NOTHING ELIDED - an earlier revision
+	// quoted six of these instructions and drew a conclusion the other twelve do not support:
+	//
+	//   0001d4d6  mov    rbx, rcx
+	//   0001d4d9  call   0x1800176e0
+	//   0001d4de  test   al, al
+	//   0001d4e0  jne    0x18001d546                       ; -> xor eax,eax / ret   (mode 0)
+	//   0001d4e2  cmp    dword ptr [rbx+0x10c], 0
+	//   0001d4e9  je     0x18001d500
+	//   0001d4eb  cmp    qword ptr [rbx+0x78], 0
+	//   0001d4f0  jne    0x18001d4fc
+	//   0001d4f2  cmp    qword ptr [rbx+0x90], 0
+	//   0001d4fa  je     0x18001d500
+	//   0001d4fc  mov    cl, 1
+	//   0001d4fe  jmp    0x18001d502
+	//   0001d500  xor    cl, cl
+	//   0001d502  movss  xmm0, dword ptr [rip+0x9017a]     ; xmm0 = 1.0f  (VA 0x1800ad684)
+	//   0001d50a  comiss xmm0, dword ptr [rbx+0xe0]        ; 1.0 vs Intensity
+	//   0001d511  ja     0x18001d521                       ; taken ONLY if Intensity < 1.0
+	//   0001d513  add    rbx, 0x60
+	//   0001d517  cmp    qword ptr [rbx], 0
+	//   0001d51b  jne    0x18001d525
+	//   0001d51d  xor    al, al                            ; >= 1.0 AND ptr NULL -> al = 0
+	//   0001d51f  jmp    0x18001d527
+	//   0001d521  add    rbx, 0x60                         ; < 1.0 path
+	//   0001d525  mov    al, 1                             ; < 1.0 -> al = 1 UNCONDITIONALLY
+	//   0001d527  test   cl, cl
+	//   0001d529  jne    0x18001d546                       ; -> mode 0
+	//   0001d52b  test   al, al
+	//   0001d52d  je     0x18001d546                       ; -> mode 0
+	//   0001d52f  cmp    qword ptr [rbx], 0
+	//   0001d533  mov    eax, 1
+	//   0001d538  mov    ecx, 3
+	//   0001d53d  cmovne eax, ecx                          ; ptr non-null -> 3, else -> 1
+	//   0001d545  ret
+	//
+	// READ THE TWO PATHS AGAINST EACH OTHER. `rbx` is advanced by 0x60 on BOTH branches before
+	// the cmovne, so the pointer tested at 0x18001d52f is qword [rcx+0x60] either way:
+	//
+	//   qword [rcx+0x60] != 0  ->  mode 3 for EVERY intensity, above 1.0 and below. The slider
+	//                              would change NOTHING. cmovne takes ecx=3 regardless of al.
+	//   qword [rcx+0x60] == 0  ->  intensity >= 1.0 gives al=0 -> mode 0
+	//                              intensity <  1.0 gives al=1 -> mode 1
+	//
+	// AND THAT POINTER IS THE ControlMask, WHICH IS NULL HERE. The same slot is tested at
+	// 0x18001aa4b to force UseAutoMask off:
+	//
+	//   0001aa4b  cmp  qword ptr [rdi+0x60], 0
+	//   0001aa50  je   0x18001aa59
+	//   0001aa52  mov  dword ptr [rdi+0xf0], r12d     ; UseAutoMask = 0
+	//
+	// This add-on writes DLSSNR.ControlMask as an explicit NULL, and a null lands as a null - the
+	// same fact that killed the round-1 claim that a present-but-null mask forces UseAutoMask off.
+	// So [rcx+0x60] == 0 on this deployment and dragging below 1.0 DOES move the mode 0 -> 1.
+	//
+	// THE RESIDUAL GATE IS THE BACKEND, NOT THE POINTER. 0x18001f500 puts the mode through a
+	// capability query before anything runs [0x18001f522 call 0x1800295e0]:
+	//
+	//   0002 95e6  mov   rax, qword ptr [rcx]
+	//   0002 95eb  mov   rax, qword ptr [rax+0x50]
+	//   0002 95ef  call  qword ptr [0x1800ac428]      ; vtable: fetch capability bitmask
+	//   0002 95f5  test  ebx, ebx
+	//   0002 95f7  je    0x18002960c                  ; mode 0 -> trivially "supported"
+	//   0002 95f9  lea   ecx, [rbx-1]
+	//   0002 95fc  movzx edx, cl
+	//   0002 95ff  bt    eax, edx                     ; is bit (mode-1) set?
+	//   0002 9602  jb    0x18002960c                  ; yes -> return 1
+	//   0002 9604  xor   al, al                       ; no  -> return 0
+	//
+	// If the backend does not advertise bit 0, mode 1 is refused, the flag at 0x1800191bd stays
+	// clear and the extra dispatch it gates never issues. NOTHING ON THIS SIDE CAN READ THAT BIT.
+	// So: the >= 1.0 equivalence is unconditional and proven; the below-1.0 mode change is proven;
+	// whether mode 1 produces a visible pass is CONDITIONAL on a backend capability we cannot see.
+	//
+	// and the caller, 0x18001f500, forwards that mode to a CAPABILITY QUERY:
+	//
+	//   0001f513  call   0x18001d4d0                       ; mode
+	//   0001f518  test   eax, eax
+	//   0001f51a  je     0x18001f533                       ; mode 0 -> return false
+	//   0001f520  mov    edx, eax                          ; mode passed as arg2
+	//   0001f522  call   0x1800295e0                       ; bt eax, mode-1 : does the backend
+	//                                                      ; support this mode?
+	//
+	// THE FALSE IS NOT AN ABORT. Its one caller stores it in a local flag and falls straight
+	// through into the rest of the evaluate [BIN 0x1800191a8-0x1800191bd]:
+	//
+	//   0019 1a8  call   0x18001f500
+	//   0019 1ad  test   al, al
+	//   0019 1af  je     0x1800191ba                       ; -> xor r12b, r12b
+	//   0019 1b1  mov    r12b, 1
+	//   0019 1bd  mov    byte ptr [rbp-0x7f], r12b         ; a FLAG, not a return
+	//
+	// and the flag's only consumer gates one extra dispatch [BIN 0x180019789 test r12b,r12b /
+	// 0x18001978c je -> skips `call 0x180023080` at 0x1800197d9]. Denoising is unaffected.
+	//
+	// So: 1.0 = no attenuation = full NR, and it is the right default. Values ABOVE 1.0 are
+	// indistinguishable from 1.0, which is why the slider tops out there - not because the
+	// control is dead. Below 1.0 the mode really does change; whether the backend then runs the
+	// pass is the one thing left, and only hardware settles it.
+	//
+	// ---- local_tone_strength: A CLAMP THAT WAS PROVEN, AND A LIVENESS THAT WAS NOT ------------
+	//
+	// THE CLAMP IS REAL. THE CONTROL IS STILL INERT AT THE SHIPPED DEFAULT STYLE.
+	//
+	// A previous revision of this block quoted the range below, jumped 0x18001d603 -> 0x18001d608,
+	// and concluded "this is the one range claim on this list that is proven rather than
+	// conventional". The jump ELIDED THE INSTRUCTION THAT DECIDES WHETHER ANY STORE HAPPENS AT
+	// ALL. Here is the range again with nothing removed [BIN 0x18001d5f0, reached
+	// 0x1800159c0 -> 0x180018620 -> 0x18001d7c0 -> 0x18001d5f0]:
+	//
+	//   0001d5f0  movss  xmm2, dword ptr [rcx+0xe4]        ; t = LocalToneStrength
+	//   0001d5f8  xorps  xmm1, xmm1
+	//   0001d5fb  movss  xmm3, dword ptr [rip+0x90081]     ; 1.0f  @0x1800ad684
+	//   0001d603  comiss xmm2, xmm3
+	//   0001d606  mov    eax, dword ptr [rdx]              ; <<<< THE PER-STYLE BITMASK
+	//   0001d608  jbe    0x18001d60f
+	//   0001d60a  movaps xmm2, xmm3                        ; t > 1.0 -> t = 1.0
+	//   0001d60d  jmp    0x18001d617
+	//   0001d60f  comiss xmm1, xmm2                        ; 0 vs t
+	//   0001d612  jbe    0x18001d617
+	//   0001d614  xorps  xmm2, xmm2                        ; t < 0   -> t = 0
+	//   0001d617  test   al, 1
+	//   0001d619  je     0x18001d634                       ; bit clear -> NO STORE
+	//   0001d61b  movss  xmm0, dword ptr [rdx+4]
+	//   0001d620  subss  xmm0, xmm1
+	//   0001d624  mulss  xmm0, xmm2
+	//   0001d628  addss  xmm0, xmm1
+	//   0001d62c  movss  dword ptr [rcx+0x124], xmm0
+	//   0001d634  test   al, 2   / je 0x18001d651  ... -> [rcx+0x128]
+	//   0001d651  test   al, 4   / je 0x18001d66e  ... -> [rcx+0x12c]
+	//   0001d66e  test   al, 8   / je 0x18001d68b  ... -> [rcx+0x130]
+	//   0001d68b  test   al, 0x10 / je 0x18001d6a8 ... -> [rcx+0x134]
+	//   0001d6a8  test   al, 0x20 / je 0x18001d6c5 ... -> [rcx+0x138]
+	//   0001d6c5  test   al, 0x40 / je 0x18001d6e2 ... -> [rcx+0x13c]
+	//   0001d6e2  test   al, al   / jns             ... -> [rcx+0x140]
+	//   0001d6ff  bt     eax, 8   / jae            ... -> [rcx+0x144]
+	//   0001d71e  bt     eax, 9   ... 0001d73d bt eax,0xa ... 0001d75c bt eax,0xb
+	//   0001d77b  bt     eax, 0xc / jae            ... -> [rcx+0x154]
+	//   0001d79a  bt     eax, 0xd / jae 0x18001d7b9 -> [rcx+0x158]
+	//   0001d7b9  ret
+	//
+	// FOURTEEN stores, bits 0..13, each individually gated. `t` never reaches memory unless its
+	// bit is set. THE CLAMP IS GENUINE - every value >= 1.0 really is byte-identical to 1.0 - but
+	// a clamp on a coefficient says nothing about whether the coefficient is used.
+	//
+	// WHERE THE MASK COMES FROM, and why it is zero on a stock install. `rdx` is set by the single
+	// caller 0x18001d7c0 [BIN 0x18001d8c7-0x18001d8f2]:
+	//
+	//   0001d8c7  lea  rdx, [rdi+0x28]              ; DEFAULT mask block
+	//   0001d8cb  lea  rax, [rdx+0x3c]              ; first sub-entry
+	//   0001d8cf  lea  rcx, [rdx+0x25c]             ; end of sub-entries
+	//   0001d8d6  cmp  rax, rcx
+	//   0001d8d9  je   0x18001d8ef                  ; exhausted -> keep the DEFAULT block
+	//   0001d8db  cmp  byte ptr [rax], 0
+	//   0001d8de  je   0x18001d8e5                  ; flag byte 0 -> entry disabled, skip
+	//   0001d8e0  cmp  dword ptr [rax+4], ebp       ; sub-entry KEY vs r9d
+	//   0001d8e3  je   0x18001d8eb
+	//   0001d8e5  add  rax, 0x44
+	//   0001d8e9  jmp  0x18001d8d6
+	//   0001d8eb  lea  rdx, [rax+8]                 ; matched -> that entry's own mask block
+	//   0001d8ef  mov  rcx, r14
+	//   0001d8f2  call 0x18001d5f0
+	//
+	// (0x25c-0x3c)/0x44 = 8 sub-entries. Layout per entry: +0 flag byte, +4 key, +8 mask, then
+	// the 14 floats - 8 + 4 + 56 = 0x44, exactly the stride, and rdx+0x3c lands on the first
+	// entry precisely because the default block is itself mask + 14 floats = 0x3c bytes.
+	//
+	// THERE IS EXACTLY ONE STYLE RECORD, so `rdi` is not in doubt:
+	//
+	//   0002 3bb0  cmp  rcx, 1
+	//   0002 3bb4  jae  0x180023bc8                 ; index >= 1 -> xor eax,eax / ret  (NULL)
+	//   0002 3bb6  imul rax, rcx, 0x288
+	//   0002 3bbd  lea  rcx, [0x1800b0d80]
+	//   0002 3bc4  add  rax, rcx
+	//
+	// and the by-name lookup agrees: 0x1800239be lea rbx,[0x1800b0d80] / 0x1800239c9 lea
+	// r14,[0x1800b1008] / 0x180023a06 add rbx,0x288 - and 0x1800b1008-0x1800b0d80 = 0x288, i.e.
+	// ONE iteration. So rdi = 0x1800b0d80 and rdi+0x28 = 0x1800b0da8.
+	//
+	// THE DEFAULT MASK, READ OUT OF THE DEPLOYED IMAGE [md5 eea91faf55a8993656c66815f0497b3b]:
+	//
+	//   0x1800b0da8  0x00000000 0x00000000 0x3f800000 0x00000000   <- mask = 0, then the 14 floats
+	//
+	// dword [0x1800b0da8] == 0. NO BIT IS SET. All fourteen `je`/`jae` above are taken and the
+	// function returns having written nothing. AT THE SHIPPED DEFAULT, local_tone_strength MOVES
+	// NOTHING - not 14 parameters, not one.
+	//
+	// THE EIGHT SUB-ENTRIES, same dump, stride 0x44 from 0x1800b0de4:
+	//
+	//   0x1800b0de4  flag=0x00000001  key=0x00000001  mask=0x00000034   <- ENABLED
+	//   0x1800b0e28  flag=0x00000001  key=0x00000002  mask=0x00000020   <- ENABLED
+	//   0x1800b0e6c  flag=0x00000000  ... skipped at 0x18001d8db
+	//   0x1800b0eb0  flag=0x00000000  ... skipped
+	//   0x1800b0ef4  flag=0x00000000  ... skipped
+	//   0x1800b0f38  flag=0x00000000  ... skipped
+	//   0x1800b0f7c  flag=0x00000000  ... skipped
+	//   0x1800b0fc0  flag=0x00000000  ... skipped
+	//
+	// mask 0x34 = bits 2,4,5 -> [rcx+0x12c], [rcx+0x134], [rcx+0x138]: THREE of the fourteen.
+	// mask 0x20 = bit 5      -> [rcx+0x138]                          : ONE of the fourteen.
+	//
+	// So the ceiling on this control is 3 parameters, and its default is 0.
+	//
+	// STILL OPEN, and NOT guessed at here: whether DLSSNR.Style is the value that arrives in ebp
+	// (r9d) and is compared against those sub-entry keys, or the value compared against
+	// [record+8] at 0x18001d8b3, which is a different selector. Both exist in 0x18001d7c0. The
+	// zero-mask default result does not depend on resolving it; the "try style 1 or 2" advice
+	// does, so the tooltip flags it rather than asserting it.
+	//
+	// ---- the two STRUCTURE strengths: LIVE ONLY BEHIND TWO RUNTIME TYPE CHECKS ---------------
+	//
+	// A previous revision called these "proven to reach the network raw and unclamped". THAT WAS
+	// A REACHABILITY CLAIM MISREAD AS A LIVENESS CLAIM. The call chain it cited does exist -
+	// 0x180019f30 derives the effective pair at +0xf8/+0xfc, 0x180021bb0 loads them, 0x18003f490
+	// forwards, 0x180061710 stores them - but it walked the CALL EDGES and never looked at the
+	// guards sitting on them. There are two, and both are `dynamic_cast` null tests:
+	//
+	//   GATE 1, in fn 0x180021bb0. The network object must be an HNetCpp::CCNetwork:
+	//     0021cc4  mov  rcx, qword ptr [rdi+0x48]
+	//     0021cc8  call 0x18007f5cc                        ; __RTDynamicCast, src .?AVNetwork@HNetCpp@@
+	//                                                      ;                  dst .?AVCCNetwork@HNetCpp@@
+	//     0021cd0  mov  qword ptr [rsp+0xe0], rax
+	//     002253f  test rcx, rcx
+	//     0022542  je   0x18002263b                        ; NULL -> the whole block below is skipped
+	//     0022548  movss xmm5, dword ptr [r14+0xfc]        ; effective LOCAL structure
+	//     0022551  movss xmm7, dword ptr [r14+0xf8]        ; effective SKIN  structure
+	//     0022636  call 0x18003f490
+	//
+	//   GATE 2, in fn 0x18003f52c. The layer must be a CCTinlayoutFusedPreBlockSwin1HLayer:
+	//     003f5e8  call 0x18007f5cc                        ; dst .?AVCCTinlayoutFusedPreBlockSwin1HLayer@HNetCpp@@
+	//     003f5f0  test rax, rax
+	//     003f5f3  je   0x18003f68e                        ; NULL -> `call 0x180061710` is skipped
+	//     003f689  call 0x180061710                        ; -> cb+0x98, cb+0x9c
+	//
+	// 0x180061710 itself is indeed a pure unclamped setter [BIN 0x180061756 movss [rdx+0x98] /
+	// 0x18006175e movss [rdx+0x9c]] - but nothing reaches it unless both casts succeed. And
+	// +0xf8/+0xfc have NO other reader: an exhaustive scan of every movss in .text finds exactly
+	// three sites at each displacement, and the two outside 0x180021bb0 are rbp-relative frame
+	// locals in a different function, not this struct. So gates 1 and 2 are the only route.
+	//
+	// WHAT THAT MEANS FOR THE USER: local_structure_strength, skin_structure_strength and
+	// use_auto_mask - which only SELECTS between +0xe8 and the -1.0f constant for those same two
+	// slots - are all downstream of one gate. If the loaded model is not a CCNetwork with a
+	// PreBlockSwin1H layer, all three are inert TOGETHER and no value of any of them does
+	// anything. That is exactly the 3-of-5 pattern reported from hardware, and it is NOT
+	// something a slider range can fix. It is UNRESOLVED whether the shipped model satisfies the
+	// casts; settling it needs a run, and the overlay says so rather than promising these work.
+	//
+	// NOTHING IS CLAMPED ON LOAD. An earlier revision clamped all four here, which removed
+	// reachable values from the two strengths - the very thing the binary declines to do - and
+	// silently rewrote the user's ini. The ini is the unclamped escape hatch; the sliders carry
+	// the conventional [0,1] domain because -1.0f is the snippet's own disabled sentinel and
+	// out-of-range conditioning of a trained network is undefined rather than "more".
 	float    intensity                = 1.0f;
 	float    local_tone_strength      = 1.0f;
 	float    local_structure_strength = 1.0f;

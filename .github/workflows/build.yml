@@ -2,7 +2,7 @@ name: build
 
 on:
   push:
-    branches: [ main, dlss-sr, nr-sr-chain ]
+    branches: [ main, dlss-sr, nr-sr-chain, nr-tuning-live ]
     tags: [ 'v*' ]
   pull_request:
   workflow_dispatch:
@@ -526,6 +526,43 @@ jobs:
               -Wall -Wextra -Wno-attributes -Wno-unknown-pragmas -Wno-unused-parameter \
               -I include abi/ini_rewrite_test.cpp -o ini_test_mingw.exe
           ./ini_test_mingw.exe
+
+      # -----------------------------------------------------------------------------------------
+      # THE NGX PARAMETER-BLOCK SELFTEST. It drives src/ngx_interop.hpp's hand-laid 17-slot vtable
+      # through the BYTE OFFSETS the deployed snippet uses, replays the snippet's own
+      # parameter-read function (fn 0x180019f30) against it, and pins the two tuning transforms
+      # the overlay tooltips cite.
+      #
+      # GATING, AND NEW. The test existed, passed, and was run by hand - wired into neither CI nor
+      # build.sh - so the exact class of regression it was written to catch could land with every
+      # job green. It is also in build.sh now; both toolchains run it here because the vtable it
+      # checks is the one place where MSVC and GCC layout differences would show up as a silently
+      # wrong slot rather than a compile error.
+      # -----------------------------------------------------------------------------------------
+      - name: NGX parameter-block selftest (MSVC)
+        shell: cmd
+        run: |
+          rem The test includes the REAL src/ngx_interop.hpp, whose first include is
+          rem "reshade_compat.hpp" - a quote-include resolves against src/, which would drag in
+          rem windows.h and reshade.hpp. Stage the header next to the host shims instead, exactly
+          rem as tools/run_ngx_paramblock_selftest.sh does, so the test cannot drift from a copy.
+          mkdir stage_ngx
+          copy /Y src\ngx_interop.hpp stage_ngx\ >nul
+          copy /Y src\addon_config.hpp stage_ngx\ >nul
+          copy /Y tools\ngx_paramblock_shim\*.hpp stage_ngx\ >nul
+          copy /Y tools\ngx_paramblock_shim\*.h stage_ngx\ >nul
+          cl /nologo /std:c++17 /EHsc /O2 /MT /W3 ^
+             /I stage_ngx tools\ngx_paramblock_selftest.cpp /Fe:ngx_selftest_msvc.exe
+          if errorlevel 1 exit /b 1
+          ngx_selftest_msvc.exe
+          if errorlevel 1 exit /b 1
+
+      - name: NGX parameter-block selftest (mingw-w64)
+        shell: bash
+        run: |
+          export PATH="/c/mingw64/bin:$PATH"
+          export CXX=g++
+          ./tools/run_ngx_paramblock_selftest.sh
 
       # -----------------------------------------------------------------------------------------
       # The overlay runs on the PRESENT thread. nr_try_run takes st->mutex and then g.mutex
