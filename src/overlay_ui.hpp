@@ -290,7 +290,10 @@ struct status_block
 	std::atomic<uint64_t>     hist_applied{ 0 }, hist_dropped{ 0 };
 
 	std::atomic<bool>         bypass_active{ false };
-	std::atomic<bool>         teardown_requested{ false };
+	// A TIMESTAMP, not a latch. As a latch, a feature that never came back would leave the status
+	// reading "REBUILDING" indefinitely - which is exactly the kind of stale-positive this panel
+	// exists to avoid, and the same defect the reference add-on's "ACTIVE" has.
+	std::atomic<uint64_t>     teardown_ms{ 0 };
 };
 
 inline status_block &status()
@@ -483,7 +486,7 @@ inline bool begin_pass(cfg::config &c,
 		feature_failed   = false;
 		pending_res      = 0;
 		need_reset       = true;
-		s.teardown_requested.store(true, std::memory_order_relaxed);
+		s.teardown_ms.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_relaxed);
 		OVERLAY_LOG_ONCE(reshade::log::level::info,
 			"DLSS-NR overlay: feature reset requested. The NGX feature and every texture will be "
 			"released on the next present and rebuilt on the following dispatch. This message is "
@@ -575,7 +578,7 @@ inline void publish_evaluate(uint32_t ngx_result, const char *ngx_result_name, b
 		// add-on that stopped evaluating ten minutes ago still reads ACTIVE with a large count.
 		// A timestamp is what turns that into an answerable question.
 		s.eval_ms.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_relaxed);
-		s.teardown_requested.store(false, std::memory_order_relaxed);
+		s.teardown_ms.store(0, std::memory_order_relaxed);
 	}
 	else
 	{
@@ -1099,6 +1102,7 @@ inline void draw_status(reshade::api::effect_runtime *rt, const host_facts &f)
 	const uint64_t pass_ms  = s.pass_seen_ms.load(std::memory_order_relaxed);
 	const uint64_t evals    = s.evaluates.load(std::memory_order_relaxed);
 	const uint64_t fails    = s.eval_failures.load(std::memory_order_relaxed);
+	const uint64_t tear_ms  = s.teardown_ms.load(std::memory_order_relaxed);
 	const double   eval_age = (eval_ms == 0) ? -1.0 : (double)(now - eval_ms) / 1000.0;
 
 	if (listed_as_disabled(rt, f.addon_name))
@@ -1156,7 +1160,7 @@ inline void draw_status(reshade::api::effect_runtime *rt, const host_facts &f)
 		ImGui::TextWrapped("The TAA pass is still being identified and the game's own dispatch is "
 		                   "issued untouched. Nothing is denoised and nothing is written back.");
 	}
-	else if (s.teardown_requested.load(std::memory_order_relaxed))
+	else if (tear_ms != 0 && (now - tear_ms) < 3000u)
 	{
 		overlay_imgui::textf_colored(col::amber, "REBUILDING - the NGX feature is being released and recreated");
 	}
@@ -1213,10 +1217,15 @@ inline void draw_status(reshade::api::effect_runtime *rt, const host_facts &f)
 
 	const bool codec_running = s.codec_running.load(std::memory_order_relaxed);
 	const bool codec_failed  = s.codec_failed.load(std::memory_order_relaxed);
+	// This flag is refreshed only when an evaluate happens, so once the pass stops it would keep
+	// claiming RUNNING underneath a NOT EVALUATING headline. Say so instead of contradicting it.
+	const bool codec_fresh   = (eval_ms != 0) && (now - eval_ms) <= 250u;
 	if (!f.hdr_codec_at_load)
 		overlay_imgui::textf_colored(col::amber, "HDR codec  OFF (hdr_codec=0) - the network is fed the RAW linear TAA output (README gap 1: the darkening)");
 	else if (codec_running)
-		overlay_imgui::textf_colored(col::green, "HDR codec  RUNNING - the network sees the display-referred proxy");
+		overlay_imgui::textf_colored(codec_fresh ? col::green : col::dim,
+			"HDR codec  %s - the network sees the display-referred proxy",
+			codec_fresh ? "RUNNING" : "was running at the last evaluate");
 	else if (codec_failed)
 		overlay_imgui::textf_colored(col::red, "HDR codec  FAILED - its shaders or pipelines could not be created (see ReShade.log). The denoise still runs, undecoded.");
 	else
