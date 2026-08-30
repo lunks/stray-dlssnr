@@ -6318,7 +6318,8 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 		// (rtx_neural_rendering.cpp:289-292 makes exactly this substitution.) The proxy is at the
 		// colour extent, so the Color/Output rect equality the snippet enforces still holds.
 		auto *const colour_res  = reinterpret_cast<ID3D12Resource *>(
-			codec_encoded ? st->proxy_tex.handle : taa_out.res.handle);
+			(codec_encoded && g_cfg.codec_bind_proxy != 0) ? st->proxy_tex.handle
+			                                               : taa_out.res.handle);
 		// THE DEPTH INPUT. When the conversion pass ran AND its result is being bound, this is OUR
 		// r32_float texture holding DeviceZ verbatim at the colour extent; otherwise it is the
 		// game's own r32_g8_typeless resource, exactly as before this feature existed. depth_used -

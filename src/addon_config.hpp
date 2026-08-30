@@ -743,6 +743,17 @@ struct config
 	// result it has produced is an artifact of the instrument.
 	uint32_t nr_probe_selftest = 0;
 
+	// DIAGNOSTIC. With the codec on, DLSSNR.Color is normally our PROXY texture. Set this to 0 to
+	// run the codec exactly as usual but hand NGX the GAME'S colour instead, isolating the colour
+	// binding from everything else about codec-on mode.
+	//
+	// Why it exists: with the codec OFF, copy_back writes out_tex to the screen and produces a
+	// real image (frame mean luma 29.29 vs 36.02 with copy_back=0), so out_tex HAS content there.
+	// With the codec ON, the probe measures out_tex as exactly zero - same evaluate, same output
+	// resource pointer, and the output FORMAT has been ruled out (r10g10b10a2_unorm behaves the
+	// same as r16g16b16a16_float). The colour binding is the remaining difference.
+	uint32_t codec_bind_proxy = 1;
+
 	// =======================================================================================
 	// DLSS SUPER RESOLUTION (NGX feature 1, nvngx_dlss.dll). See STAGING-sr.md.
 	// =======================================================================================
@@ -1135,6 +1146,7 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "nr_probe_warmup")          c.nr_probe_warmup = static_cast<uint32_t>(parse_u64(v, c.nr_probe_warmup));
 		else if (key == "neural_format")            c.neural_format = static_cast<uint32_t>(parse_u64(v, c.neural_format));
 		else if (key == "nr_probe_selftest")        c.nr_probe_selftest = static_cast<uint32_t>(parse_u64(v, c.nr_probe_selftest));
+		else if (key == "codec_bind_proxy")         c.codec_bind_proxy = static_cast<uint32_t>(parse_u64(v, c.codec_bind_proxy));
 		else if (key == "app_id")                   c.app_id = parse_u64(v, c.app_id);
 		else if (key == "dlss_sr")                  c.dlss_sr = parse_bool(v, c.dlss_sr);
 		else if (key == "dlss_nr")                  c.dlss_nr = parse_bool(v, c.dlss_nr);
