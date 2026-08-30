@@ -6322,7 +6322,10 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	// The network is a DISPLAY-REFERRED image network; this is what makes its input in-distribution.
 	if (want_codec)
 	{
-		nr_codec_encode(cmd, *st, st->orig_srv, proxy_scale, proxy_in_srv);
+		// codec_skip_encode: run codec-on mode WITHOUT the encode dispatch, to test whether that
+		// dispatch is what stops NGX writing out_tex. See addon_config.hpp.
+		if (g_cfg.codec_skip_encode == 0)
+			nr_codec_encode(cmd, *st, st->orig_srv, proxy_scale, proxy_in_srv);
 		codec_encoded = true;
 	}
 

@@ -772,6 +772,19 @@ struct config
 	//
 	// LEFT AT 0 UNTIL MEASURED. nr_probe now reports the written region's bounds; set these to what
 	// it reports rather than guessing, because a wrong value silently resamples the whole image.
+	// DIAGNOSTIC. Skip the codec's ENCODE dispatch while leaving everything else about codec-on
+	// mode intact. Pair with codec_bind_proxy=0 so DLSSNR.Color is the game's own texture rather
+	// than a stale proxy.
+	//
+	// Why: NGX writes out_tex with the codec OFF (copy_back puts a real image on screen) and
+	// writes NOTHING with it ON - measured, 0 of 1728000 sampled texels non-zero - and that holds
+	// even with codec_bind_proxy=0, which changes the colour binding but STILL RUNS THE ENCODE.
+	// The encode is a ReShade compute dispatch issued immediately before the evaluate, and there
+	// is no state restore or descriptor-heap cache sync between the two. This tree already
+	// documents the reverse hazard (NGX rebinds heaps and the compute root signature on the raw
+	// list, and ReShade's cache goes stale) but nothing covers encode -> NGX.
+	uint32_t codec_skip_encode = 0;
+
 	uint32_t neural_populated_w = 0;
 	uint32_t neural_populated_h = 0;
 
@@ -1168,6 +1181,7 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "neural_format")            c.neural_format = static_cast<uint32_t>(parse_u64(v, c.neural_format));
 		else if (key == "nr_probe_selftest")        c.nr_probe_selftest = static_cast<uint32_t>(parse_u64(v, c.nr_probe_selftest));
 		else if (key == "codec_bind_proxy")         c.codec_bind_proxy = static_cast<uint32_t>(parse_u64(v, c.codec_bind_proxy));
+		else if (key == "codec_skip_encode")        c.codec_skip_encode = static_cast<uint32_t>(parse_u64(v, c.codec_skip_encode));
 		else if (key == "neural_populated_w")       c.neural_populated_w = static_cast<uint32_t>(parse_u64(v, c.neural_populated_w));
 		else if (key == "neural_populated_h")       c.neural_populated_h = static_cast<uint32_t>(parse_u64(v, c.neural_populated_h));
 		else if (key == "app_id")                   c.app_id = parse_u64(v, c.app_id);
