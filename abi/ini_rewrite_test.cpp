@@ -120,6 +120,11 @@ static const char *const kFixture =
 
 int main()
 {
+    // UNBUFFERED. If a check crashes the process, a buffered stdout takes every line printed so
+    // far with it and CI shows an empty step - which is exactly what happened the first time this
+    // ran, and it cost a round trip to work out why.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+
     const std::wstring dir  = make_temp_dir();
     const std::wstring path = dir + L"stray_dlssnr.ini";
 

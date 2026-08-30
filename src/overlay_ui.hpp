@@ -186,8 +186,22 @@ namespace overlay_ui {
 // Logging. Same shape as the rest of the tree: one-shot latches, and nothing that can be printed
 // once a frame.
 // ---------------------------------------------------------------------------------------------
+// NOT reshade::log::message(). That inline resolves ReShadeLogMessage and then CALLS THE RESULT
+// WITH NO NULL CHECK - and GetProcAddress(nullptr, ...) returns nullptr whenever
+// get_reshade_module_handle() found no ReShade module in the process. So in any host that does
+// not export it, the first log line here would be a call through a null pointer, on the present
+// thread. Measured, not theorised: it crashed abi/ini_rewrite_test.cpp outright the first time
+// that test ran in CI. Resolve it once, with a guard, and stay silent if it is absent.
 inline void logf(reshade::log::level lvl, const char *fmt, ...)
 {
+	using log_fn = void (*)(void *, int, const char *);
+	static const log_fn fn = []() -> log_fn {
+		HMODULE m = reshade::internal::get_reshade_module_handle();
+		return (m == nullptr) ? nullptr : reinterpret_cast<log_fn>(GetProcAddress(m, "ReShadeLogMessage"));
+	}();
+	if (fn == nullptr)
+		return;
+
 	char buf[1024];
 	va_list args;
 	va_start(args, fmt);
@@ -196,7 +210,7 @@ inline void logf(reshade::log::level lvl, const char *fmt, ...)
 	if (n < 0)
 		return;
 	buf[sizeof(buf) - 1] = '\0';
-	reshade::log::message(lvl, buf);
+	fn(reshade::internal::get_current_module_handle(), static_cast<int>(lvl), buf);
 }
 
 #define OVERLAY_LOG_ONCE(lvl, ...) do { \
