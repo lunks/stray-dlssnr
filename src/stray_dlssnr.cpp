@@ -4782,6 +4782,29 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 				     g_cfg.intensity, g_cfg.local_tone_strength, g_cfg.local_structure_strength,
 				     g_cfg.skin_structure_strength, g_cfg.style, (int)g_cfg.copy_back,
 				     (int)codec_encoded, (int)(g_cfg.history_restore && g_cfg.copy_back));
+
+				// THE LOG LINE ABOVE IS WHY THIS BUG SURVIVED SO LONG. It faithfully printed
+				// Intensity=2.000 LocalTone=1.550 every time, which reads as proof the values
+				// reached the snippet - and they DID. What it could not say was that the snippet
+				// then ignored them, because both sit above the top of the range it responds to.
+				// So say it here: a value the snippet provably cannot act on gets named as such,
+				// at the same moment the value itself is printed.
+				//
+				// The overlay clamps to [0,1] and so does the ini loader, so this should now be
+				// unreachable. It is kept precisely because it should be unreachable: if it ever
+				// fires again, a range regression has landed and this is the line that says so.
+				if (g_cfg.intensity >= 1.0f)
+					LOGI("DLSS-NR:   NOTE Intensity=%.3f is INERT. The snippet skips the pass "
+					     "entirely unless the value is strictly below 1.0 [comiss/ja at "
+					     "0x18001d50a] and this add-on binds no ControlMask. 1.0 = full NR; "
+					     "lower it to attenuate.", g_cfg.intensity);
+				if (g_cfg.local_tone_strength > 1.0f)
+					LOGI("DLSS-NR:   NOTE LocalTone=%.3f is INERT. The snippet clamps it to "
+					     "[0,1] at 0x18001d603, so this is byte-identical to 1.0.",
+					     g_cfg.local_tone_strength);
+				if (!g_cfg.use_auto_mask)
+					LOGI("DLSS-NR:   NOTE UseAutoMask=0, so the snippet replaces BOTH structure "
+					     "strengths with -1.0f at 0x18001aa84 and neither knob does anything.");
 			}
 
 			// THE IDENTITY PROPERTY, stated on the first evaluate that actually ran through the

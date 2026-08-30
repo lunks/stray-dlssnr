@@ -1457,19 +1457,35 @@ inline void draw_controls(const host_facts &f)
 			"is safe - just do not read \"no visible change\" as a measurement of that style.");
 	}
 
-	slider_f("NR Intensity", l.intensity, 0.0f, 2.0f, "%.2f", k_plain,
-		"Live. 1.0 is the snippet's OWN fallback recovered from its disassembly, not a calibrated "
-		"neutral midpoint, and the scale these values sit on is not known.");
+	// RANGE IS [0,1], AND THAT IS THE WHOLE FIX FOR THESE TWO. They used to run 0..2 on the
+	// grounds that "the scale is not known". It is known, it is [0,1], and the upper half was
+	// provably inert - which is exactly why they were reported dead from hardware while the
+	// hdr_codec.hpp constants next to them worked. See addon_config.hpp for the disassembly.
+	slider_f("NR Intensity", l.intensity, 0.0f, 1.0f, "%.2f", k_plain,
+		"Live, and it is an ATTENUATION - not a gain. 1.0 means NO attenuation, which is why it is "
+		"the default and why it is the TOP of this slider: the snippet compares 1.0 against the "
+		"value and skips the entire pass unless the value is strictly BELOW 1.0 "
+		"[comiss xmm0,[rbx+0xe0] / ja at 0x18001d50a, whose 0 return makes the caller skip its "
+		"dispatch at 0x18001f51a]. DRAG DOWN to take effect; there is nothing above 1.0 to reach. "
+		"This add-on binds no ControlMask, so that is unconditional here.");
 
-	slider_f("Local Tone Strength", l.local_tone_strength, 0.0f, 2.0f, "%.2f", k_plain,
-		"Live. Same caveat as Intensity: 1.0 is the snippet's fallback, not a measured neutral.");
+	slider_f("Local Tone Strength", l.local_tone_strength, 0.0f, 1.0f, "%.2f", k_plain,
+		"Live. A BLEND COEFFICIENT the snippet clamps to [0,1] itself before using it to lerp 14 "
+		"network parameters [movss/comiss/movaps at 0x18001d603-0x18001d614], so every value at or "
+		"above 1.0 is byte-identical to 1.0. 1.0 = full local tone and is the default; DRAG DOWN "
+		"to reduce it.");
 
 	const bool mask_on = l.use_auto_mask.load(std::memory_order_relaxed);
 
 	ImGui::BeginDisabled(!mask_on);
-	slider_f("Local Structure Strength", l.local_structure_strength, 0.0f, 2.0f, "%.2f", k_plain,
+	slider_f("Local Structure Strength", l.local_structure_strength, 0.0f, 1.0f, "%.2f", k_plain,
 		"Live. Requires Automatic Mask: with the mask off the snippet internally forces BOTH "
-		"structure strengths to -1 and neither does anything.");
+		"structure strengths to -1 and neither does anything. "
+		"HONEST NOTE ON THE RANGE: unlike Intensity and Local Tone, this one is NOT clamped "
+		"anywhere in the snippet - it is passed raw into the network's conditioning block "
+		"(stored at layer+0x9c by 0x180061710, no clamp on the way). [0,1] is the domain its two "
+		"proven siblings share and the snippet's own disabled-sentinel is -1.0, so above 1.0 is "
+		"out-of-distribution for a trained network - undefined, not 'more'.");
 
 	{
 		bool inherit = l.skin_structure_strength.load(std::memory_order_relaxed) < 0.0f;
@@ -1486,8 +1502,10 @@ inline void draw_controls(const host_facts &f)
 			"drag from the left edge.");
 
 		ImGui::BeginDisabled(inherit);
-		slider_f("Skin Structure Strength", l.skin_structure_strength, 0.0f, 2.0f, "%.2f", k_plain,
-			"Live. 0.0 flattens skin structure; it is not a bypass. Untick \"inherit\" to reach it.");
+		slider_f("Skin Structure Strength", l.skin_structure_strength, 0.0f, 1.0f, "%.2f", k_plain,
+			"Live. 0.0 flattens skin structure; it is not a bypass. Untick \"inherit\" to reach it. "
+			"Same range note as Local Structure Strength: [0,1] by convention with its proven "
+			"siblings, not by a clamp measured in the snippet.");
 		ImGui::EndDisabled();
 	}
 	ImGui::EndDisabled();

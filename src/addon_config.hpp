@@ -238,8 +238,55 @@ struct config
 	// ---- the five tuning knobs -----------------------------------------------------------
 	// These defaults are the snippet's OWN fallbacks, recovered from the disassembly: each read
 	// is followed by a `cmp eax,0xbad00000` test that substitutes the value below when the host
-	// supplied nothing. 1.0 is therefore the fallback, NOT a calibrated neutral midpoint, and the
-	// scale these values sit on is not known.
+	// supplied nothing.
+	//
+	// THE SCALE IS NOW KNOWN, AND IT IS [0,1] - NOT the 0..2 this add-on used to offer. An
+	// earlier note here said "the scale these values sit on is not known" and the overlay ran
+	// 0..2 sliders on the strength of it. That was the bug: for two of these the ENTIRE upper
+	// half is provably inert, and 1.0 - the default - sits exactly at the top of the live range,
+	// so a user who raised a slider from its default could not see anything change, ever.
+	//
+	// `intensity` is an ATTENUATION, not a gain, and 1.0 means "no attenuation". The snippet
+	// skips the whole pass unless it is strictly below 1.0 [BIN 0x18001d4d0, called from
+	// 0x18001f500 on the evaluate path]:
+	//
+	//   0001d502  movss  xmm0, dword ptr [rip+0x9017a]     ; xmm0 = 1.0f  (VA 0x1800ad684)
+	//   0001d50a  comiss xmm0, dword ptr [rbx+0xe0]        ; 1.0 vs Intensity
+	//   0001d511  ja     0x18001d521                       ; taken ONLY if Intensity < 1.0
+	//   0001d513  add    rbx, 0x60
+	//   0001d517  cmp    qword ptr [rbx], 0                ; ...else fall back to ControlMask
+	//   0001d51b  jne    0x18001d525
+	//   0001d51d  xor    al, al                            ; >= 1.0 and no mask -> return 0
+	//
+	// and the caller turns that 0 into "skip the pass entirely" [BIN 0x18001f518 test eax,eax /
+	// 0x18001f51a je -> return false, so the `call 0x1800295e0` at 0x18001f522 never runs]. This
+	// add-on binds no ControlMask, so for us `Intensity >= 1.0` is unconditionally a no-op.
+	//
+	// `local_tone_strength` is a BLEND COEFFICIENT that the snippet clamps to [0,1] itself
+	// [BIN 0x18001d5f0, reached 0x1800159c0 -> 0x180018620 -> 0x18001d7c0 -> 0x18001d5f0]:
+	//
+	//   0001d5f0  movss  xmm2, dword ptr [rcx+0xe4]        ; t = LocalToneStrength
+	//   0001d5fb  movss  xmm3, dword ptr [rip+0x90081]     ; 1.0f
+	//   0001d603  comiss xmm2, xmm3
+	//   0001d608  jbe    0x18001d60f
+	//   0001d60a  movaps xmm2, xmm3                        ; t > 1.0 -> t = 1.0
+	//   0001d60f  comiss xmm1, xmm2                        ; 0 vs t
+	//   0001d612  jbe    0x18001d617
+	//   0001d614  xorps  xmm2, xmm2                        ; t < 0   -> t = 0
+	//
+	// after which `t` is the lerp coefficient for 14 network parameters written to
+	// [rcx+0x124..0x158]. Every value >= 1.0 is therefore identical to 1.0.
+	//
+	// The two STRUCTURE strengths are different, and the difference is stated honestly because it
+	// is the one thing here that is convention rather than proof: they are NOT clamped anywhere
+	// in the snippet. They pass through raw into the network's conditioning block
+	// [BIN 0x180019f30 derives +0xf8/+0xfc -> 0x180021bb0 loads them at 0x180022548/0x180022551
+	// -> `call 0x18003f490` at 0x180022636 -> `call 0x180061710` at 0x18003f689, which is a pure
+	// setter storing them at layer+0x98 / layer+0x9c with no clamp]. [0,1] is used for them
+	// because it is the domain their two proven siblings share, because the snippet's own
+	// "disabled" sentinel for both is -1.0f, and because they are conditioning inputs to a
+	// trained network, for which out-of-range is undefined rather than "more". If a value above
+	// 1.0 is ever measured to do something useful on hardware, this is the comment to correct.
 	float    intensity                = 1.0f;
 	float    local_tone_strength      = 1.0f;
 	float    local_structure_strength = 1.0f;
@@ -495,6 +542,35 @@ inline float parse_float(const char *v, float fallback)
 	return static_cast<float>(r);
 }
 
+// The four NR strength knobs live on [0,1] - see the long note on the tuning-knob defaults for
+// the disassembly. An ini written by an older build (or by hand) can hold anything, and a value
+// above 1.0 is not merely out of range, it is INERT: the snippet skips the intensity pass
+// outright at >= 1.0 and clamps local tone to 1.0, so a stale `intensity = 2.0` would silently
+// reproduce exactly the "this control does nothing" bug the range fix exists to remove. Clamp on
+// load so an existing stray_dlssnr.ini cannot carry the bug forward.
+//
+// `skin_structure_strength` is the one that must NOT be clamped at the bottom to 0: negative is
+// a live sentinel meaning "inherit local_structure_strength" [BIN 0x18001aa6d comiss / 0x18001aa70
+// jae / 0x18001aa72 movss xmm1,[rdi+0xe8]], so it clamps to [-1,1] and any negative normalises
+// to exactly -1.0.
+inline float clamp_unit(float v)
+{
+	if (!(v == v))       // NaN -> the snippet's own fallback
+		return 1.0f;
+	if (v < 0.0f) return 0.0f;
+	if (v > 1.0f) return 1.0f;
+	return v;
+}
+
+inline float clamp_skin(float v)
+{
+	if (!(v == v))       // NaN -> "inherit", the snippet's own fallback for this one
+		return -1.0f;
+	if (v < 0.0f) return -1.0f;
+	if (v > 1.0f) return 1.0f;
+	return v;
+}
+
 inline void trim(std::string &s)
 {
 	size_t b = 0, e = s.size();
@@ -587,10 +663,10 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "depth_inverted")           c.depth_inverted = parse_bool(v, c.depth_inverted);
 		else if (key == "mvec_scale_x")             c.mvec_scale_x = parse_float(v, c.mvec_scale_x);
 		else if (key == "mvec_scale_y")             c.mvec_scale_y = parse_float(v, c.mvec_scale_y);
-		else if (key == "intensity")                c.intensity = parse_float(v, c.intensity);
-		else if (key == "local_tone_strength")      c.local_tone_strength = parse_float(v, c.local_tone_strength);
-		else if (key == "local_structure_strength") c.local_structure_strength = parse_float(v, c.local_structure_strength);
-		else if (key == "skin_structure_strength")  c.skin_structure_strength = parse_float(v, c.skin_structure_strength);
+		else if (key == "intensity")                c.intensity = clamp_unit(parse_float(v, c.intensity));
+		else if (key == "local_tone_strength")      c.local_tone_strength = clamp_unit(parse_float(v, c.local_tone_strength));
+		else if (key == "local_structure_strength") c.local_structure_strength = clamp_unit(parse_float(v, c.local_structure_strength));
+		else if (key == "skin_structure_strength")  c.skin_structure_strength = clamp_skin(parse_float(v, c.skin_structure_strength));
 		else if (key == "style")                    c.style = static_cast<uint32_t>(parse_u64(v, c.style));
 		// ---- BEGIN overlay_ui hook ----
 		else if (key == "ui_correction")            c.ui_correction = static_cast<uint32_t>(parse_u64(v, c.ui_correction));

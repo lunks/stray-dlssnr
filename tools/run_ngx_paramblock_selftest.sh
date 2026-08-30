@@ -16,6 +16,7 @@ stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 
 cp src/ngx_interop.hpp             "$stage/"
+cp src/addon_config.hpp            "$stage/"
 cp tools/ngx_paramblock_shim/*.hpp "$stage/"
 cp tools/ngx_paramblock_shim/*.h   "$stage/"
 

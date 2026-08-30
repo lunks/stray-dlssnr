@@ -158,15 +158,24 @@ silently taking a default.
 | `mvec_clip_row` | `0` | pin the `View.ClipToPrevClip` float4 row. `0` = discover **and** cross-check against this game's own TAA bytecode |
 | `mvec_clip_transpose` | `0` | read `ClipToPrevClip` transposed — the escape hatch for the matrix convention |
 | `mvec_scale_x` / `mvec_scale_y` | `0` / `0` | `0` = derive from extents (forced to `1.0` when `mvec_decode=1`). With the decode on, `-1` is the per-axis **sign A/B** |
-| `intensity`, `local_tone_strength`, `local_structure_strength` | `1.0` | the snippet's own fallbacks |
+| `intensity`, `local_tone_strength`, `local_structure_strength` | `1.0` | the snippet's own fallbacks. **Range `[0,1]`, clamped on load.** `intensity` is an *attenuation*: the snippet skips its pass entirely unless the value is strictly **below** 1.0, so 1.0 = full NR and you drag **down**. `local_tone_strength` is a blend coefficient the snippet clamps to `[0,1]` itself |
 | `skin_structure_strength` | `-1.0` | negative = inherit local structure strength; `0.0` is **not** neutral |
 | `style` | `0` | uint. **Only `0` is known to exist in this snippet build** — `1`/`2` carry the reference add-on's names (Natural/Cinematic) and are unmeasured here |
 | `use_auto_mask` | `1` | gates both structure strengths |
 | `ui_correction` | `0` | `DLSSNR.UICorrection`. A real parameter of this build (one exact-line match in `nvngx_dlssnr.dll`'s string table; read with a `0xbad00000` guard, fallback `0`). Written per evaluate. **Its visual effect on STRAY is unverified** — a diagnostic knob, not a tuning one |
 
 The five tuning knobs default to the snippet's **own internal fallbacks**, recovered from its
-disassembly. `1.0` is a fallback, **not a calibrated neutral midpoint**, and the scale these
-values sit on is not known. Change them one at a time.
+disassembly. Change them one at a time.
+
+**The scale is `[0,1]`.** An earlier build offered `0..2` sliders on the grounds that the scale
+was unknown, and that was a real bug: for two of these knobs the entire upper half is provably
+inert, and because the default is `1.0` the only direction a user could drag was into the dead
+half. `intensity` is gated on `comiss 1.0, [rbx+0xe0] / ja` at `0x18001d50a` — the pass is skipped
+unless the value is strictly below `1.0` — and `local_tone_strength` is clamped to `[0,1]` at
+`0x18001d603` before being used as a lerp coefficient. The two structure strengths are *not*
+clamped by the snippet; `[0,1]` is used for them by convention with their proven siblings and with
+the snippet's own `-1.0` disabled-sentinel, which is called out as convention rather than proof in
+both the tooltip and `addon_config.hpp`.
 
 ### `rt_census` — the DXR dispatch census
 
