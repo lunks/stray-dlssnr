@@ -512,7 +512,9 @@ ours:    Y(original + (neural − proxy))                    =  Y(orig) + Y(neur
 ```
 
 Measured over 200,000 pixels through real FP16 surfaces with the same luma weights on both sides:
-**worst relative difference `4.55e-07`**, a few ULP. The magnitude sweep agrees to four decimals at
+**worst relative difference `3.82e-07`**, a few ULP. (Every figure in this section is quoted from the
+CI run, where MSVC and mingw agree to the digit; a different host's `pow` moves the last significant
+figure — macOS/clang gives `4.55e-07` for the same sweep — and none of the conclusions move with it.) The magnitude sweep agrees to four decimals at
 every source level:
 
 | source magnitude | source `Y` | proxy `Y` | gain, mode 0 | gain, mode 1 | chroma distance between them |
@@ -535,7 +537,9 @@ every source level:
   network's answer and locks the hue to *that*; where the proxy clipped, the network's answer is
   neutral white, so a saturated highlight is pulled toward the white point. `[6.0, 5.2, 3.0]` comes
   back as `[6.0, 5.2, 3.0]` in mode 0 and as roughly `[5.21, 5.21, 5.21]` in mode 1. Over 60,000
-  random pixels at `color_strength = 1` the two differ by up to **84 % of the pixel's magnitude**.
+  random pixels at `color_strength = 1` the two differ by up to **83 % of the pixel's magnitude** — the
+worst case is `[10.04, 10.12, 0.94]`, which mode 0 leaves essentially alone and mode 1 returns as
+`[9.45, 9.45, 9.45]`.
 
 **So `hdr_graft = 1` is a colour experiment, not a highlight-recovery fix.** It is a defensible,
 different aesthetic — *trust the network's colour* — and STRAY's neon signage is exactly where you
@@ -553,7 +557,7 @@ RGB-uniform, hue-exact rescale.
 Their decode has the *same* construction (`luminance_only = original · ratio`, then
 `lerp(luminance_only, upgraded, ColorStrength)`), and their upgraded luminance equals our
 transferred luminance — so **at `color_strength = 0` the two graft modes are very nearly the same
-image** (worst 4.7 % of a channel over 60,000 pixels, versus 84 % at `color_strength = 1`). There is
+image** (worst 4.74 % of a channel over 60,000 pixels, versus 83 % at `color_strength = 1`). There is
 no fourth mode worth adding; there are two real graft behaviours and one crossfade between
 *luminance-only* and *full colour* that applies to both. **A/B the grafts at
 `color_strength = 1`.**
@@ -580,12 +584,13 @@ c++ -std=c++17 -O2 -Wall -o /tmp/hdr_codec_selftest tools/hdr_codec_selftest.cpp
 | NaN firewall | a broken source passes through untouched, alpha included, in **both** modes |
 | FP16 range | mode 1 never emits a non-finite or out-of-range value, including their `neural_y == 0` cliff |
 | their cliff | reproduced, not smoothed: an exactly-zero network answer forces `lerp(original, 0, ts)` |
-| headroom term ≡ additive residual | worst relative difference `4.55e-07` over 150,222 else-branch samples |
-| their asymmetric branch | fires 49,778 / 200,000 times on FP16 data — real, not an edge case |
-| mode 1 at `transfer_strength = 0` | exact at `paper_white_scale` 1.0 / 2.0 / 0.5; **7165**, **4342**, **7138** of 20,000 non-exact at 1.5 / 2.2 / 0.75, worst `1.08e-07` relative. Mode 0: **0/20,000 at every one** |
-| divergence | 4.7 % of a channel at `color_strength = 0`; 84 % at `color_strength = 1` |
+| headroom term ≡ additive residual | worst relative difference `3.82e-07` over 150,250 else-branch samples |
+| their asymmetric branch | fires 49,750 / 200,000 times on FP16 data — real, not an edge case |
+| mode 1 at `transfer_strength = 0` | exact at `paper_white_scale` 1.0 / 2.0 / 0.5; **7144**, **4365**, **7076** of 20,000 non-exact at 1.5 / 2.2 / 0.75, worst `1.08e-07` relative. Mode 0: **0/20,000 at every one** |
+| divergence | 4.74 % of a channel at `color_strength = 0`; 83 % at `color_strength = 1` |
 
-CI runs the same replay under **both** MSVC and mingw, and separately compiles the codec's HLSL —
+CI runs the same replay under **both** MSVC and mingw — and the two agree to the printed digit on
+every figure above — and separately compiles the codec's HLSL —
 extracted from the string literals in `src/hdr_codec.hpp` exactly as `full_source()` assembles it —
 with **`fxc /T cs_5_0 /O3 /Ges /Gis`**, the compiler and the flags the add-on itself uses at load. A
 typo in that HLSL has no compile-time symptom in the C++ build and no crash at runtime: the codec

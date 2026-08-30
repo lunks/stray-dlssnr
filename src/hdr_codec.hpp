@@ -87,7 +87,7 @@
 //   Luminance is linear, so it does not:
 //       theirs:  neural_y + max(0, original_y - proxy_y)  ==  Y(o) + Y(n) - Y(p)
 //       ours:    Y(original + (neural - proxy))           ==  Y(o) + Y(n) - Y(p)
-//   Measured over 200,000 pixels through real FP16 surfaces: worst relative difference 4.55e-07.
+//   Measured over 200,000 pixels through real FP16 surfaces: worst relative difference 3.82e-07.
 //   The two modes deliver the SAME luminance gain at every source magnitude. What differs is
 //   CHROMA: theirs rebuilds the pixel from the network's answer and locks the hue to THAT, so
 //   where the proxy has clipped to white a saturated highlight is dragged toward the white point;

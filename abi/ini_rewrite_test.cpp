@@ -176,8 +176,8 @@ int main()
     check(has_line(out, "enabled = 1"), "enabled (load-only) was NOT round-tripped");
     check(has_line(out, "hdr_codec = 1"), "hdr_codec (load-only) was NOT round-tripped");
     check(has_line(out, "totally_unknown_key = 42"), "an unrecognised key survived untouched");
-    check(has_line(out, "; ui_correction is deliberately ABSENT, so the append path is exercised too."),
-          "the comment above the absent key survived");
+    check(has_line(out, "; ui_correction and hdr_graft are deliberately ABSENT, so the append path is exercised too."),
+          "the comment above the absent keys survived");
 
     // --- what we do own must change, without reflowing ---
     check(has_line(out, "intensity                = 1.25"), "intensity took the new value AND kept its column alignment");
