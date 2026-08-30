@@ -1743,6 +1743,33 @@ struct nr_state
 	std::atomic<uint32_t> sr_census_render_w{ 0 }, sr_census_render_h{ 0 };
 	std::atomic<uint32_t> sr_census_out_w{ 0 }, sr_census_out_h{ 0 };
 
+	// ---- CHAIN MODE (dlss_chain) ---------------------------------------------------------------
+	// True for the whole of an accepted dispatch that is running the chain, and read by
+	// nr_ensure_aux, which allocates a DIFFERENT set of textures for it: no pre-denoise copy (the
+	// decode's `original` is the game's own t5 SRV, borrowed for the event exactly as the velocity
+	// and depth SRVs already are) and no second motion-vector target (both networks read the one
+	// DLSS-SR already decodes into). Set at the top of the chain's own precondition block and
+	// cleared by nr_release_feature_and_output, so a teardown cannot leave it lying.
+	bool chain_active = false;
+	// RUN-latched after 8 consecutive DLSS-NR EvaluateFeature failures inside the chain. The frame
+	// stays correct - DLSS-SR then runs on the game's raw colour, which is exactly dlss_sr=1 - but
+	// paying for an encode, an evaluate into a 166 MB DLL and a decode every frame for an answer
+	// nothing can use is not something to do silently forever.
+	bool chain_nr_off = false;
+	uint32_t chain_nr_fail_streak = 0;
+	// PROOF OF LIFE. Incremented ONLY on the line where BOTH EvaluateFeature calls have returned
+	// Success on the same dispatch, so a non-zero value is evidence that the chain RAN - not that
+	// it compiled, linked and was configured. The periodic census prints it.
+	std::atomic<uint64_t> chain_evaluates{ 0 };
+
+	bool logged_chain_unavailable  = false;
+	bool logged_chain_not_upsampling = false;
+	bool logged_chain_codec_off    = false;
+	bool logged_chain_banner       = false;
+	bool logged_chain_nr_fail      = false;
+	bool logged_chain_sr_only      = false;
+	bool logged_chain_out_fail     = false;
+
 	bool logged_sr_banner      = false;
 	bool logged_sr_no_jitter   = false;
 	bool logged_sr_out_extent  = false;
@@ -1872,6 +1899,12 @@ static void nr_release_feature_and_output(device *dev, nr_state &st, const char 
 	// handle from the old resolution, whose address UE's pool can hand back for something else.
 	st.mvec_bound_res = 0;
 
+	// Chain mode's per-geometry state. chain_nr_off is RUN-latched and deliberately NOT cleared,
+	// exactly like sr_latched_off: it records that NGX refused the evaluate, which a resolution
+	// change cannot undo.
+	st.chain_active = false;
+	st.chain_nr_fail_streak = 0;
+
 	st.out_w = st.out_h = 0;
 	st.out_fmt = format::unknown;
 	st.neural_fmt = format::unknown;
@@ -1930,7 +1963,16 @@ static void nr_ensure_aux(device *dev, nr_state &st)
 
 	const bool want_codec = g_cfg.hdr_codec && st.codec.ok && !st.codec_failed;
 	// The pristine copy is needed by the codec (as `original`) AND by the feedback fix.
-	const bool want_orig  = want_codec || (g_cfg.history_restore && g_cfg.copy_back);
+	//
+	// CHAIN MODE WANTS NEITHER. The decode's `original` there is the game's own t5 SRV, consumed
+	// inside the event and never stored - the same borrow the motion-vector decode already makes
+	// of the game's velocity and depth descriptors, and it keeps the standing "nothing here ever
+	// CREATES a view on a resource the game owns" rule intact for the same reason. And the
+	// temporal-feedback fix does not apply: it exists to undo the DLSS-NR copy-back writing a
+	// denoised image into a buffer UE extracts as TAA history, and chain mode performs no
+	// copy-back at all (its result is at the render extent; u0 is at the output extent).
+	const bool want_orig  = !st.chain_active &&
+	                        (want_codec || (g_cfg.history_restore && g_cfg.copy_back));
 
 	// ---- the DECODED MOTION-VECTOR TARGET -----------------------------------------------------
 	//
@@ -1942,7 +1984,12 @@ static void nr_ensure_aux(device *dev, nr_state &st)
 	// A failure here is NOT fatal and is NOT an error for the pass: DLSSNR.MVec falls back to the
 	// game's raw encoded velocity with the derived grid scale, i.e. bit-for-bit what the add-on
 	// did before this feature existed.
-	if (g_cfg.mvec_decode && st.mvec.ok && !st.mvec_failed && !st.mvec_ok && !st.mvec_tex_failed)
+	//
+	// NOT IN CHAIN MODE. There the two networks read ONE guide - the one DLSS-SR's own decode
+	// writes, at the render extent, which chain mode has made equal to this extent - so a second
+	// identical r16g16_float texture that nothing would ever read is pure waste.
+	if (!st.chain_active &&
+	    g_cfg.mvec_decode && st.mvec.ok && !st.mvec_failed && !st.mvec_ok && !st.mvec_tex_failed)
 	{
 		const resource_desc d(w, h, 1, 1, format::r16g16_float, 1, memory_heap::default_,
 			resource_usage::unordered_access | resource_usage::shader_resource);
@@ -2010,7 +2057,7 @@ static void nr_ensure_aux(device *dev, nr_state &st)
 	// ---- the codec's proxy, result and the three SRVs ----------------------------------------
 	if (!want_codec || st.codec_textures_ok || st.codec_tex_failed)
 		return;
-	if (!st.orig_ok)
+	if (!st.chain_active && !st.orig_ok)
 		return;   // the decode has no `original` to add onto; orig_failed already said why
 
 	const char *stage = nullptr;
@@ -2021,8 +2068,15 @@ static void nr_ensure_aux(device *dev, nr_state &st)
 	// it comfortably holds the [0,1] sRGB-encoded values the network expects.
 	const resource_desc proxy_desc(w, h, 1, 1, format::r16g16b16a16_float, 1, memory_heap::default_,
 		resource_usage::unordered_access | resource_usage::shader_resource);
+	// In chain mode result_tex is not a copy source at all - it is DLSS-SR's COLOUR INPUT, read by
+	// the snippet as an SRV - so shader_resource joins the usage set. create_resource asserts that
+	// usage is a superset of every state the resource is ever transitioned to, and chain mode
+	// transitions this one to shader_resource_non_pixel. The bit is added ONLY on that path, so
+	// the DLSS-NR allocation is unchanged.
 	const resource_desc result_desc(w, h, 1, 1, st.out_fmt, 1, memory_heap::default_,
-		resource_usage::unordered_access | resource_usage::copy_source);
+		st.chain_active
+			? (resource_usage::unordered_access | resource_usage::copy_source | resource_usage::shader_resource)
+			: (resource_usage::unordered_access | resource_usage::copy_source));
 
 	const resource_view_desc proxy_view(resource_view_type::texture_2d, format::r16g16b16a16_float, 0, 1, 0, 1);
 	// format_to_default_typed is a no-op for the two colour-class formats this can be, but the
@@ -2046,7 +2100,9 @@ static void nr_ensure_aux(device *dev, nr_state &st)
 		stage = "create_resource_view(proxy SRV)";
 	else if (!dev->create_resource_view(st.proxy_tex,  resource_usage::unordered_access, proxy_view, &st.proxy_uav))
 		stage = "create_resource_view(proxy UAV)";
-	else if (!dev->create_resource_view(st.orig_tex,   resource_usage::shader_resource,  tex_view,   &st.orig_srv))
+	// No orig_tex in chain mode, so no view on it: the decode reads the game's t5 SRV instead.
+	else if (!st.chain_active &&
+	         !dev->create_resource_view(st.orig_tex,   resource_usage::shader_resource,  tex_view,   &st.orig_srv))
 		stage = "create_resource_view(original SRV)";
 	else if (!dev->create_resource_view(st.out_tex,    resource_usage::shader_resource,  neural_view, &st.out_srv))
 		stage = "create_resource_view(neural SRV)";
@@ -2849,6 +2905,228 @@ static bool nr_update_clip_to_prev_clip(device *dev, probe::device_shadow &sh, c
 	return true;
 }
 
+// --------------------------------------------------------------------------------------------
+// THE HDR CODEC'S TWO DISPATCHES, IN ONE PLACE.
+//
+// Lifted out of the DLSS-NR pass unchanged so chain mode runs the SAME encode and the SAME decode
+// with the SAME s. A divergence between two copies would be a CORRECTNESS failure rather than a
+// tuning difference - the decode subtracts a proxy that was built with s, and hdr_codec.hpp's
+// identity property is only exact while the two agree - so there is one copy and no way to
+// disagree.
+//
+// The only thing that differs between the callers is the SOURCE of `original`:
+//   DLSS-NR alone   st.orig_srv, an SRV on our own pristine copy of the TAA output.
+//   chain mode      the GAME'S OWN t5 descriptor, borrowed for this event and never stored -
+//                   exactly as the motion-vector decode already borrows the game's velocity and
+//                   depth SRVs. No copy, no barrier, and no view created on a game resource.
+//
+// Both dispatch over st.out_w x st.out_h, the extent every codec texture is allocated at.
+// --------------------------------------------------------------------------------------------
+static void nr_codec_encode(command_list *cmd, nr_state &st, resource_view src_srv,
+                            float proxy_scale, bool &proxy_in_srv)
+{
+	// THE CACHE SYNC, AND IT IS LOAD-BEARING.
+	//
+	// ReShade's command_list_impl caches _current_descriptor_heaps / _current_root_signature and
+	// SKIPS a redundant SetDescriptorHeaps or SetComputeRootSignature. That cache is only written
+	// when the APPLICATION goes through ReShade's wrapper - and NGX writes the RAW command list,
+	// which ReShade never sees. So across an evaluate the cache goes stale, and the next
+	// push_descriptors would issue SetComputeRootDescriptorTable with a GPU handle living in a
+	// heap that is not bound: undefined behaviour, or a device removal.
+	//
+	// bind_descriptor_tables with count == 0 is ReShade's own escape hatch for exactly this:
+	// d3d12_impl_command_list.cpp:538 and :549 both special-case `|| count == 0` to FORCE the
+	// two calls, which re-issues them on the real list and leaves the cache equal to reality.
+	cmd->bind_descriptor_tables(shader_stage::all_compute, st.codec.encode_layout, 0, 0, nullptr);
+	cmd->bind_pipeline(pipeline_stage::all_compute, st.codec.encode_pso);
+
+	descriptor_table_update srv_up = {};
+	srv_up.binding = 0; srv_up.array_offset = 0; srv_up.count = 1;
+	srv_up.type = descriptor_type::shader_resource_view;
+	srv_up.descriptors = &src_srv;
+	cmd->push_descriptors(shader_stage::compute, st.codec.encode_layout, hdr_codec::kParamSrvTable, srv_up);
+
+	descriptor_table_update uav_up = {};
+	uav_up.binding = 0; uav_up.array_offset = 0; uav_up.count = 1;
+	uav_up.type = descriptor_type::unordered_access_view;
+	uav_up.descriptors = &st.proxy_uav;
+	cmd->push_descriptors(shader_stage::compute, st.codec.encode_layout, hdr_codec::kParamUavTable, uav_up);
+
+	hdr_codec::encode_args ea;
+	ea.width = st.out_w; ea.height = st.out_h; ea.proxy_scale = proxy_scale; ea.pad0 = 0;
+	cmd->push_constants(shader_stage::compute, st.codec.encode_layout, hdr_codec::kParamConstants,
+	                    0, hdr_codec::kEncodeConstantCount, &ea);
+
+	cmd->dispatch(hdr_codec::group_count(st.out_w), hdr_codec::group_count(st.out_h), 1);
+
+	// The encode's write has to be visible to the snippet. In Remix this is the barrier set
+	// flushed immediately before the evaluate (rtx_neural_rendering.cpp:355-358); here the
+	// UNORDERED_ACCESS -> NON_PIXEL_SHADER_RESOURCE transition IS the write-completion barrier,
+	// and it also puts the proxy in the state NGX reads Color in.
+	cmd->barrier(st.proxy_tex, resource_usage::unordered_access, resource_usage::shader_resource_non_pixel);
+	proxy_in_srv  = true;
+}
+
+static void nr_codec_decode(command_list *cmd, nr_state &st, resource_view original_srv,
+                            float proxy_scale, float transfer_strength, float color_strength,
+                            uint32_t graft_mode, bool &out_in_srv)
+{
+	// NGX wrote out_tex OUTSIDE anything that tracks it, so nothing knows the decode's read of
+	// it has to wait. This transition is that dependency, and it is also what makes the
+	// texture readable as an SRV. (rtx_neural_rendering.cpp:408-441 records the same two
+	// hazards in Vulkan terms.)
+	cmd->barrier(st.out_tex, resource_usage::unordered_access, resource_usage::shader_resource_non_pixel);
+	out_in_srv = true;
+
+	// The cache sync again, and this is the call whose absence is a device removal: NGX has
+	// just rebound the descriptor heaps and the compute root signature on the RAW list, and
+	// ReShade's cache still names ours from the encode above.
+	cmd->bind_descriptor_tables(shader_stage::all_compute, st.codec.decode_layout, 0, 0, nullptr);
+	cmd->bind_pipeline(pipeline_stage::all_compute, st.codec.decode_pso);
+
+	// t0 original, t1 proxy, t2 neural - one contiguous table, in declaration order.
+	const resource_view decode_srvs[3] = { original_srv, st.proxy_srv, st.out_srv };
+	descriptor_table_update srv_up = {};
+	srv_up.binding = 0; srv_up.array_offset = 0; srv_up.count = 3;
+	srv_up.type = descriptor_type::shader_resource_view;
+	srv_up.descriptors = decode_srvs;
+	cmd->push_descriptors(shader_stage::compute, st.codec.decode_layout, hdr_codec::kParamSrvTable, srv_up);
+
+	descriptor_table_update uav_up = {};
+	uav_up.binding = 0; uav_up.array_offset = 0; uav_up.count = 1;
+	uav_up.type = descriptor_type::unordered_access_view;
+	uav_up.descriptors = &st.result_uav;
+	cmd->push_descriptors(shader_stage::compute, st.codec.decode_layout, hdr_codec::kParamUavTable, uav_up);
+
+	hdr_codec::decode_args da;
+	da.width = st.out_w; da.height = st.out_h;
+	// The IDENTICAL scale the encode used, from the same CPU float in the same frame.
+	da.proxy_scale = proxy_scale;
+	// Clamped on the CPU, exactly as Remix does (rtx_neural_rendering.cpp:525-526); the shader
+	// does not re-clamp them.
+	da.transfer_strength = transfer_strength;
+	da.color_strength    = color_strength;
+	// The ONLY thing that selects the renodx graft. It reaches the shader here and nowhere
+	// else: no pipeline is rebuilt and no feature is recreated, so if this dispatch runs at
+	// all, the mode is in effect. Threaded through the extraction rather than read from
+	// g_cfg here, because the chain path calls this with the same value the encode used.
+	da.graft_mode        = graft_mode;
+	da.pad1 = da.pad2 = 0;
+	cmd->push_constants(shader_stage::compute, st.codec.decode_layout, hdr_codec::kParamConstants,
+	                    0, hdr_codec::kDecodeConstantCount, &da);
+
+	cmd->dispatch(hdr_codec::group_count(st.out_w), hdr_codec::group_count(st.out_h), 1);
+}
+
+// --------------------------------------------------------------------------------------------
+// THE DLSS-NR KEY SET AND THE EVALUATE, IN ONE PLACE.
+//
+// TWO callers now: the DLSS-NR pass, and chain mode (dlss_chain=1), which runs the same network
+// on the SAME command list a few lines before DLSS-SR's. This is one function rather than two
+// copies because a divergence between them would be SILENT - an absent key is not an error to
+// NGX, it is a default, and that is exactly how a control in this tree once shipped as a control
+// that did nothing.
+//
+// Everything geometric arrives through nr_eval_args, because the two callers' geometry is not the
+// same. DLSS-NR alone denoises the TAA pass's OUTPUT (taa_out - which in the MainUpsampling
+// permutation chain mode requires is 3840x2160). Chained, it denoises the TAA pass's INPUT at the
+// render extent, so that DLSS-SR upscales a DENOISED image instead of a noisy one.
+//
+// The guide-reset latch lives in here, keyed on the bound RESOURCE as well as the extent, so both
+// callers get it - and so the first chained frame, where the guide changes from st.mvec_tex (or
+// the game's raw velocity) to the shared st.sr_res.mvec_tex, correctly pulses one DLSSNR.Reset.
+// --------------------------------------------------------------------------------------------
+struct nr_eval_args
+{
+	ID3D12Resource *color  = nullptr;  uint32_t color_w = 0, color_h = 0;
+	ID3D12Resource *depth  = nullptr;  uint32_t depth_w = 0, depth_h = 0;
+	ID3D12Resource *mvec   = nullptr;  uint32_t mvec_w  = 0, mvec_h  = 0;
+	ID3D12Resource *output = nullptr;  uint32_t out_w   = 0, out_h   = 0;
+	float scale_x = 1.0f, scale_y = 1.0f;
+};
+
+// out_reset reports the DLSSNR.Reset value that was actually sent, which is the one thing a caller
+// cannot recompute afterwards: st.need_reset is cleared on success.
+static ngx::Result nr_evaluate(nr_state &st, ID3D12GraphicsCommandList *cl, const nr_eval_args &a,
+                               bool &out_reset)
+{
+	if (st.params == nullptr || st.feature == nullptr || g_snippet.evaluate_feature == nullptr || cl == nullptr)
+		return ngx::Result_FAIL_NotInitialized;
+
+	ngx::parameter_block *p = st.params;
+
+	// Process-lifetime, not stack buffers: Set takes the name as a bare const char* and
+	// nothing in the ABI promises the callee copies it before returning.
+	static const ngx::resource_param_names s_colour(ngx::kParamColor);
+	static const ngx::resource_param_names s_depth(ngx::kParamDepth);
+	static const ngx::resource_param_names s_mvec(ngx::kParamMVec);
+	static const ngx::resource_param_names s_output(ngx::kParamOutput);
+	static const ngx::resource_param_names s_mask(ngx::kParamControlMask);
+
+	nr_set_resource(p, s_colour, a.color,  a.color_w, a.color_h);
+	nr_set_resource(p, s_depth,  a.depth,  a.depth_w, a.depth_h);
+	nr_set_resource(p, s_mvec,   a.mvec,   a.mvec_w,  a.mvec_h);
+	nr_set_resource(p, s_output, a.output, a.out_w,   a.out_h);
+	// Written EVERY frame even though this add-on never binds one - see nr_clear_resource.
+	nr_clear_resource(p, s_mask);
+
+	// The guide grid moved under a history accumulated against the old one. Nothing else
+	// notices, so force one reset frame.
+	//
+	// THE RESOURCE IS PART OF THE KEY, not just the extent. The fallback ladder can swap
+	// DLSSNR.MVec between our decoded texture and the game's raw velocity mid-run, and in
+	// STRAY both are 1920x1080 - so an extent-only test would see NO change while the guide's
+	// UNITS changed from absolute pixels to encoded unorm. That is precisely the case that
+	// needs a reset, and it is the one an extent-only latch cannot see.
+	const uint64_t mvec_res_key = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(a.mvec));
+	if (st.guide_w != a.mvec_w || st.guide_h != a.mvec_h || st.mvec_bound_res != mvec_res_key)
+	{
+		if (st.guide_w != 0 || st.guide_h != 0)
+			st.need_reset = true;   // a first frame is initialisation, not a reset
+		st.guide_w = a.mvec_w;
+		st.guide_h = a.mvec_h;
+		st.mvec_bound_res = mvec_res_key;
+	}
+
+	out_reset = st.need_reset;
+
+	ngx::set_u32(p, ngx::kParamEnabled,       1u);
+	ngx::set_u32(p, ngx::kParamReset,         st.need_reset ? 1u : 0u);
+	ngx::set_u32(p, ngx::kParamDepthInverted, g_cfg.depth_inverted ? 1u : 0u);
+	ngx::set_f32(p, ngx::kParamMVecScaleX,    a.scale_x);
+	ngx::set_f32(p, ngx::kParamMVecScaleY,    a.scale_y);
+	// Gates BOTH structure strengths. Binding a ControlMask would force it to 0 inside the
+	// snippet; this add-on binds none, so the two never conflict.
+	ngx::set_u32(p, ngx::kParamUseAutoMask,   g_cfg.use_auto_mask ? 1u : 0u);
+
+	ngx::set_f32(p, ngx::kParamIntensity,              g_cfg.intensity);
+	ngx::set_f32(p, ngx::kParamLocalToneStrength,      g_cfg.local_tone_strength);
+	ngx::set_f32(p, ngx::kParamLocalStructureStrength, g_cfg.local_structure_strength);
+	// Negative means "inherit LocalStructureStrength". 0.0 is NOT neutral.
+	ngx::set_f32(p, ngx::kParamSkinStructureStrength,  g_cfg.skin_structure_strength);
+	ngx::set_u32(p, ngx::kParamStyle,                  g_cfg.style);
+	// ---- BEGIN overlay_ui hook ----
+	// The overlay's "NR UI Correction" checkbox. Per-evaluate, exactly like Style, and NOT
+	// baked at create time - and st.params is the SAME parameter block nr_ensure_feature
+	// writes into, so a later CreateFeature sees it as well. DLSSNR.UICorrection is a real
+	// parameter of THIS snippet build: exactly one exact-line match in nvngx_dlssnr.dll's
+	// string table, against ZERO for DLSSNR.Upscaling. Without this write the checkbox would
+	// be a control that does nothing - the user would A/B it, see no change, and record a
+	// false negative. Default 0, which is also the snippet's own fallback, so an untouched
+	// install is bit-identical to one without this line.
+	ngx::set_u32(p, ngx::kParamUICorrection,           g_cfg.ui_correction);
+
+	// PARITY. renodx writes both indicator-axis keys = 0 [BIN 0x180014adb / 0x180014aee] and
+	// both strings exist in the snippet. These condition the NGX debug indicator overlay,
+	// which is registry-armed and off by default, so this is purely defensive: it stops the
+	// snippet reading an absent key if the indicator is ever enabled on this machine.
+	ngx::set_u32(p, ngx::kParamIndicatorInvertX, 0u);
+	ngx::set_u32(p, ngx::kParamIndicatorInvertY, 0u);
+	// ---- END overlay_ui hook ----
+
+	return g_snippet.evaluate_feature(cl, st.feature, p, nullptr);
+}
+
 // =============================================================================================
 // DLSS SUPER RESOLUTION - the pass.
 //
@@ -2939,11 +3217,23 @@ static void sr_try_run(command_list *cmd, device *dev, probe::device_shadow &sh,
                        const nr_view_info &colour, const nr_view_info &depth,
                        const nr_view_info &velocity,
                        resource_view vel_view, resource_view depth_view,
+                       resource_view colour_view,
                        const nr_view_info &taa_out, uint32_t taa_out_reg,
                        probe::restore_plan &plan, ID3D12GraphicsCommandList *d3d12_cmd,
                        uint32_t gx, uint32_t gy, uint32_t gz,
-                       uint32_t want_out_w, uint32_t want_out_h, bool &issued)
+                       uint32_t want_out_w, uint32_t want_out_h, bool chain, bool &issued)
 {
+	// CHAIN MODE is DLSS-NR spliced into this function at four points, not a third pass. Building
+	// it as its own function would have duplicated the jitter read, the coarse geometry key, the
+	// per-geometry create latch, the render view rect, the resolution latch and the whole
+	// suppression/ownership contract - six things whose divergence would be silent. Every splice
+	// is marked "CHAIN MODE"; with dlss_chain=0 `chain` is false and each one is a predictable
+	// branch and nothing else.
+	//
+	// Published for nr_ensure_aux, which allocates a different set of textures on this path. It is
+	// assigned on EVERY entry, in both directions, so a run that stops chaining cannot leave a
+	// stale true behind for the DLSS-NR path to read.
+	st.chain_active = chain;
 	// SUPPRESSING WITHOUT WRITING IS THE ONE COMBINATION THAT PRODUCES A GARBAGE FRAME, and it is
 	// reachable from the ini: sr_suppress_taa=1 with sr_direct_output=0 and sr_copy_back=0 would
 	// stop the game's TAA from running while DLSS wrote into a texture nothing reads, leaving u0
@@ -3079,6 +3369,21 @@ static void sr_try_run(command_list *cmd, device *dev, probe::device_shadow &sh,
 	const float jitter_x = st.sr_jitter.jitter_x * g_cfg.sr_jitter_scale_x;
 	const float jitter_y = st.sr_jitter.jitter_y * g_cfg.sr_jitter_scale_y;
 
+	// ---------------------------------------------------------------- CHAIN MODE: ONE camera cut, BOTH networks
+	//
+	// Both features want a Reset on a camera cut, and the two detectors are NOT equally reachable.
+	// DLSS-NR's (TemporalAAJitter.zw == .xy, bitwise) lives inside nr_update_clip_to_prev_clip,
+	// which is only called when the motion-vector decode is wanted - so with sr_mvec_decode=0 it
+	// never fires at all. DLSS-SR's is computed UNCONDITIONALLY by update_jitter, which has just
+	// run. So the unconditional one is the source, it is read here - BEFORE either evaluate - and
+	// it is latched into both features' sticky flags so that a cut on a frame whose evaluate fails
+	// is carried forward rather than lost.
+	if (chain && st.sr_jitter.reset_signalled)
+	{
+		st.need_reset         = true;   // DLSS-NR: read by nr_evaluate
+		st.sr_feat.need_reset = true;   // DLSS-SR: OR'd into DLSS.Reset by dlss_sr::evaluate_feature
+	}
+
 	// ---------------------------------------------------------------- the RENDER view rect
 	//
 	// QuantizeSceneBufferSize rounds the scene buffer's TEXTURE extent up to a multiple of 4 while
@@ -3210,6 +3515,127 @@ static void sr_try_run(command_list *cmd, device *dev, probe::device_shadow &sh,
 			     "play. This message is printed once.");
 	}
 
+	// ================================================================ CHAIN MODE: the DLSS-NR half's CPU preconditions
+	//
+	// Everything chain mode needs that can fail WITHOUT GPU consequence fails HERE, above the
+	// ownership point. A failure drops the DLSS-NR half only: the frame is then exactly a
+	// dlss_sr=1 frame - complete, correct, upscaled, not denoised - which is strictly better than
+	// bailing and handing the frame back to the game's own TAAU. That is a deliberate choice and
+	// it is the one place this implementation departs from the design it was built from.
+	bool  chain_run   = chain;
+	bool  chain_codec = false;
+	float chain_proxy_scale = 1.0f, chain_transfer = 0.0f, chain_colour_strength = 0.0f;
+	// Same selector the NR-alone path uses, computed here because the chain path has its own
+	// copies of every codec constant. codec_graft_ok is the build-time gate: with the renodx
+	// graft shader absent, mode 1 must fall back to 0 rather than dispatch a shader that is
+	// not there.
+	uint32_t chain_graft_mode = 0u;
+	bool  chain_encoded = false, chain_nr_ok = false, chain_decoded = false;
+	bool  chain_proxy_in_srv = false, chain_out_in_srv = false, chain_result_in_srv = false;
+	bool  chain_nr_reset = false;
+	float chain_nr_scale_x = 1.0f, chain_nr_scale_y = 1.0f;
+
+	if (chain_run && st.chain_nr_off)
+		chain_run = false;   // run-latched after 8 failed DLSS-NR evaluates; already logged once
+
+	if (chain_run)
+	{
+		// THE GEOMETRY MOVE, which is the one idea the whole chain rests on.
+		//
+		// DLSS-NR's textures are allocated at the COLOUR extent here, NOT at taa_out's. Chained,
+		// the image DLSS-NR denoises is the TAA pass's INPUT (t5, render resolution): in the
+		// MainUpsampling permutation there is no resolved image at the render resolution anywhere
+		// in the frame, and denoising at 4K after the upscale would defeat the ordering this whole
+		// feature exists for. Every downstream DLSS-NR site reads st.out_w/out_h, so this ONE call
+		// moves all of them together - the codec's dispatch domain, the proxy, the result, the
+		// Color and Output rects. It is also what makes DLSS-NR's guide extent equal DLSS-SR's BY
+		// CONSTRUCTION rather than by luck: leaving nr_ensure_output on taa_out would give a
+		// 3840x2160 guide against a 1920x1080 one, a silent 2x per-axis error.
+		if (!nr_ensure_output(dev, st, colour.w, colour.h, colour.fmt))
+		{
+			chain_run = false;
+			if (!st.logged_chain_out_fail)
+			{
+				st.logged_chain_out_fail = true;
+				LOGW("DLSS-CHAIN: the DLSS-NR textures could not be prepared at the RENDER extent "
+				     "%ux%u %s, so this frame is DLSS-SR ALONE - a correct upscaled frame with no "
+				     "denoise, i.e. exactly dlss_sr=1. The message above says why: a geometry move "
+				     "queues a teardown and self-heals on the next present, an allocation failure "
+				     "is latched for this extent. This message is printed once.",
+				     colour.w, colour.h, probe::format_name(colour.fmt));
+			}
+		}
+	}
+
+	if (chain_run)
+	{
+		// ONE value, computed ONCE, handed to BOTH codec dispatches - a disagreement between the
+		// encode's s and the decode's is a correctness failure, not a tuning difference. Same
+		// expressions as the DLSS-NR path's, and the clamps are Remix's.
+		chain_proxy_scale = 1.0f / (g_cfg.paper_white_scale > 0.01f ? g_cfg.paper_white_scale : 0.01f);
+		chain_graft_mode  = (st.codec_graft_ok && g_cfg.hdr_graft != 0u) ? 1u : 0u;
+		chain_transfer = (g_cfg.transfer_strength < 0.0f) ? 0.0f
+			: (g_cfg.transfer_strength > 1.0f ? 1.0f : g_cfg.transfer_strength);
+		chain_colour_strength = (g_cfg.color_strength < 0.0f) ? 0.0f
+			: (g_cfg.color_strength > 1.0f ? 1.0f : g_cfg.color_strength);
+
+		// st.orig_ok is deliberately NOT in this predicate, unlike the DLSS-NR path's want_codec:
+		// chain mode takes no pristine copy. `original` is the game's own t5 descriptor, which is
+		// what colour_view carries, so its presence is the precondition instead.
+		chain_codec = g_cfg.hdr_codec && !st.codec_failed && st.codec.ok &&
+		              st.codec_textures_ok && colour_view.handle != 0;
+
+		if (!chain_codec && !st.logged_chain_codec_off)
+		{
+			st.logged_chain_codec_off = true;
+			LOGE("DLSS-CHAIN: the HDR codec is NOT running (%s), so DLSS-SR's COLOUR INPUT will be "
+			     "the network's RAW DISPLAY-REFERRED answer bound as if it were linear HDR. That is "
+			     "README gap 1 MAGNIFIED by the upscaler rather than merely present in the frame: "
+			     "DLSS-SR accumulates and resolves an image whose transfer function is wrong. Set "
+			     "hdr_codec=1. The chain still runs. This message is printed once.",
+			     !g_cfg.hdr_codec        ? "hdr_codec=0"
+			     : st.codec_failed       ? "its shaders or pipelines could not be built - see above"
+			     : colour_view.handle == 0
+			                             ? "the game's own colour SRV was not recovered at this "
+			                               "dispatch, and chain mode reads the decode's `original` "
+			                               "through it rather than through a copy"
+			                             : "its textures could not be allocated at this extent");
+		}
+	}
+
+	if (chain_run && !st.logged_chain_banner)
+	{
+		st.logged_chain_banner = true;
+		LOGI("==================================================================");
+		LOGI("DLSS-CHAIN ARMED. One accepted TAA dispatch, TWO networks, in this order:");
+		LOGI("  [1] %s DLSS-NR (feature 18) at the RENDER extent %ux%u -> st.out_tex",
+		     chain_codec ? "codec encode ->" : "(no codec) ->", colour.w, colour.h);
+		LOGI("  [2] %s DLSS-SR (feature 1) COLOUR = %s -> u%u %ux%u",
+		     chain_codec ? "codec decode ->" : "->",
+		     chain_codec ? "result_tex, LINEAR HDR (the untouched original plus the network's "
+		                   "residual)"
+		                 : "out_tex, the network's DISPLAY-REFERRED answer (hdr_codec is off)",
+		     taa_out_reg, want_out_w, want_out_h);
+		LOGI("  DENOISE FIRST, THEN UPSCALE. DLSS-NR alone in this configuration would denoise "
+		     "the 4K output; chained it denoises what DLSS-SR is about to resolve.");
+		if (g_cfg.copy_back)
+			LOGW("  copy_back=1 is IGNORED in chain mode, and it has to be: DLSS-NR's result is "
+			     "%ux%u and u%u is %ux%u, and a full-subresource CopyTextureRegion between "
+			     "mismatched extents is INVALID USAGE, not an error return. The only write to u%u "
+			     "is DLSS-SR's.", colour.w, colour.h, taa_out_reg, taa_out.w, taa_out.h, taa_out_reg);
+		if (g_cfg.history_restore)
+			LOGW("  history_restore=1 is INERT in chain mode. It exists to undo the DLSS-NR "
+			     "copy-back writing a denoised image into a buffer UE 4.27 extracts as TAA "
+			     "history; chain mode performs no such write, so there is nothing to undo and no "
+			     "pristine copy is taken.");
+		LOGI("  THE CHEAPEST ON-HARDWARE CHECK: transfer_strength=0 with the codec on must be "
+		     "PIXEL-IDENTICAL to dlss_chain=0/dlss_sr=1 at the same ini. At 0 the decode is "
+		     "result = lerp(original, graded, 0) = original exactly, so DLSS-SR is handed the same "
+		     "t5 bits it is handed today - which validates the encode, the evaluate, the decode, "
+		     "the shared guide and the extra barrier independently of image quality.");
+		LOGI("==================================================================");
+	}
+
 	// ================================================================ FROM HERE WE MAY OWN THE DISPATCH
 	if (!suppress)
 	{
@@ -3301,6 +3727,117 @@ static void sr_try_run(command_list *cmd, device *dev, probe::device_shadow &sh,
 		st.sr_mvec_frames.fetch_add(1, std::memory_order_relaxed);
 	}
 
+	// ---- CHAIN MODE, between the two stages: DENOISE, THEN UPSCALE -----------------------------
+	//
+	// ONE motion guide serves both networks - st.sr_res.mvec_tex, decoded just above at the render
+	// extent, which the geometry move has made equal to DLSS-NR's output extent - and it is
+	// already in SHADER_RESOURCE_NON_PIXEL, which is the state NGX reads a guide in. So the second
+	// decode a naive chain would need does not exist, and neither does an extra barrier for it.
+	if (chain_run)
+	{
+		if (chain_codec)
+		{
+			// `original` is the GAME's own t5 descriptor. It is not transitioned: it was bound as
+			// an SRV to the dispatch this window replaced, so it already carries
+			// NON_PIXEL_SHADER_RESOURCE, and nothing inside this window writes it. Exactly the
+			// rule that leaves the velocity and depth SRVs untransitioned above.
+			nr_codec_encode(cmd, st, colour_view, chain_proxy_scale, chain_proxy_in_srv);
+			chain_encoded = true;
+		}
+
+		if (nr_ensure_feature(st, d3d12_cmd, st.out_w, st.out_h))
+		{
+			nr_eval_args na;
+			na.color   = reinterpret_cast<ID3D12Resource *>(
+				chain_encoded ? st.proxy_tex.handle : colour.res.handle);
+			na.color_w = st.out_w;  na.color_h = st.out_h;
+			na.depth   = reinterpret_cast<ID3D12Resource *>(depth.res.handle);
+			na.depth_w = depth.w;   na.depth_h = depth.h;
+			na.mvec    = reinterpret_cast<ID3D12Resource *>(
+				mvec_used ? st.sr_res.mvec_tex.handle : velocity.res.handle);
+			na.mvec_w  = mvec_used ? st.sr_res.mvec_w : velocity.w;
+			na.mvec_h  = mvec_used ? st.sr_res.mvec_h : velocity.h;
+			na.output  = reinterpret_cast<ID3D12Resource *>(st.out_tex.handle);
+			na.out_w   = st.out_w;  na.out_h  = st.out_h;
+
+			// FORCED to 1.0 with the decode on, for the reason the DLSS-NR path forces it: the
+			// guide is already absolute pixels on this grid, so the grid ratio would double-apply.
+			// Without the decode it is the ratio between the two grids, which corrects the grid
+			// and can never correct UE4's ENCODING. mvec_scale_x/y still override both.
+			const float cd_x = mvec_used ? 1.0f
+				: (velocity.w != 0 ? static_cast<float>(st.out_w) / static_cast<float>(velocity.w) : 1.0f);
+			const float cd_y = mvec_used ? 1.0f
+				: (velocity.h != 0 ? static_cast<float>(st.out_h) / static_cast<float>(velocity.h) : 1.0f);
+			na.scale_x = (g_cfg.mvec_scale_x != 0.0f) ? g_cfg.mvec_scale_x : cd_x;
+			na.scale_y = (g_cfg.mvec_scale_y != 0.0f) ? g_cfg.mvec_scale_y : cd_y;
+			chain_nr_scale_x = na.scale_x;   // kept for the proof-of-life line below
+			chain_nr_scale_y = na.scale_y;
+
+			const ngx::Result nr_r = nr_evaluate(st, d3d12_cmd, na, chain_nr_reset);
+
+			// ---- BEGIN overlay_ui hook ----
+			// The overlay's status line is the only place a player can see DLSS-NR is alive, and
+			// in chain mode this is the ONLY site that publishes to it - the DLSS-NR pass's own
+			// publish is on a branch chain mode never reaches.
+			overlay_ui::publish_evaluate(
+				static_cast<uint32_t>(nr_r), ngx::result_to_string(nr_r), !ngx::failed(nr_r),
+				st.out_w, st.out_h, probe::format_name(st.out_fmt), probe::format_name(st.neural_fmt),
+				velocity.w, velocity.h, na.scale_x, na.scale_y, chain_encoded,
+				st.hist_restored.load(std::memory_order_relaxed),
+				st.hist_dropped.load(std::memory_order_relaxed));
+			// ---- END overlay_ui hook ----
+
+			if (ngx::failed(nr_r))
+			{
+				if (!st.logged_chain_nr_fail)
+				{
+					st.logged_chain_nr_fail = true;
+					LOGE("DLSS-CHAIN: the DLSS-NR EvaluateFeature FAILED: 0x%08x %s. DLSS-SR is "
+					     "still run, on the game's RAW colour - so the frame is a correct upscaled "
+					     "frame with no denoise, exactly dlss_sr=1. This message is printed once.",
+					     (unsigned)nr_r, ngx::result_to_string(nr_r));
+				}
+				if (++st.chain_nr_fail_streak >= 8)
+				{
+					st.chain_nr_off = true;
+					LOGE("DLSS-CHAIN: the DLSS-NR half has failed 8 frames running. It is latched "
+					     "OFF for the rest of this run - paying for an encode, an evaluate into a "
+					     "166 MB DLL and a decode every frame for an answer nothing can use is not "
+					     "something to do silently. DLSS-SR keeps running alone, which is exactly "
+					     "dlss_sr=1. Read the FIRST error above: it names the check that refused.");
+				}
+			}
+			else
+			{
+				chain_nr_ok = true;
+				st.chain_nr_fail_streak = 0;
+				st.need_reset = false;
+				st.evaluate_count++;
+			}
+		}
+
+		// The denoised image DLSS-SR is about to read has to be FINISHED and READABLE.
+		if (chain_nr_ok && chain_encoded)
+		{
+			nr_codec_decode(cmd, st, colour_view, chain_proxy_scale, chain_transfer,
+			                chain_colour_strength, chain_graft_mode, chain_out_in_srv);
+			chain_decoded = true;
+			// THE ONE BARRIER CHAIN MODE ADDS. It is the decode's write-completion AND the state
+			// NGX reads Color in, in one transition - the same shape as the proxy's.
+			cmd->barrier(st.result_tex, resource_usage::unordered_access,
+			             resource_usage::shader_resource_non_pixel);
+			chain_result_in_srv = true;
+		}
+		else if (chain_nr_ok)
+		{
+			// With the codec off DLSS-SR's Color is the network's own target, so it needs the
+			// transition the decode would otherwise have made for it.
+			cmd->barrier(st.out_tex, resource_usage::unordered_access,
+			             resource_usage::shader_resource_non_pixel);
+			chain_out_in_srv = true;
+		}
+	}
+
 	// ---- stage 2 of 2: CreateFeature + EvaluateFeature ------------------------------------------
 	dlss_sr::create_desc cd;
 	cd.render_w = render_w;
@@ -3326,7 +3863,15 @@ static void sr_try_run(command_list *cmd, device *dev, probe::device_shadow &sh,
 		dlss_sr::evaluate_desc ed;
 		// The colour INPUT is the TAA pass's own input at t5, NOT its output. That is the single
 		// biggest semantic difference from DLSS-NR, which binds the RESOLVED output.
-		ed.color  = reinterpret_cast<ID3D12Resource *>(colour.res.handle);
+		// CHAIN MODE substitutes the DENOISED image here, and this one line is the join between
+		// the two features. With the codec on it is result_tex - the untouched linear HDR original
+		// plus the network's residual, in colour.fmt, at the render extent - NOT the
+		// display-referred proxy, which never leaves the DLSS-NR sub-window. With the codec off it
+		// is the network's raw answer (warned about, once, above). If the DLSS-NR half did not run
+		// or failed, this falls back to the game's own t5 and the frame is exactly dlss_sr=1.
+		ed.color  = reinterpret_cast<ID3D12Resource *>(
+			chain_decoded ? st.result_tex.handle
+			              : (chain_nr_ok ? st.out_tex.handle : colour.res.handle));
 		ed.depth  = reinterpret_cast<ID3D12Resource *>(depth.res.handle);
 		ed.mvec   = reinterpret_cast<ID3D12Resource *>(
 			mvec_used ? st.sr_res.mvec_tex.handle : velocity.res.handle);
@@ -3403,6 +3948,53 @@ static void sr_try_run(command_list *cmd, device *dev, probe::device_shadow &sh,
 			st.sr_eval_fail_streak = 0;
 			st.sr_feat.need_reset  = false;
 			const uint64_t n = st.sr_evaluates.fetch_add(1, std::memory_order_relaxed) + 1;
+
+			// THE CHAIN'S PROOF OF LIFE. This is inside DLSS-SR's success branch AND guarded on
+			// the DLSS-NR half having returned Success on this same dispatch, so it cannot be
+			// reached by code that merely compiled and linked - which is exactly how a feature in
+			// this tree once shipped as dead code. chain_evaluates is incremented here and nowhere
+			// else, and the periodic census prints it: if it is zero, the chain did not run,
+			// whatever else the log says.
+			if (chain_run && chain_nr_ok)
+			{
+				const uint64_t cn = st.chain_evaluates.fetch_add(1, std::memory_order_relaxed) + 1;
+				if (cn == 1 || cn == 100)
+				{
+					LOGI("DLSS-CHAIN: CHAINED EVALUATE #%llu OK - BOTH networks ran on ONE accepted "
+					     "dispatch.", (unsigned long long)cn);
+					LOGI("  [1] DLSS-NR  feature 18, Color=%s 0x%llx %ux%u%s, MVec=0x%llx %ux%u "
+					     "scale %.4f/%.4f, Output=out_tex 0x%llx, Reset=%d",
+					     chain_encoded ? "the display-referred PROXY" : "the game's RAW t5",
+					     (unsigned long long)(chain_encoded ? st.proxy_tex.handle : colour.res.handle),
+					     st.out_w, st.out_h,
+					     chain_encoded ? " (s applied)" : "",
+					     (unsigned long long)(mvec_used ? st.sr_res.mvec_tex.handle : velocity.res.handle),
+					     mvec_used ? st.sr_res.mvec_w : velocity.w,
+					     mvec_used ? st.sr_res.mvec_h : velocity.h,
+					     (double)chain_nr_scale_x, (double)chain_nr_scale_y,
+					     (unsigned long long)st.out_tex.handle, (int)chain_nr_reset);
+					LOGI("  [2] %s", chain_decoded
+					     ? "codec decode -> result_tex, LINEAR HDR (original + residual)"
+					     : "NO codec decode - DLSS-SR is reading the network's display-referred answer");
+					LOGI("  [3] DLSS-SR  feature 1, Color=0x%llx (view rect %ux%u), "
+					     "MotionVectors=THE SAME 0x%llx, Output=%s %ux%u, Jitter=(%.6f, %.6f), Reset=%d",
+					     (unsigned long long)(chain_decoded ? st.result_tex.handle : st.out_tex.handle),
+					     render_w, render_h,
+					     (unsigned long long)(mvec_used ? st.sr_res.mvec_tex.handle : velocity.res.handle),
+					     direct ? "the game's u0 DIRECTLY" : "the add-on's own texture",
+					     want_out_w, want_out_h, (double)jitter_x, (double)jitter_y, (int)ed.reset);
+					LOGI("  The DLSS-NR copy-back does not run in chain mode; the only write to u%u "
+					     "is DLSS-SR's.", taa_out_reg);
+				}
+			}
+			else if (chain_run && !chain_nr_ok && !st.logged_chain_sr_only)
+			{
+				st.logged_chain_sr_only = true;
+				LOGW("DLSS-CHAIN: DLSS-SR evaluated but the DLSS-NR half did not, so this frame is "
+				     "UPSCALED BUT NOT DENOISED - a complete, correct frame, and exactly what "
+				     "dlss_sr=1 produces. The reason is above. This message is printed once; the "
+				     "census's chained= counter is the running number that matters.");
+			}
 			st.sr_census_render_w.store(render_w, std::memory_order_relaxed);
 			st.sr_census_render_h.store(render_h, std::memory_order_relaxed);
 			st.sr_census_out_w.store(want_out_w, std::memory_order_relaxed);
@@ -3465,9 +4057,29 @@ static void sr_try_run(command_list *cmd, device *dev, probe::device_shadow &sh,
 		cmd->barrier(st.sr_res.mvec_tex, resource_usage::shader_resource_non_pixel,
 		             resource_usage::unordered_access);
 
+	// CHAIN MODE's three, on the same UNCONDITIONAL rule and for the same reason: leaving any of
+	// them in NON_PIXEL_SHADER_RESOURCE would make the next frame's opening barrier declare a
+	// StateBefore D3D12 disagrees with - a validation error under the debug layer and a silently
+	// wrong transition under vkd3d.
+	if (chain_result_in_srv)
+		cmd->barrier(st.result_tex, resource_usage::shader_resource_non_pixel,
+		             resource_usage::unordered_access);
+	if (chain_out_in_srv)
+		cmd->barrier(st.out_tex, resource_usage::shader_resource_non_pixel,
+		             resource_usage::unordered_access);
+	if (chain_proxy_in_srv)
+		cmd->barrier(st.proxy_tex, resource_usage::shader_resource_non_pixel,
+		             resource_usage::unordered_access);
+
 	// The last cache sync, and only when push_descriptors was actually used. It leaves ReShade's
 	// cache naming the APPLICATION's heaps, which is what restore_state is about to put back.
-	if (mvec_used)
+	// Whichever of our layouts was LAST serves - the call exists for its side effect on the cache,
+	// not for the binding - so chain mode's codec dispatches take priority over the mvec decode's.
+	if (chain_decoded)
+		cmd->bind_descriptor_tables(shader_stage::all_compute, st.codec.decode_layout, 0, 0, nullptr);
+	else if (chain_encoded)
+		cmd->bind_descriptor_tables(shader_stage::all_compute, st.codec.encode_layout, 0, 0, nullptr);
+	else if (mvec_used)
 		cmd->bind_descriptor_tables(shader_stage::all_compute, st.mvec.layout, 0, 0, nullptr);
 
 	// Put the command list back the way NGX found it. UNCONDITIONAL: CreateFeature clobbers state
@@ -3592,7 +4204,10 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 				// MainUpsampling permutation's hash without disturbing the DLSS-NR pin, so the two
 				// features can be A/B'd on one install; 0 falls back to shader_hash, which is what
 				// dlss_sr=0 uses unconditionally.
-				const uint64_t want_hash = (g_cfg.dlss_sr && g_cfg.sr_shader_hash != 0)
+				// dlss_chain is treated EXACTLY like dlss_sr here, and it has to be: chain mode
+				// only upscales in the MainUpsampling permutation, which is a different #define
+				// set and therefore a different DXBC and a different fnv1a64.
+				const uint64_t want_hash = ((g_cfg.dlss_sr || g_cfg.dlss_chain) && g_cfg.sr_shader_hash != 0)
 					? g_cfg.sr_shader_hash : g_cfg.shader_hash;
 				is_target = sr.is_compute && sr.dxbc_valid &&
 					(want_hash != 0 ? (sr.hash == want_hash) : sr.passed_all_gates);
@@ -3675,6 +4290,14 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	// pool slot. This does neither.
 	resource_view mvec_vel_view   = { 0 };
 	resource_view mvec_depth_view = { 0 };
+	// CHAIN MODE keeps the game's own COLOUR descriptor for the same reason and under the same
+	// rule: the HDR codec's `original` is the render-resolution scene colour there, and reading it
+	// through the game's own SRV removes a full-extent copy per frame AND the state-inference that
+	// copy would need (the existing StateBefore derivation is stated for a UAV-and-SRV, NON-RTV
+	// texture, and render-resolution SceneColor is RenderTargetable, so it does not transfer).
+	// CONSUMED INSIDE THIS EVENT AND NEVER STORED. Caching it across frames would be a dangling
+	// read with no diagnostic.
+	resource_view mvec_colour_view = { 0 };
 
 	// EVERY colour-class SRV bound at this dispatch, not just the configured one. The measured TAA
 	// pass binds colour at t5 AND history at t6 (both r16g16b16a16_float, both 1920x1080), and the
@@ -3712,7 +4335,7 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 
 		if (r.dx_register_index == g_cfg.srv_depth    && bc == buffer_class::depth)    { depth    = vi; mvec_depth_view = r.view; }
 		if (r.dx_register_index == g_cfg.srv_velocity && bc == buffer_class::velocity) { velocity = vi; mvec_vel_view   = r.view; }
-		if (r.dx_register_index == g_cfg.srv_colour   && bc == buffer_class::colour)   colour   = vi;
+		if (r.dx_register_index == g_cfg.srv_colour   && bc == buffer_class::colour)   { colour   = vi; mvec_colour_view = r.view; }
 	}
 
 	// THE DISCRIMINATOR. Not the confidence score: 0x901e041a7cadc9db was MEASURED in this game
@@ -3752,10 +4375,62 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	// The OUTPUT extent, needed before the UAV can be judged. Group counts are the primary source
 	// (see nr_pick_output_uav); the ini can pin it, and 0/0 selects the DLSS-NR rule.
 	const uint32_t sr_tile  = (g_cfg.sr_group_tile != 0) ? g_cfg.sr_group_tile : 8u;
-	const uint32_t sr_out_w = g_cfg.dlss_sr
-		? (g_cfg.sr_out_width  != 0 ? g_cfg.sr_out_width  : sr_tile * gx) : 0u;
-	const uint32_t sr_out_h = g_cfg.dlss_sr
-		? (g_cfg.sr_out_height != 0 ? g_cfg.sr_out_height : sr_tile * gy) : 0u;
+	const uint32_t cand_out_w = (g_cfg.sr_out_width  != 0) ? g_cfg.sr_out_width  : sr_tile * gx;
+	const uint32_t cand_out_h = (g_cfg.sr_out_height != 0) ? g_cfg.sr_out_height : sr_tile * gy;
+
+	// ---------------------------------------------------------------- CHAIN MODE: is it actually reachable?
+	//
+	// BOTH features must be armed - not "the add-on is armed". g_nr_armed is set when EITHER
+	// snippet initialised (nr_lazy_ngx_init returns sr_ok on the DLSS-NR failure path), so it
+	// cannot answer this question; the two parameter blocks can, because each is allocated only
+	// after its own Init_Ext succeeded.
+	bool chain_ok = g_cfg.dlss_chain &&
+	                st->params != nullptr &&
+	                g_sr_armed.load(std::memory_order_relaxed) && st->sr_feat.params != nullptr;
+
+	if (g_cfg.dlss_chain && !chain_ok && !st->logged_chain_unavailable)
+	{
+		st->logged_chain_unavailable = true;
+		LOGE("DLSS-CHAIN: dlss_chain=1 but the chain cannot run - DLSS-NR is %s and DLSS-SR is %s. "
+		     "Chain mode needs BOTH snippets loaded and initialised; it never half-runs. This run "
+		     "falls back to %s. The messages above name the specific failure.",
+		     st->params != nullptr ? "ARMED" : "NOT armed (dlss_nr=0, nvngx_dlssnr.dll missing, or Init_Ext failed)",
+		     (g_sr_armed.load(std::memory_order_relaxed) && st->sr_feat.params != nullptr)
+		        ? "ARMED" : "NOT armed (nvngx_dlss.dll missing, or Init_Ext failed)",
+		     (g_sr_armed.load(std::memory_order_relaxed) && st->sr_feat.params != nullptr)
+		        ? (g_cfg.dlss_sr ? "DLSS-SR alone" : "the game's own TAA - set dlss_sr=1 to run DLSS-SR alone")
+		        : (st->params != nullptr ? "DLSS-NR alone" : "the game's own TAA, untouched"));
+	}
+
+	// THE ENGINE.INI DETECTOR, and it is a positive, named refusal rather than an absence of
+	// output. Chain mode has nothing to upscale into unless UE4 is in MainUpsampling, and the
+	// symptom of getting that wrong would otherwise be a chain that runs and produces a frame
+	// identical to DLSS-NR's.
+	if (chain_ok && cand_out_w == colour.w && cand_out_h == colour.h)
+	{
+		chain_ok = false;
+		if (!st->logged_chain_not_upsampling)
+		{
+			st->logged_chain_not_upsampling = true;
+			LOGE("DLSS-CHAIN: dlss_chain=1 but this dispatch is NOT an upsampling one - the colour "
+			     "input t%u is %ux%u and the output extent derived from the group counts is ALSO "
+			     "%ux%u, so DLSS-SR has nothing to upscale into. Chain mode requires UE4's "
+			     "MainUpsampling permutation. Put this in Engine.ini [SystemSettings]: "
+			     "r.TemporalAA.Upsampling=1 / r.SecondaryScreenPercentage=100 / "
+			     "r.ScreenPercentage=50 - and then RE-PIN sr_shader_hash from the probe, because "
+			     "flipping Upsampling changes TAA_PASS_CONFIG, the DXBC and therefore the hash. "
+			     "Falling back to %s for this run.",
+			     g_cfg.srv_colour, colour.w, colour.h, cand_out_w, cand_out_h,
+			     g_cfg.dlss_sr ? "DLSS-SR alone" : "DLSS-NR alone");
+		}
+	}
+
+	// Chain mode needs the DLSS-SR rule (output extent >= colour extent), not the DLSS-NR one
+	// (exact equality against the colour SRV) - otherwise the 4K u0 is rejected outright and the
+	// pass never runs. DLSS-NR does not also try to claim that UAV: in chain mode its Output is
+	// its own st.out_tex at the render extent, and taa_out appears nowhere in its half.
+	const uint32_t sr_out_w = (g_cfg.dlss_sr || chain_ok) ? cand_out_w : 0u;
+	const uint32_t sr_out_h = (g_cfg.dlss_sr || chain_ok) ? cand_out_h : 0u;
 
 	nr_view_info taa_out;
 	uint32_t taa_out_reg = 0;
@@ -3768,7 +4443,10 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	// DLSS-SR owns its own output texture at the OUTPUT extent (dlss_sr::ensure_output), or binds
 	// u0 directly, so this DLSS-NR allocation is skipped entirely. With dlss_sr=0 the guard
 	// short-circuits and the call is made exactly as before.
-	if (!g_cfg.dlss_sr && !nr_ensure_output(dev, *st, taa_out.w, taa_out.h, taa_out.fmt))
+	// Chain mode calls nr_ensure_output itself, inside sr_try_run, at the RENDER extent - see the
+	// geometry move there. Calling it here with taa_out's extent would allocate DLSS-NR's textures
+	// at 4K and then immediately queue a teardown when the chain asked for 1080p.
+	if (!(g_cfg.dlss_sr || chain_ok) && !nr_ensure_output(dev, *st, taa_out.w, taa_out.h, taa_out.fmt))
 		return;
 
 	// ---------------------------------------------------------------- the state restore plan
@@ -3903,11 +4581,16 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	// sr_try_run owns the window from here to probe::restore_state, including the decision about
 	// whether the game's Dispatch gets issued at all - which is why it takes `issued` by reference
 	// on exactly the same contract this function documents.
-	if (g_cfg.dlss_sr)
+	// CHAIN MODE enters the SAME function with chain=true, which splices DLSS-NR in ahead of
+	// DLSS-SR rather than duplicating any of this. If both keys are set, the chain wins: it is a
+	// superset of what dlss_sr=1 does. With dlss_chain=0 and dlss_sr=0 this is one predictable
+	// branch and nothing else, exactly as it is today.
+	if (g_cfg.dlss_sr || chain_ok)
 	{
 		sr_try_run(cmd, dev, *sh, *cs, *st, shader, colour, depth, velocity,
-		           mvec_vel_view, mvec_depth_view, taa_out, taa_out_reg, plan, d3d12_cmd,
-		           gx, gy, gz, sr_out_w, sr_out_h, issued);
+		           mvec_vel_view, mvec_depth_view, mvec_colour_view,
+		           taa_out, taa_out_reg, plan, d3d12_cmd,
+		           gx, gy, gz, sr_out_w, sr_out_h, chain_ok, issued);
 		return;
 	}
 
@@ -4386,62 +5069,13 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	// The network is a DISPLAY-REFERRED image network; this is what makes its input in-distribution.
 	if (want_codec)
 	{
-		// THE CACHE SYNC, AND IT IS LOAD-BEARING.
-		//
-		// ReShade's command_list_impl caches _current_descriptor_heaps / _current_root_signature and
-		// SKIPS a redundant SetDescriptorHeaps or SetComputeRootSignature. That cache is only written
-		// when the APPLICATION goes through ReShade's wrapper - and NGX writes the RAW command list,
-		// which ReShade never sees. So across an evaluate the cache goes stale, and the next
-		// push_descriptors would issue SetComputeRootDescriptorTable with a GPU handle living in a
-		// heap that is not bound: undefined behaviour, or a device removal.
-		//
-		// bind_descriptor_tables with count == 0 is ReShade's own escape hatch for exactly this:
-		// d3d12_impl_command_list.cpp:538 and :549 both special-case `|| count == 0` to FORCE the
-		// two calls, which re-issues them on the real list and leaves the cache equal to reality.
-		cmd->bind_descriptor_tables(shader_stage::all_compute, st->codec.encode_layout, 0, 0, nullptr);
-		cmd->bind_pipeline(pipeline_stage::all_compute, st->codec.encode_pso);
-
-		descriptor_table_update srv_up = {};
-		srv_up.binding = 0; srv_up.array_offset = 0; srv_up.count = 1;
-		srv_up.type = descriptor_type::shader_resource_view;
-		srv_up.descriptors = &st->orig_srv;
-		cmd->push_descriptors(shader_stage::compute, st->codec.encode_layout, hdr_codec::kParamSrvTable, srv_up);
-
-		descriptor_table_update uav_up = {};
-		uav_up.binding = 0; uav_up.array_offset = 0; uav_up.count = 1;
-		uav_up.type = descriptor_type::unordered_access_view;
-		uav_up.descriptors = &st->proxy_uav;
-		cmd->push_descriptors(shader_stage::compute, st->codec.encode_layout, hdr_codec::kParamUavTable, uav_up);
-
-		hdr_codec::encode_args ea;
-		ea.width = st->out_w; ea.height = st->out_h; ea.proxy_scale = proxy_scale; ea.pad0 = 0;
-		cmd->push_constants(shader_stage::compute, st->codec.encode_layout, hdr_codec::kParamConstants,
-		                    0, hdr_codec::kEncodeConstantCount, &ea);
-
-		cmd->dispatch(hdr_codec::group_count(st->out_w), hdr_codec::group_count(st->out_h), 1);
-
-		// The encode's write has to be visible to the snippet. In Remix this is the barrier set
-		// flushed immediately before the evaluate (rtx_neural_rendering.cpp:355-358); here the
-		// UNORDERED_ACCESS -> NON_PIXEL_SHADER_RESOURCE transition IS the write-completion barrier,
-		// and it also puts the proxy in the state NGX reads Color in.
-		cmd->barrier(st->proxy_tex, resource_usage::unordered_access, resource_usage::shader_resource_non_pixel);
-		proxy_in_srv  = true;
+		nr_codec_encode(cmd, *st, st->orig_srv, proxy_scale, proxy_in_srv);
 		codec_encoded = true;
 	}
 
 	// ---- stage 2 of 3: the NGX evaluate ---------------------------------------------------------
 	if (nr_ensure_feature(*st, d3d12_cmd, st->out_w, st->out_h))
 	{
-		ngx::parameter_block *p = st->params;
-
-		// Process-lifetime, not stack buffers: Set takes the name as a bare const char* and
-		// nothing in the ABI promises the callee copies it before returning.
-		static const ngx::resource_param_names s_colour(ngx::kParamColor);
-		static const ngx::resource_param_names s_depth(ngx::kParamDepth);
-		static const ngx::resource_param_names s_mvec(ngx::kParamMVec);
-		static const ngx::resource_param_names s_output(ngx::kParamOutput);
-		static const ngx::resource_param_names s_mask(ngx::kParamControlMask);
-
 		// The snippet is fed the PROXY, not the raw TAA output: it is a display-referred image
 		// network and the TAA output is unbounded linear radiance at this point in the frame.
 		// (rtx_neural_rendering.cpp:289-292 makes exactly this substitution.) The proxy is at the
@@ -4459,31 +5093,6 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 		const uint32_t mvec_w   = mvec_used ? st->out_w : velocity.w;
 		const uint32_t mvec_h   = mvec_used ? st->out_h : velocity.h;
 		auto *const output_res  = reinterpret_cast<ID3D12Resource *>(st->out_tex.handle);
-
-		nr_set_resource(p, s_colour, colour_res, taa_out.w, taa_out.h);
-		nr_set_resource(p, s_depth,  depth_res,  depth.w,   depth.h);
-		nr_set_resource(p, s_mvec,   mvec_res,   mvec_w,    mvec_h);
-		nr_set_resource(p, s_output, output_res, st->out_w, st->out_h);
-		// Written EVERY frame even though this add-on never binds one - see nr_clear_resource.
-		nr_clear_resource(p, s_mask);
-
-		// The guide grid moved under a history accumulated against the old one. Nothing else
-		// notices, so force one reset frame.
-		//
-		// THE RESOURCE IS PART OF THE KEY, not just the extent. The fallback ladder can swap
-		// DLSSNR.MVec between our decoded texture and the game's raw velocity mid-run, and in
-		// STRAY both are 1920x1080 - so an extent-only test would see NO change while the guide's
-		// UNITS changed from absolute pixels to encoded unorm. That is precisely the case that
-		// needs a reset, and it is the one an extent-only latch cannot see.
-		const uint64_t mvec_res_key = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mvec_res));
-		if (st->guide_w != mvec_w || st->guide_h != mvec_h || st->mvec_bound_res != mvec_res_key)
-		{
-			if (st->guide_w != 0 || st->guide_h != 0)
-				st->need_reset = true;   // a first frame is initialisation, not a reset
-			st->guide_w = mvec_w;
-			st->guide_h = mvec_h;
-			st->mvec_bound_res = mvec_res_key;
-		}
 
 		// MVecScaleX/Y.
 		//
@@ -4513,41 +5122,22 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 		const float scale_x = (g_cfg.mvec_scale_x != 0.0f) ? g_cfg.mvec_scale_x : derived_x;
 		const float scale_y = (g_cfg.mvec_scale_y != 0.0f) ? g_cfg.mvec_scale_y : derived_y;
 
-		ngx::set_u32(p, ngx::kParamEnabled,       1u);
-		ngx::set_u32(p, ngx::kParamReset,         st->need_reset ? 1u : 0u);
-		ngx::set_u32(p, ngx::kParamDepthInverted, g_cfg.depth_inverted ? 1u : 0u);
-		ngx::set_f32(p, ngx::kParamMVecScaleX,    scale_x);
-		ngx::set_f32(p, ngx::kParamMVecScaleY,    scale_y);
-		// Gates BOTH structure strengths. Binding a ControlMask would force it to 0 inside the
-		// snippet; this add-on binds none, so the two never conflict.
-		ngx::set_u32(p, ngx::kParamUseAutoMask,   g_cfg.use_auto_mask ? 1u : 0u);
 
-		ngx::set_f32(p, ngx::kParamIntensity,              g_cfg.intensity);
-		ngx::set_f32(p, ngx::kParamLocalToneStrength,      g_cfg.local_tone_strength);
-		ngx::set_f32(p, ngx::kParamLocalStructureStrength, g_cfg.local_structure_strength);
-		// Negative means "inherit LocalStructureStrength". 0.0 is NOT neutral.
-		ngx::set_f32(p, ngx::kParamSkinStructureStrength,  g_cfg.skin_structure_strength);
-		ngx::set_u32(p, ngx::kParamStyle,                  g_cfg.style);
-		// ---- BEGIN overlay_ui hook ----
-		// The overlay's "NR UI Correction" checkbox. Per-evaluate, exactly like Style, and NOT
-		// baked at create time - and st->params is the SAME parameter block nr_ensure_feature
-		// writes into, so a later CreateFeature sees it as well. DLSSNR.UICorrection is a real
-		// parameter of THIS snippet build: exactly one exact-line match in nvngx_dlssnr.dll's
-		// string table, against ZERO for DLSSNR.Upscaling. Without this write the checkbox would
-		// be a control that does nothing - the user would A/B it, see no change, and record a
-		// false negative. Default 0, which is also the snippet's own fallback, so an untouched
-		// install is bit-identical to one without this line.
-		ngx::set_u32(p, ngx::kParamUICorrection,           g_cfg.ui_correction);
+		nr_eval_args ea_nr;
+		ea_nr.color  = colour_res;  ea_nr.color_w = st->out_w;  ea_nr.color_h = st->out_h;
+		ea_nr.depth  = depth_res;   ea_nr.depth_w = depth.w;    ea_nr.depth_h = depth.h;
+		ea_nr.mvec   = mvec_res;    ea_nr.mvec_w  = mvec_w;     ea_nr.mvec_h  = mvec_h;
+		ea_nr.output = output_res;  ea_nr.out_w   = st->out_w;  ea_nr.out_h   = st->out_h;
+		ea_nr.scale_x = scale_x;    ea_nr.scale_y = scale_y;
 
-		// PARITY. renodx writes both indicator-axis keys = 0 [BIN 0x180014adb / 0x180014aee] and
-		// both strings exist in the snippet. These condition the NGX debug indicator overlay,
-		// which is registry-armed and off by default, so this is purely defensive: it stops the
-		// snippet reading an absent key if the indicator is ever enabled on this machine.
-		ngx::set_u32(p, ngx::kParamIndicatorInvertX, 0u);
-		ngx::set_u32(p, ngx::kParamIndicatorInvertY, 0u);
-		// ---- END overlay_ui hook ----
-
-		const ngx::Result r = g_snippet.evaluate_feature(d3d12_cmd, st->feature, p, nullptr);
+		// THE COLOUR RECT IS st->out_w/out_h, NOT taa_out.w/h. On this path the two are equal by
+		// construction - nr_ensure_output was called with taa_out.w/h a few lines above and returns
+		// false unless they match what out_tex was created at - so this is a provable no-op here.
+		// It is not a no-op in chain mode, where out_tex is at the RENDER extent while taa_out is
+		// the 4K output UAV, and getting it wrong there is either a rejected evaluate (the snippet
+		// checks Color against Output) or a silent 2x-per-axis scale error.
+		bool nr_reset_sent = false;
+		const ngx::Result r = nr_evaluate(*st, d3d12_cmd, ea_nr, nr_reset_sent);
 
 		// ---- BEGIN overlay_ui hook ----
 		// Everything the overlay's status block needs, published as relaxed atomics that flow ONE way
@@ -4719,50 +5309,8 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	// one left there, and adding that as a residual would be worse than doing nothing.
 	if (codec_encoded && evaluated)
 	{
-		// NGX wrote out_tex OUTSIDE anything that tracks it, so nothing knows the decode's read of
-		// it has to wait. This transition is that dependency, and it is also what makes the
-		// texture readable as an SRV. (rtx_neural_rendering.cpp:408-441 records the same two
-		// hazards in Vulkan terms.)
-		cmd->barrier(st->out_tex, resource_usage::unordered_access, resource_usage::shader_resource_non_pixel);
-		out_in_srv = true;
-
-		// The cache sync again, and this is the call whose absence is a device removal: NGX has
-		// just rebound the descriptor heaps and the compute root signature on the RAW list, and
-		// ReShade's cache still names ours from the encode above.
-		cmd->bind_descriptor_tables(shader_stage::all_compute, st->codec.decode_layout, 0, 0, nullptr);
-		cmd->bind_pipeline(pipeline_stage::all_compute, st->codec.decode_pso);
-
-		// t0 original, t1 proxy, t2 neural - one contiguous table, in declaration order.
-		const resource_view decode_srvs[3] = { st->orig_srv, st->proxy_srv, st->out_srv };
-		descriptor_table_update srv_up = {};
-		srv_up.binding = 0; srv_up.array_offset = 0; srv_up.count = 3;
-		srv_up.type = descriptor_type::shader_resource_view;
-		srv_up.descriptors = decode_srvs;
-		cmd->push_descriptors(shader_stage::compute, st->codec.decode_layout, hdr_codec::kParamSrvTable, srv_up);
-
-		descriptor_table_update uav_up = {};
-		uav_up.binding = 0; uav_up.array_offset = 0; uav_up.count = 1;
-		uav_up.type = descriptor_type::unordered_access_view;
-		uav_up.descriptors = &st->result_uav;
-		cmd->push_descriptors(shader_stage::compute, st->codec.decode_layout, hdr_codec::kParamUavTable, uav_up);
-
-		hdr_codec::decode_args da;
-		da.width = st->out_w; da.height = st->out_h;
-		// The IDENTICAL scale the encode used, from the same CPU float in the same frame.
-		da.proxy_scale = proxy_scale;
-		// Clamped on the CPU, exactly as Remix does (rtx_neural_rendering.cpp:525-526); the shader
-		// does not re-clamp them.
-		da.transfer_strength = transfer_strength;
-		da.color_strength    = color_strength;
-		// The ONLY thing that selects the renodx graft. It reaches the shader here and nowhere
-		// else: no pipeline is rebuilt, no feature is recreated, and there is no second code path
-		// that could be left uncalled - if this dispatch runs at all, the mode is in effect.
-		da.graft_mode        = graft_mode;
-		da.pad1 = da.pad2 = 0;
-		cmd->push_constants(shader_stage::compute, st->codec.decode_layout, hdr_codec::kParamConstants,
-		                    0, hdr_codec::kDecodeConstantCount, &da);
-
-		cmd->dispatch(hdr_codec::group_count(st->out_w), hdr_codec::group_count(st->out_h), 1);
+		nr_codec_decode(cmd, *st, st->orig_srv, proxy_scale, transfer_strength,
+		                color_strength, graft_mode, out_in_srv);
 
 		codec_used = true;
 	}
@@ -5035,16 +5583,18 @@ static void nr_init_device(device *dev)
 	// A SECOND snippet, through the trampoline's SLOT B. Loaded here on the MAIN THREAD for
 	// exactly the reason the DLSS-NR one is: LoadLibraryW of a 59 MB DLL must never happen on a
 	// command-list recording thread. Every call INTO it is still deferred to the first dispatch.
+	// dlss_chain needs this module just as much as dlss_sr does - it is the SECOND network in the
+	// chain - so the load gate is the OR of the two. With both 0, nothing here runs.
 	static bool s_sr_snippet_tried = false;
-	if (g_cfg.dlss_sr && !s_sr_snippet_tried)
+	if ((g_cfg.dlss_sr || g_cfg.dlss_chain) && !s_sr_snippet_tried)
 	{
 		s_sr_snippet_tried = true;
 		if (!ngx::load_snippet(g_sr_snippet, dir, ngx::spec_dlsssr(), g_cfg.require_trampoline))
 		{
 			LOGE("DLSS-SR not available: %s", g_sr_snippet.not_available_reason.c_str());
-			LOGE("DLSS-SR: dlss_sr=1 was asked for and cannot be honoured. The game renders "
-			     "exactly as it would with the add-on unloaded (or with DLSS-NR alone, if "
-			     "dlss_nr=1).");
+			LOGE("%s was asked for and cannot be honoured. The game renders exactly as it would "
+			     "with the add-on unloaded (or with DLSS-NR alone, if dlss_nr=1).",
+			     g_cfg.dlss_chain ? "dlss_chain=1 (which needs BOTH snippets)" : "dlss_sr=1");
 		}
 		else
 		{
@@ -5146,10 +5696,10 @@ static bool nr_lazy_ngx_init(device *dev)
 	// the build before SR existed" has to be true as stated, not nearly true. The exit is taken
 	// whenever DLSS-SR is not going to arm either; the mvec block below must stay reachable when
 	// it IS, because the two features share that one pipeline.
-	const bool sr_will_try = g_cfg.dlss_sr && g_sr_snippet.available;
+	const bool sr_will_try = (g_cfg.dlss_sr || g_cfg.dlss_chain) && g_sr_snippet.available;
 	if (!nr_ok && !sr_will_try)
 	{
-		if (g_cfg.dlss_sr)
+		if (g_cfg.dlss_sr || g_cfg.dlss_chain)
 			LOGE("DLSS-SR: dlss_sr=1 but nvngx_dlss.dll never loaded (the reason is above), so "
 			     "there is nothing to initialise. Neither feature is armed and the game renders "
 			     "exactly as it does with the add-on unloaded.");
@@ -5228,7 +5778,7 @@ static bool nr_lazy_ngx_init(device *dev)
 	// The pipeline is SHARED: DLSS-NR writes into its own colour-grid target and DLSS-SR into its
 	// own render-grid one, but the root signature, the PSO and the DXBC are one set. Built when
 	// EITHER feature wants it.
-	if (g_cfg.mvec_decode || (g_cfg.dlss_sr && g_cfg.sr_mvec_decode))
+	if (g_cfg.mvec_decode || ((g_cfg.dlss_sr || g_cfg.dlss_chain) && g_cfg.sr_mvec_decode))
 	{
 		static std::vector<uint8_t> s_mvec_dxbc;   // process-wide: the source never changes
 		static bool                 s_mvec_tried = false;
@@ -5283,7 +5833,7 @@ static bool nr_lazy_ngx_init(device *dev)
 	// through the trampoline's slot B - which is what nvngx_dlss.dll's caller check sees.
 	// =========================================================================================
 	bool sr_ok = false;
-	if (g_cfg.dlss_sr && g_sr_snippet.available)
+	if ((g_cfg.dlss_sr || g_cfg.dlss_chain) && g_sr_snippet.available)
 	{
 		const ngx::Result r = g_sr_snippet.init_ext(g_cfg.app_id, dir.c_str(), st->d3d12,
 		                                            ngx::kVersionApi, nullptr);
@@ -5382,6 +5932,12 @@ static bool nr_lazy_ngx_init(device *dev)
 		     g_cfg.sr_group_tile);
 		LOGI("  ladder          sr_suppress_taa=%d sr_direct_output=%d sr_copy_back=%d",
 		     (int)g_cfg.sr_suppress_taa, (int)g_cfg.sr_direct_output, (int)g_cfg.sr_copy_back);
+		if (g_cfg.dlss_chain)
+			LOGI("  CHAIN MODE      dlss_chain=1: DLSS-NR runs FIRST, at the render extent, and its "
+			     "denoised result becomes this feature's COLOUR INPUT. DLSS-NR is %s. The chain is "
+			     "only entered when BOTH are armed; the line that proves it ran is "
+			     "\"DLSS-CHAIN: CHAINED EVALUATE #1 OK\" and the census's chained= counter.",
+			     (st->params != nullptr) ? "ARMED" : "NOT ARMED, so the chain will NOT run");
 		LOGI("  create          PerfQualityValue=%s DLSS.Use.HW.Depth=%d Create.Flags=0x%02x "
 		     "[IsHDR=%d MVLowRes=%d MVJittered=%d DepthInverted=%d AutoExposure=%d AlphaUpscaling=%d]",
 		     dlss_sr::perf_quality_name(g_cfg.sr_perf_quality), (int)g_cfg.sr_hw_depth,
@@ -5412,10 +5968,11 @@ static bool nr_lazy_ngx_init(device *dev)
 		     "an error.");
 		LOGI("==================================================================");
 	}
-	else if (g_cfg.dlss_sr)
+	else if (g_cfg.dlss_sr || g_cfg.dlss_chain)
 	{
-		LOGE("DLSS-SR: dlss_sr=1 but the feature could NOT be armed (see above). The SR pass will "
-		     "not run and the game's own TAA is untouched.");
+		LOGE("DLSS-SR: %s but the feature could NOT be armed (see above). The SR pass will not run "
+		     "and the game's own TAA is untouched.",
+		     g_cfg.dlss_chain ? "dlss_chain=1" : "dlss_sr=1");
 	}
 
 	if (!nr_ok)
@@ -5772,6 +6329,7 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 		const uint64_t nr_mvec_reuse   = (nst != nullptr) ? nst->mvec_cb_reuse.load(std::memory_order_relaxed) : 0;
 		const uint32_t nr_mvec_mode    = (nst != nullptr) ? nst->census_mvec_mode.load(std::memory_order_relaxed) : 0;
 		const uint64_t sr_evals        = (nst != nullptr) ? nst->sr_evaluates.load(std::memory_order_relaxed) : 0;
+		const uint64_t chain_evals     = (nst != nullptr) ? nst->chain_evaluates.load(std::memory_order_relaxed) : 0;
 		const uint64_t sr_suppressed   = (nst != nullptr) ? nst->sr_suppressed.load(std::memory_order_relaxed) : 0;
 		const uint64_t sr_mvec         = (nst != nullptr) ? nst->sr_mvec_frames.load(std::memory_order_relaxed) : 0;
 		const uint32_t sr_rw           = (nst != nullptr) ? nst->sr_census_render_w.load(std::memory_order_relaxed) : 0;
@@ -5838,7 +6396,7 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 		// evidence the feature RAN. A zero with dlss_sr=1 means the pass never reached the
 		// evaluate - and the one-shot "DLSS-SR: pass did not run - <reason>" line above names the
 		// stage that refused.
-		if (g_cfg.dlss_sr)
+		if (g_cfg.dlss_sr || g_cfg.dlss_chain)
 			LOGI("--- DLSS-SR @ frame %llu: evaluates=%llu suppressed_dispatches=%llu "
 			     "mvec_decodes=%llu geometry=%ux%u -> %ux%u (armed=%d suppress=%d direct=%d "
 			     "copy_back=%d)",
@@ -5847,6 +6405,16 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 			     sr_rw, sr_rh, sr_ow, sr_oh,
 			     (int)g_sr_armed.load(std::memory_order_relaxed),
 			     (int)g_cfg.sr_suppress_taa, (int)g_cfg.sr_direct_output, (int)g_cfg.sr_copy_back);
+		// THE CHAIN'S PROOF-OF-LIFE LINE. chained= is incremented on the ONE branch where BOTH
+		// EvaluateFeature calls returned Success on the same dispatch, so a non-zero value is
+		// evidence the chain RAN. Zero with dlss_chain=1 means it did not, and one of the
+		// one-shot "DLSS-CHAIN: ..." lines above names the stage that refused.
+		if (g_cfg.dlss_chain)
+			LOGI("--- DLSS-CHAIN @ frame %llu: chained=%llu (of %llu DLSS-SR evaluates) sr_armed=%d",
+			     (unsigned long long)g.frame, (unsigned long long)chain_evals,
+			     (unsigned long long)sr_evals,
+			     (int)g_sr_armed.load(std::memory_order_relaxed));
+
 		// `dxil=` COUNTS PIXEL AND COMPUTE SHADERS ONLY. on_init_pipeline's loop skips every
 		// sub-object that is not a PS or a CS, so a DXIL ray tracing library can never reach it
 		// and dxil=0 has never meant "no ray tracing". The rt= field says which it is, so the

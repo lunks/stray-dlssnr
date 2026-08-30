@@ -2,7 +2,7 @@ name: build
 
 on:
   push:
-    branches: [ main, dlss-sr ]
+    branches: [ main, dlss-sr, nr-sr-chain ]
     tags: [ 'v*' ]
   pull_request:
   workflow_dispatch:

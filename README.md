@@ -9,6 +9,10 @@ game — and extended with UAV resolution, a D3D12 state save/restore, and the N
 
 ## What changed in this revision
 
+**Newest: chain mode** (`dlss_chain`, default `0`) — DLSS-NR **and** DLSS-SR on one accepted TAA
+dispatch, denoise first and upscale second, instead of the two features being mutually exclusive.
+See **§6c**. With the key at `0` the build behaves exactly as it did before it existed.
+
 The pass itself — identification, SRV/UAV resolution, RS 1.1 handling, `capture_state` /
 `restore_state`, the re-issued game dispatch — is **untouched**. Two targeted additions sit on top
 of it, and each has its own ini switch so it can be A/B'd on hardware.
@@ -1155,6 +1159,161 @@ never called. The SR path is instrumented so that cannot happen quietly:
   disagree with it.
 
 Success is never reported from the absence of an error.
+
+---
+
+## 6c. Chain mode — `dlss_chain`, default `0`
+
+`dlss_sr = 1` and `dlss_nr = 1` do **not** give you both features. Both want the same accepted TAA
+compute dispatch, and whoever takes it owns the frame — which, before this revision, was DLSS-SR,
+unconditionally. That was an implementation choice, not a limitation: both snippets already load
+side by side through the trampoline's two slots, DLSS-NR already evaluates into its **own** texture
+rather than writing the frame, and DLSS-SR's colour input is a parameter. `dlss_chain = 1` wires
+the one to the other.
+
+### The order, and why it is that way round
+
+```
+game TAA dispatch (suppressed)
+  -> [codec encode]   1920x1080 linear HDR -> display-referred proxy
+  -> DLSS-NR evaluate proxy -> out_tex, at the RENDER extent
+  -> [codec decode]   the denoised answer grafted back onto the linear original
+  -> DLSS-SR evaluate COLOUR = that denoised 1920x1080 image -> u0 at 3840x2160
+  -> one state restore
+```
+
+**Denoise first, then upscale.** Upscaling noise is precisely what you do not want, and it is what
+DLSS-NR alone does in an upsampling configuration: it denoises at one resolution and a spatial
+filter with no temporal information then magnifies whatever is left.
+
+Both evaluates run between **one** `probe::capture_state` and **one** `probe::restore_state`, on
+the raw command list, with the descriptor-heap cache re-synced between them — that sync is the call
+whose absence is a device removal, not an artefact.
+
+### What DLSS-SR actually receives
+
+`st.result_tex`: **linear HDR** at the render extent, in the colour SRV's own format — the
+untouched original plus the network's additive residual. Never the display-referred proxy, which
+exists only between the encode's barrier and the restore and is read by nothing but the DLSS-NR
+evaluate and the decode.
+
+`hdr_codec.hpp`'s identity property is unchanged by chaining: the proof is algebraic in exactly
+three things — the original, `InProxy`'s bits and `InNeural`'s bits — and never mentions the TAA
+output. Chain mode changes only *which resource supplies the original*: the game's own `t5`
+descriptor instead of a copy. So the property still holds, and it yields a stronger on-hardware
+check than the DLSS-NR one:
+
+> **`transfer_strength = 0` in chain mode must be pixel-identical to `dlss_chain=0` / `dlss_sr=1`
+> at the same ini.** At 0 the decode is `result = lerp(original, graded, 0) = original`, exactly,
+> so DLSS-SR is handed the same `t5` bits it is handed today. That single A/B validates the
+> geometry move, the encode, the DLSS-NR evaluate, the decode, the extra barrier and the shared
+> motion guide — independently of image quality.
+
+With `hdr_codec = 0` chain mode feeds DLSS-SR the network's **raw display-referred** answer as if
+it were linear HDR: gap 1 propagated *through* the upscaler rather than merely present in the
+frame. The add-on says so once and runs anyway.
+
+### The geometry move, which is the idea the whole thing rests on
+
+In `MainUpsampling` there is no resolved image at the render resolution anywhere in the frame — the
+TAA pass's output is already 4K. So chained, **DLSS-NR denoises the TAA pass's *input*** (`t5`,
+render resolution), not its output. One call — `nr_ensure_output(colour.w, colour.h, colour.fmt)` —
+moves every downstream DLSS-NR site together: the codec's dispatch domain, the proxy, the result,
+the `Color` and `Output` rects, and the motion guide's extent.
+
+That last one matters. DLSS-NR's guide is prepared at its **output** extent and DLSS-SR's at the
+**render** extent, so they do **not** coincide by default; they coincide here *because* the
+geometry moved. Had `nr_ensure_output` been left on the TAA output, DLSS-NR would have read a
+3840x2160 guide while DLSS-SR read a 1920x1080 one — a silent 2x-per-axis error. One
+`mvec_decode` dispatch therefore serves both networks, with `MVecScaleX/Y` and `MV.Scale.X/Y` all
+forced to exactly 1.0.
+
+### What does *not* happen in chain mode
+
+* **The DLSS-NR copy-back does not run, and must not.** Its result is at the render extent and
+  `u0` is at the output extent, and a full-subresource `CopyTextureRegion` between mismatched
+  extents is *invalid usage*, not an error return. `copy_back = 1` is ignored and the log says so.
+* **`history_restore` is inert**, because it is gated on `copy_back` and exists to undo a write
+  chain mode never makes. No pristine copy is taken; the `original` is read straight from the
+  game's own `t5` SRV, borrowed for the event and never stored — the same borrow the motion-vector
+  decode already makes of the game's velocity and depth descriptors.
+* The only write to `u0` is DLSS-SR's (`sr_direct_output = 1`), or its copy-back
+  (`sr_direct_output = 0, sr_copy_back = 1`).
+
+### The fallback ladder — every rung, and what is on screen
+
+| rung | condition | on screen |
+|---|---|---|
+| 1 | `dlss_chain = 0` | today's build, exactly |
+| 2 | one snippet absent / not armed | one named refusal, then the single feature that *did* arm |
+| 3 | not an upsampling dispatch | one named refusal with the Engine.ini block; DLSS-SR alone if `dlss_sr=1`, else DLSS-NR alone |
+| 4 | DLSS-NR textures unavailable at the render extent | **DLSS-SR alone** — a correct upscaled 4K frame, not denoised |
+| 5 | DLSS-NR `CreateFeature`/`EvaluateFeature` fails | **DLSS-SR alone**; latched off after 8 consecutive failures |
+| 6 | DLSS-SR fails, DLSS-NR fine | the game's own TAAU at 4K. DLSS-NR's evaluate for that frame is **discarded** — one wasted evaluate, a correct frame |
+| 7 | jitter unreadable, geometry latch, SR latched off | the game's own TAAU at 4K |
+| 8 | an exception in the owned window | the game's own TAAU at 4K; the restore still runs |
+
+Rungs 6 and 7 are the two places chain mode is **strictly worse than DLSS-NR alone**: there is no
+legal destination for a 1920x1080 denoise when `u0` is 3840x2160, so "DLSS-NR alone" is not an
+available fallback and the honest answer is the game's own TAAU. Ownership is reported only after
+DLSS-SR succeeded *and* the state restore completed, so none of these can produce a black or stale
+frame.
+
+### Configuration
+
+`Engine.ini` — identical to the DLSS-SR block, chain mode adds no new CVar:
+
+```ini
+[SystemSettings]
+r.TemporalAA.Upsampling=1
+r.SecondaryScreenPercentage=100
+r.ScreenPercentage=50
+```
+
+`stray_dlssnr.ini`:
+
+```ini
+dlss_chain      = 1
+dlss_nr         = 1        ; both snippets must load
+dlss_sr         = 0        ; chain is its own branch; leave this off
+hdr_codec       = 1        ; effectively mandatory - see above
+sr_shader_hash  = 0x....   ; the MainUpsampling permutation's hash, RE-PINNED
+sr_mvec_decode  = 1
+sr_suppress_taa = 0        ; raise to 1 only after the chain is running
+sr_direct_output= 0
+sr_copy_back    = 1
+```
+
+`r.TemporalAA.Upsampling` changes `TAA_PASS_CONFIG`, which is a `#define`, so the DXBC and the
+`fnv1a64` change with it. The pinned `shader_hash` for the `Main` permutation **stops matching**,
+and the only symptom would be `DLSS-NR: pass did not run - this dispatch is not the target shader`.
+`dlss_chain` therefore selects `sr_shader_hash` exactly as `dlss_sr` does, and `shader_hash` keeps
+DLSS-NR's own pin so the two can still be A/B'd on one install.
+
+### Proving it ran
+
+* `DLSS-CHAIN: CHAINED EVALUATE #1 OK - BOTH networks ran on ONE accepted dispatch.` — printed
+  from inside DLSS-SR's success branch **and** guarded on the DLSS-NR half having returned
+  `Success` on the same dispatch. It names both evaluates, both resources and both `Reset` values.
+* `--- DLSS-CHAIN @ frame N: chained=... (of ... DLSS-SR evaluates) sr_armed=1` in the periodic
+  census. `chained` is incremented on that one branch and nowhere else. **If it is zero, the chain
+  did not run, whatever else the log says.**
+* every refusal names itself once: `DLSS-CHAIN: <what and why>`.
+
+### Known unknowns, stated
+
+Chained, DLSS-NR is handed the **pre-TAA, jittered, single-sample** render-resolution scene colour,
+not the TAA-resolved image it has been run on to date. The snippet has no jitter parameter at all,
+so it reads sub-pixel jitter as motion or noise; its own temporal history plus the motion guide
+plus `Reset` is what stands against that. This is unavoidable in this ordering — in
+`MainUpsampling` there is no un-jittered image at the render resolution — and it cannot be settled
+by inspection. An A/B against `r.TemporalAASamples=1` is the cheapest probe. If DLSS-NR turns out
+to need a resolved image, the chain is mis-ordered and the answer is not a tuning change.
+
+Separately: if the colour texture is *wider than the view rect* (`QuantizeSceneBufferSize` rounds
+to a multiple of 4, e.g. 1932 vs 1930), the encode reads those uninitialised columns and the
+network's receptive field can bleed them inward. At `r.ScreenPercentage=50` into 3840x2160 the two
+are exactly equal and this does not arise; at 58.8% it does, and nothing detects it.
 
 ---
 
