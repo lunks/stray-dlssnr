@@ -189,6 +189,14 @@ static constexpr const char *kParamLocalToneStrength      = "DLSSNR.LocalToneStr
 static constexpr const char *kParamLocalStructureStrength = "DLSSNR.LocalStructureStrength";
 static constexpr const char *kParamSkinStructureStrength  = "DLSSNR.SkinStructureStrength";
 static constexpr const char *kParamStyle                  = "DLSSNR.Style";
+// ---- BEGIN overlay_ui hook ----
+// REAL in this snippet build, unlike DLSSNR.Upscaling: the exact string is in nvngx_dlssnr.dll's
+// table (measured), and the snippet reads it as Get(const char *, int *) into its feature state
+// with a proper `cmp eax,0xbad00000` guard and a fallback of 0. Written with set_u32; the
+// parameter block converts between the numeric Set/Get overloads, so an unsigned Set is readable
+// by the snippet's signed Get. Its VISUAL effect on this content is unverified - see overlay_ui.
+static constexpr const char *kParamUICorrection           = "DLSSNR.UICorrection";
+// ---- END overlay_ui hook ----
 
 // Generic NGX, nvsdk_ngx_defs.h:709-710, 758.
 static constexpr const char *kParamCreationNodeMask       = "CreationNodeMask";

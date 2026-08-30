@@ -349,6 +349,73 @@ jobs:
               abi/overlay_calls_probe.cpp -o overlay_probe_mingw.dll
 
       # -----------------------------------------------------------------------------------------
+      # THE OVERLAY ITSELF, compiled and LINKED under both toolchains, GATING.
+      #
+      # The add-on build already compiles src/overlay_ui.hpp - but the mingw add-on job is
+      # continue-on-error, and mingw is the toolchain of the binary on the user's machine TODAY.
+      # A break in the overlay under mingw would therefore be non-gating there. It is gating here.
+      # -----------------------------------------------------------------------------------------
+      - name: Overlay compiles and links (MSVC)
+        shell: cmd
+        run: |
+          cl /nologo /std:c++17 /EHsc /O2 /MT /W3 /LD ^
+             /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+             /I include ^
+             abi\overlay_ui_probe.cpp /Fe:overlay_ui_msvc.dll
+          if errorlevel 1 exit /b 1
+
+      - name: Overlay compiles and links (mingw-w64)
+        shell: bash
+        run: |
+          export PATH="/c/mingw64/bin:$PATH"
+          g++ -std=gnu++17 -O2 -shared -static -static-libgcc -static-libstdc++ \
+              -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -DNOMINMAX -DNDEBUG \
+              -Wall -Wextra -Wno-attributes -Wno-unknown-pragmas -Wno-unused-parameter \
+              -I include \
+              abi/overlay_ui_probe.cpp -o overlay_ui_mingw.dll
+
+      # -----------------------------------------------------------------------------------------
+      # The overlay runs on the PRESENT thread. nr_try_run takes st->mutex and then g.mutex
+      # (stray_dlssnr.cpp:2193, :2198), and on_present already reads the DLSS-NR counters as
+      # atomics rather than locking, specifically to avoid inverting that order - the AB/BA
+      # deadlock is spelled out at :1505-1508. A lock anywhere in the overlay would join that
+      # ordering graph, and it would also block Present behind CreateFeature's network-weight
+      # upload. Separately, ngx::store mutates a std::unordered_map the SNIPPET also calls into,
+      # so pushing a slider value straight at NGX from this thread is heap corruption.
+      #
+      # Both are design invariants that a future edit could break without any symptom in CI. This
+      # is the cheapest gate that notices.
+      # -----------------------------------------------------------------------------------------
+      - name: The overlay must not lock, and must not write NGX parameters
+        shell: pwsh
+        run: |
+          $banned = @(
+            @{ p = 'std::mutex';        why = 'the overlay must hold no lock: it runs on the present thread and nr_try_run takes st->mutex then g.mutex' },
+            @{ p = 'std::lock_guard';   why = 'same - see the AB/BA deadlock note at stray_dlssnr.cpp:1505-1508' },
+            @{ p = 'std::unique_lock';  why = 'same' },
+            @{ p = 'std::scoped_lock';  why = 'same' },
+            @{ p = 'ngx::set_';         why = 'NGX parameters are written only on the render thread; ngx::store mutates a map the snippet also calls into' },
+            @{ p = 'ngx::store';        why = 'same' },
+            @{ p = 'pd_get';            why = 'the overlay must not reach into nr_state; everything it needs is published as an atomic' },
+            @{ p = 'kNrStateGuid';      why = 'same' }
+          )
+          $hits = @()
+          $n = 0
+          foreach ($line in Get-Content src/overlay_ui.hpp) {
+            $n++
+            if ($line -match '^\s*//') { continue }
+            foreach ($b in $banned) {
+              if ($line -match [regex]::Escape($b.p)) { $hits += ("src/overlay_ui.hpp:${n}: " + $b.p + "  --  " + $b.why) }
+            }
+          }
+          if ($hits.Count) {
+            Write-Host "::error::src/overlay_ui.hpp broke one of the overlay's concurrency invariants."
+            $hits | ForEach-Object { Write-Host "  $_" }
+            throw "overlay concurrency invariant violated"
+          }
+          Write-Host "  OK  the overlay takes no lock, touches no nr_state and writes no NGX parameter"
+
+      # -----------------------------------------------------------------------------------------
       # The gate that actually protects the shipped binary. The probe above proves WHICH calls are
       # unsafe; this proves the add-on does not make them. Fourteen table entries return ImVec2 by
       # value and are unusable from a mingw build. ColorConvertU32ToFloat4 is deliberately NOT on
