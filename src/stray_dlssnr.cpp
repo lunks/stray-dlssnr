@@ -2829,8 +2829,10 @@ static void nr_ensure_aux(device *dev, nr_state &st)
 		LOGW("DLSS-NR: the neural target is %s but the proxy is r16g16b16a16_float. InProxy and "
 		     "InNeural therefore CANNOT hold identical bit patterns, so the decode's residual "
 		     "carries a per-pixel quantisation floor and the identity is NOT exact. This should "
-		     "be impossible - nr_ensure_output forces r16g16b16a16_float whenever the codec is "
-		     "on.", probe::format_name(st.neural_fmt));
+		     "be the deliberate neural_format override (1 = r10g10b10a2_unorm, what both "
+		     "reference implementations use; 2 = follow out_fmt). At neural_format=0 it would "
+		     "be impossible, because nr_ensure_output forces r16g16b16a16_float there.",
+		     probe::format_name(st.neural_fmt));
 	}
 }
 
@@ -2924,7 +2926,14 @@ static bool nr_ensure_output(device *dev, nr_state &st, uint32_t w, uint32_t h, 
 	// depth-stencil resource - so it changes nothing about what NGX sees here.
 	// See the header comment: 'fmt' only when out_tex is itself the copy-back source.
 	const bool codec_wanted = g_cfg.hdr_codec && st.codec.ok && !st.codec_failed;
-	const format neural = codec_wanted ? format::r16g16b16a16_float : fmt;
+	// neural_format selects what the codec-on target actually is. See addon_config.hpp: the
+	// historical r16g16b16a16_float is the configuration in which NGX returns Success and writes
+	// NOTHING (measured two ways), while both reference implementations use r10g10b10a2_unorm.
+	const format codec_neural =
+		  (g_cfg.neural_format == 1) ? format::r10g10b10a2_unorm
+		: (g_cfg.neural_format == 2) ? fmt
+		                             : format::r16g16b16a16_float;
+	const format neural = codec_wanted ? codec_neural : fmt;
 
 	const resource_desc desc(
 		w, h, 1, 1,

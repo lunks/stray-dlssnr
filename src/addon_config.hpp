@@ -719,6 +719,24 @@ struct config
 	// rate, which clears Stray's load comfortably.
 	uint32_t nr_probe_warmup = 1800;
 
+	// THE FORMAT OF out_tex (DLSSNR.Output) WHEN THE CODEC IS ON.
+	//
+	// 0 = r16g16b16a16_float, the historical default and what this add-on has always used.
+	// 1 = r10g10b10a2_unorm  - WHAT BOTH KNOWN-WORKING REFERENCE IMPLEMENTATIONS USE.
+	// 2 = follow out_fmt     - whatever the game's own TAA output is (r11g11b10_float here).
+	//
+	// Measured 2026-08-30: with 0, out_tex reads EXACTLY ZERO after a successful
+	// EvaluateFeature, confirmed by two independent read paths (an SRV read after the decode's
+	// barrier and a UAV read before it, in the state NGX wrote it in), on validated gameplay
+	// content, with IN read through the same dispatch returning real scene range. NGX has our
+	// output pointer - the getter trace shows DLSSNR.Output HIT, and the only 4 misses of 44 are
+	// optional void** binds - and still writes nothing.
+	//
+	// Meanwhile renodx-dlss5 logs 'created inline NR resources ... format=24' and DLSS5-Feeder
+	// logs 'output R10G10B10A2_UNORM', and both get a feature that evaluates and produces an
+	// image on this same machine, game and driver. 24 IS r10g10b10a2_unorm.
+	uint32_t neural_format   = 0;
+
 	// =======================================================================================
 	// DLSS SUPER RESOLUTION (NGX feature 1, nvngx_dlss.dll). See STAGING-sr.md.
 	// =======================================================================================
@@ -1109,6 +1127,7 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "nr_probe")                 c.nr_probe = static_cast<uint32_t>(parse_u64(v, c.nr_probe));
 		else if (key == "nr_probe_frames")          c.nr_probe_frames = static_cast<uint32_t>(parse_u64(v, c.nr_probe_frames));
 		else if (key == "nr_probe_warmup")          c.nr_probe_warmup = static_cast<uint32_t>(parse_u64(v, c.nr_probe_warmup));
+		else if (key == "neural_format")            c.neural_format = static_cast<uint32_t>(parse_u64(v, c.neural_format));
 		else if (key == "app_id")                   c.app_id = parse_u64(v, c.app_id);
 		else if (key == "dlss_sr")                  c.dlss_sr = parse_bool(v, c.dlss_sr);
 		else if (key == "dlss_nr")                  c.dlss_nr = parse_bool(v, c.dlss_nr);
