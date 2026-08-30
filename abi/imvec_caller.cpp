@@ -48,6 +48,23 @@ typedef void (*fn_out_vec2)(ImVec2 *);
 // The mistyped view used by the discriminator.
 typedef void (*fn_as_out)(ImVec2 *);
 
+// ---------------------------------------------------------------------------------------------
+// THE RECOVERY THUNK.
+//
+// An MSVC function that returns ImVec2 by value compiles to exactly the code you would emit for
+//     ImVec2 *f(ImVec2 *out)
+// - it takes the destination in RCX and returns it in RAX. Measured, from the callee object:
+//     cb_ret_vec2:  mov dword ptr [rcx],3FC00000h / mov rax,rcx / mov dword ptr [rcx+4],40200000h
+// Both ABIs pass a leading pointer in RCX and return a pointer in RAX, so REDECLARING the table
+// entry in that shape lets a mingw build call it correctly. This is the same manoeuvre
+// src/msvc_abi.hpp performs for ReShade's by-value-returning device virtuals.
+//
+// If a callee ever did return in RAX instead, the pointer we pass in RCX would simply be ignored
+// and the buffer would stay untouched - a FAILED check, not a corrupted one. So these are
+// memory-safe on both toolchains and can gate.
+typedef ImVec2 *(*fn_thunk_ret_vec2)(ImVec2 *);
+typedef ImVec2 *(*fn_thunk_ret_vec2_args)(ImVec2 *, const char *, const char *, bool, float);
+
 static int g_fail = 0;
 static void report(const char *name, bool ok, const char *detail)
 {
@@ -193,6 +210,44 @@ int main(int argc, char **argv)
 		if (f) f(&v);
 		report("out_param_substitute", v.x == ABI_V2_X && v.y == ABI_V2_Y,
 		       "the safe replacement for a by-value return");
+	}
+
+	// -----------------------------------------------------------------------------------------
+	// 2b. The recovery thunk, against the REAL by-value-returning MSVC exports. This is the
+	//     question "are the 14 ImVec2 returns permanently off limits under mingw, or merely
+	//     off limits when called with their DECLARED signature?" Gating on both toolchains.
+	// -----------------------------------------------------------------------------------------
+	{
+		volatile unsigned long long canary[8];
+		for (int i = 0; i < 8; ++i)
+			canary[i] = 0x7A11ED0000000000ULL | (unsigned long long)i;
+
+		// GetCursorScreenPos / GetWindowPos / GetContentRegionAvail / GetItemRectMin ... shape.
+		fn_thunk_ret_vec2 f = (fn_thunk_ret_vec2)p_ret_vec2;
+		ImVec2 v(-1.0f, -1.0f);
+		ImVec2 *ret = f(&v);
+		report("thunk_ret_vec2",
+		       v.x == ABI_V2_X && v.y == ABI_V2_Y && ret == &v,
+		       (v.x == ABI_V2_X && v.y == ABI_V2_Y && ret == &v)
+		           ? "by-value return reached through an out-param redeclaration"
+		           : "thunk did NOT fill the buffer");
+
+		// CalcTextSize shape: four declared args, so the hidden pointer displaces them by one
+		// slot and the trailing float lands on the stack. Worth proving separately.
+		fn_thunk_ret_vec2_args g2 = (fn_thunk_ret_vec2_args)sym("cb_ret_vec2_args");
+		ImVec2 v2(-1.0f, -1.0f);
+		if (g2) {
+			ImVec2 *r2 = g2(&v2, "t", nullptr, false, 1.0f);
+			report("thunk_ret_vec2_args",
+			       v2.x == ABI_V2_X + 1.0f && v2.y == ABI_V2_Y + 1.0f && r2 == &v2,
+			       "CalcTextSize shape through the thunk");
+		}
+
+		bool canary_ok = true;
+		for (int i = 0; i < 8; ++i)
+			if (canary[i] != (0x7A11ED0000000000ULL | (unsigned long long)i))
+				canary_ok = false;
+		report("thunk_stack_canary", canary_ok, canary_ok ? "intact" : "CLOBBERED");
 	}
 
 	// -----------------------------------------------------------------------------------------

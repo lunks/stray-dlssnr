@@ -9,12 +9,13 @@
 // Nothing here is ever executed. It exists so that CI answers "does the whitelist actually exist
 // and is it callable from both compilers" without anyone having to launch the game.
 
-#include <imgui.h>
-
-#include "../src/reshade_compat.hpp"
+#include "../src/overlay_imgui.hpp"
 
 extern "C" __declspec(dllexport) void overlay_whitelist_probe()
 {
+	if (!overlay_imgui::available())
+		return;
+
 	static bool  b     = false;
 	static int   i     = 0;
 	static float f     = 0.0f;
@@ -114,3 +115,22 @@ extern "C" __declspec(dllexport) void overlay_whitelist_probe()
 // Each returns ImVec2 BY VALUE. MSVC returns that in memory (ImVec2 has user-declared
 // constructors, so it is not POD to MSVC); GCC returns it in RAX (it is trivially copyable and 8
 // bytes). Calling one from a mingw build is an 8-byte store through an uninitialised RCX.
+
+extern "C" __declspec(dllexport) bool overlay_bind_probe(HMODULE m)
+{
+	overlay_imgui::textf("%d", 1);
+	overlay_imgui::textf_colored(ImVec4(1, 1, 0, 1), "%s", "warn");
+	return overlay_imgui::bind_table(m);
+}
+
+// The escape hatch, type-checked under both toolchains. Never executed. Its RUNTIME correctness
+// is established separately, against real MSVC by-value exports, by the thunk_ret_vec2 /
+// thunk_ret_vec2_args / thunk_stack_canary cases in abi/imvec_caller.cpp.
+extern "C" __declspec(dllexport) void overlay_thunk_probe()
+{
+	const imgui_function_table *const t = overlay_imgui::table();
+	if (t == nullptr)
+		return;
+	const ImVec2 p = overlay_imgui::by_value_ret(t->GetCursorScreenPos);
+	(void)p;
+}

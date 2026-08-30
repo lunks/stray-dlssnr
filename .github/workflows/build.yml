@@ -273,8 +273,19 @@ jobs:
           if ($vg -eq 'AGREE') {
             Write-Host "::notice::mingw and MSVC agree on the ImVec2 return convention."
           } else {
-            Write-Host "::warning::mingw and MSVC DISAGREE on the ImVec2 return convention. The 15 by-value-returning entries of imgui_function_table_19250 are OFF LIMITS to the add-on while the shipping binary is a mingw build."
+            Write-Host "::warning::mingw and MSVC DISAGREE on the ImVec2 return convention. The 14 ImVec2-returning entries of imgui_function_table_19250 must not be called with their DECLARED signature while the shipping binary is a mingw build."
           }
+
+          # The recovery thunk: same entries, redeclared as ImVec2*(ImVec2*). If this holds on both
+          # toolchains then those 14 are reachable when genuinely needed, rather than lost.
+          $tm = [regex]::Match($msvc,  'thunk_ret_vec2\s+(\w+)').Groups[1].Value
+          $tg = [regex]::Match($mingw, 'thunk_ret_vec2\s+(\w+)').Groups[1].Value
+          Write-Host "Out-param recovery thunk -- MSVC: $tm ; mingw: $tg"
+          if ($tm -ne 'PASS' -or $tg -ne 'PASS') {
+            throw "The out-parameter recovery thunk failed on at least one toolchain. src/overlay_imgui.hpp::by_value_ret documents it as measured-safe; that claim is now false and the header must be corrected."
+          }
+          Write-Host "::notice::by_value_ret() verified on both toolchains: a by-value ImVec2 return can be reached safely through an out-param redeclaration."
+        
 
       # -----------------------------------------------------------------------------------------
       # The whitelist itself, compiled AND LINKED under both toolchains.
@@ -287,6 +298,34 @@ jobs:
       # It also proves include/imgui.h is the right version: reshade_overlay.hpp is wrapped in
       # `#if defined(IMGUI_VERSION_NUM)` and #errors unless it is exactly 19250.
       # -----------------------------------------------------------------------------------------
+      # -----------------------------------------------------------------------------------------
+      # Include order. reshade_overlay.hpp has NO include guard and its body is wrapped in
+      # `#if defined(IMGUI_VERSION_NUM)`; reshade.hpp (#pragma once) includes it. So pulling
+      # reshade_compat.hpp in before <imgui.h> deletes the entire ImGui surface from the
+      # translation unit permanently. src/overlay_imgui.hpp #errors on that. This step proves the
+      # guard still fires - it fails the build if the bad order COMPILES.
+      # -----------------------------------------------------------------------------------------
+      - name: Wrong include order must not compile (MSVC)
+        shell: pwsh
+        run: |
+          cl /nologo /std:c++17 /EHsc /c /W3 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX `
+             /I include abi\include_order_negative.cpp /Fo:ord_msvc.obj 2>&1 | Out-String | Write-Host
+          if ($LASTEXITCODE -eq 0) {
+            throw "include_order_negative.cpp COMPILED. The include-order guard in src/overlay_imgui.hpp is not firing, so a future edit could include reshade_compat.hpp first and silently lose namespace ImGui."
+          }
+          Write-Host "  OK  guard fired, wrong include order rejected"
+
+      - name: Wrong include order must not compile (mingw-w64)
+        shell: bash
+        run: |
+          export PATH="/c/mingw64/bin:$PATH"
+          if g++ -std=gnu++17 -c -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -DNOMINMAX \
+                 -I include abi/include_order_negative.cpp -o ord_mingw.o 2>&1; then
+            echo "::error::include_order_negative.cpp COMPILED under mingw. The include-order guard is not firing."
+            exit 1
+          fi
+          echo "  OK  guard fired, wrong include order rejected"
+
       - name: Whitelist compiles and links (MSVC)
         shell: cmd
         run: |
