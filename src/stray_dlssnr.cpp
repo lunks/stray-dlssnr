@@ -3799,6 +3799,29 @@ static void nr_codec_decode(command_list *cmd, nr_state &st, resource_view origi
 	                    0, hdr_codec::kDecodeConstantCount, &da);
 
 	cmd->dispatch(hdr_codec::group_count(st.out_w), hdr_codec::group_count(st.out_h), 1);
+
+	// ---- THE NR PROBE (nr_probe=1 only; a strict no-op otherwise) ---------------------------
+	//
+	// Placed HERE, and nowhere else, for one reason: at this point BOTH sides of the network
+	// exist in the SAME FRAME and both are already in shader_resource_non_pixel - `original_srv`
+	// is what the network was given, `st.out_srv` is what it returned, and the decode above has
+	// just transitioned out_tex for exactly that read. Measuring them against each other removes
+	// the scene, the camera, the cat and the HDR graft from the comparison in one step, which is
+	// what every screenshot comparison failed to do: a cold relaunch per value moved the cat, and
+	// that scene difference measured LARGER than the effect it was supposed to resolve.
+	//
+	// The probe also DRIVES use_auto_mask / local_structure / skin_structure itself (see
+	// nr_evaluate), holding each setting for nr_probe_frames frames, so every step sees the same
+	// content and repeats its own baseline at the end as a noise floor.
+	if (g_cfg.nr_probe != 0 && st.probe.ready)
+	{
+		nr_probe::frame(cmd->get_device(), cmd, st.probe, st.probe_run,
+		                original_srv, st.out_srv, st.out_w, st.out_h,
+		                g_cfg.nr_probe_frames,
+		                [](const char *fmt, auto... args) {
+			                logf(reshade::log::level::info, fmt, args...);
+		                });
+	}
 }
 
 // --------------------------------------------------------------------------------------------
