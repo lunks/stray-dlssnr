@@ -342,6 +342,51 @@ struct live_block
 	// NGX is armed at all. Off gives the VRAM back; on runs the shipping startup path.
 	std::atomic<bool>     enabled{ true };
 
+	// ---- DLSS SUPER RESOLUTION. WHAT IS LIVE AND WHAT IS NOT, SAID HERE RATHER THAN ONLY IN A
+	// TOOLTIP.
+	//
+	// THE BRANCH IS LIVE, BOTH WAYS. The one decision dlss_sr makes on the render path -
+	// `if (g_cfg.dlss_sr) { sr_try_run(...); return; }` - is taken AFTER begin_pass has run, as is
+	// every g_cfg.sr_* read inside sr_try_run and the output-extent derivation above it. So dlss_sr
+	// rides the per-pass snapshot exactly like copy_back does: unticking it hands the accepted
+	// dispatch back to DLSS-NR on the very next frame, and ticking it sends the dispatch to
+	// sr_try_run on the very next frame.
+	//
+	// THE ARM IS NOT LIVE, AND THE CONTROL SAYS SO IN AS MANY WORDS. Reaching sr_try_run is not the
+	// same as DLSS-SR running. Arming it means a 59 MB LoadLibraryW of nvngx_dlss.dll claiming the
+	// trampoline's SLOT B, and then NVSDK_NGX_D3D12_Init_Ext through that slot from a render thread
+	// with a fully built device - which happens exactly once per process, inside nr_lazy_ngx_init,
+	// on the first accepted dispatch. With dlss_sr=0 in the ini at launch that call was never made,
+	// g_sr_armed is false, and sr_try_run bails on its own second line with "not armed" in the log.
+	// A second Init_Ext later in the session is precisely the unverified action this tree refuses
+	// elsewhere (see require_trampoline and app_id in draw_load_only), and the one measured fact
+	// about Init_Ext's fragility is that it can HANG. So the ON direction is reported as
+	// RELAUNCH REQUIRED by the service, with the reason, instead of being claimed and not done.
+	// The OFF direction is fully live, and it is the direction a user actually reaches for.
+	std::atomic<bool>     dlss_sr{ false };
+	// LAUNCH-TIME BY CONSTRUCTION, and owned anyway. Its only two read sites are the DLSS-NR snippet
+	// load in nr_init_device and the Init_Ext gate in nr_lazy_ngx_init, both of which have already
+	// happened before any checkbox can be clicked. It is in OVERLAY_OWNED_FIELDS so that Save,
+	// Revert and the dirty test all cover it - a setting that applies next launch is honest, a
+	// setting the Save button silently drops is not - and it is deliberately ABSENT from the
+	// per-pass snapshot below, because writing it into g_cfg would put a value in front of a reader
+	// that does not exist.
+	std::atomic<bool>     dlss_nr{ true };
+	// Read at its own site in the identification block, BEFORE begin_pass, for exactly the reason
+	// shader_hash is. read_ident() carries it, and carries dlss_sr with it, because the hash this
+	// dispatch must match is a function of all three. See want_hash() below.
+	std::atomic<uint64_t> sr_shader_hash{ 0 };
+	// Tier 0. Every read site is inside sr_try_run, downstream of the snapshot.
+	std::atomic<bool>     sr_suppress_taa{ false };
+	std::atomic<bool>     sr_mvec_decode{ true };
+	std::atomic<bool>     sr_mvec_reconstruct{ true };
+	// Tier 1. Both are latched into the DLSS create-params at CreateFeature and there is no
+	// evaluate-time equivalent, so a change needs the SR feature releasing before it can be read
+	// again. The controls raise a_teardown for that reason and nothing more: sr_try_run re-creates
+	// on the next accepted dispatch by itself, from the values the snapshot has already committed.
+	std::atomic<uint32_t> sr_perf_quality{ 0 };
+	std::atomic<uint32_t> sr_render_preset{ 0 };
+
 	// ---- R1, and two of them also need the clip latches cleared.
 	std::atomic<bool>     mvec_reconstruct{ true };
 	std::atomic<bool>     mvec_dilate{ false };
@@ -580,6 +625,13 @@ struct host_facts
 	bool     snippet_loaded = false;
 	bool     trampoline = false;
 	bool     armed = false;
+	// DLSS-SR's half of the same two facts. The SR section refuses to claim a live toggle it cannot
+	// honour, and these are what let it say WHICH of the two reasons applies: the snippet was never
+	// loaded (dlss_sr=0 in the ini at launch, so nvngx_dlss.dll was never asked for), or it loaded
+	// and Init_Ext through slot B failed. Both are facts about the snippet rather than settings,
+	// which is why they live here beside `armed` and not in live_block.
+	bool     sr_snippet_loaded = false;
+	bool     sr_armed = false;
 	bool     abi_thunks_active = false;
 	char     snippet_reason[256] = {};
 
@@ -648,7 +700,7 @@ inline void bump(uint32_t kind);   // fwd
 // "Revert to stray_dlssnr.ini" - and before the reconfigure ladder each of them carried its own
 // copy of a sixteen-line block. A key added to three of the four is a Save button that never
 // lights up for it, or a Revert that leaves it behind: a silent, per-key failure with no
-// diagnostic. With the list at thirty-three keys that stopped being a theoretical risk, so it is
+// diagnostic. With the list at forty-one keys that stopped being a theoretical risk, so it is
 // spelled out in exactly one place and the four callers share it.
 //
 // app_id is deliberately absent from all of this. It is the one setting with no live control -
@@ -666,7 +718,10 @@ inline void bump(uint32_t kind);   // fwd
 	X(mvec_decode) X(mvec_reconstruct) X(mvec_dilate) \
 	X(mvec_clip_row) X(mvec_clip_transpose) \
 	X(populate_parameters) X(require_trampoline) \
-	X(rt_census) X(rt_census_frames)
+	X(rt_census) X(rt_census_frames) \
+	X(dlss_sr) X(dlss_nr) X(sr_shader_hash) X(sr_suppress_taa) \
+	X(sr_mvec_decode) X(sr_mvec_reconstruct) \
+	X(sr_perf_quality) X(sr_render_preset)
 
 inline void live_to_config(const live_block &l, cfg::config &c)
 {
@@ -698,7 +753,7 @@ inline void seed_from_config(const cfg::config &c, const std::wstring &directory
 {
 	live_block &l = live();
 	// The seqlock's other writer. draw_controls has ui_edit_guard; this is the only other place
-	// that stores into live_block, and it stores THIRTY-THREE fields, so it is bracketed the same
+	// that stores into live_block, and it stores FORTY-ONE fields, so it is bracketed the same
 	// way. On a single device it is provably uncontended - it runs from nr_init_device, before any
 	// dispatch on that device - but that is an argument about a device, not about the process, and
 	// this block is process-wide.
@@ -850,6 +905,23 @@ inline bool begin_pass(cfg::config &c,
 		tmp.mvec_dilate              = l.mvec_dilate.load(std::memory_order_relaxed);
 		tmp.mvec_clip_transpose      = l.mvec_clip_transpose.load(std::memory_order_relaxed);
 		tmp.mvec_clip_row            = l.mvec_clip_row.load(std::memory_order_relaxed);
+		// ---- DLSS-SR. dlss_sr itself belongs here because its ONE functional read site - the
+		// branch into sr_try_run - is downstream of this call, as is the output-extent derivation
+		// just above it and every sr_* read inside sr_try_run. sr_perf_quality and sr_render_preset
+		// are snapshotted for the same reason even though CreateFeature latches them: the read is
+		// still downstream, and the teardown their controls raise is what makes the latched value
+		// re-taken rather than what makes the value visible.
+		//
+		// sr_shader_hash is DELIBERATELY ABSENT, exactly like shader_hash: its read site runs before
+		// this function does, so a value written here would look correct to a reader and reach
+		// nothing. read_ident() serves it. dlss_nr is absent because it has NO read site downstream
+		// of this call at all - see live_block::dlss_nr.
+		tmp.dlss_sr                  = l.dlss_sr.load(std::memory_order_relaxed);
+		tmp.sr_suppress_taa          = l.sr_suppress_taa.load(std::memory_order_relaxed);
+		tmp.sr_mvec_decode           = l.sr_mvec_decode.load(std::memory_order_relaxed);
+		tmp.sr_mvec_reconstruct      = l.sr_mvec_reconstruct.load(std::memory_order_relaxed);
+		tmp.sr_perf_quality          = l.sr_perf_quality.load(std::memory_order_relaxed);
+		tmp.sr_render_preset         = l.sr_render_preset.load(std::memory_order_relaxed);
 		// shader_hash is DELIBERATELY ABSENT from this list. Its read site runs before this
 		// function does; read_ident() serves it instead. Writing it here would be worse than
 		// useless - it would look correct to a reader and reach nothing.
@@ -977,17 +1049,40 @@ struct ident_view
 {
 	uint32_t epoch = 0;
 	uint64_t shader_hash = 0;
+	// DLSS-SR RE-PINS THE SAME DISPATCH UNDER A DIFFERENT PERMUTATION, so the identification read
+	// has to carry both keys and the switch between them. TAA_PASS_CONFIG and
+	// TAA_SCREEN_PERCENTAGE_RANGE are #defines: flipping r.TemporalAA.Upsampling gives different
+	// DXBC and a different fnv1a64, so the MainUpsampling permutation DLSS-SR targets is a
+	// different hash from the one DLSS-NR pins - and both have to be live, because both are edited
+	// from the same panel while the game runs. Putting the choice in the view rather than at the
+	// call site is what keeps it a single coherent read: all three come from inside one acquire.
+	bool     dlss_sr = false;
+	uint64_t sr_shader_hash = 0;
 };
 
 inline ident_view read_ident()
 {
 	const live_block &l = live();
 	ident_view v;
-	// ACQUIRE first, then the value, exactly as begin_pass does: bump(k_ident) stores the hash
-	// relaxed and then releases the epoch, so acquiring here is what makes the pair visible.
-	v.epoch       = l.ident_epoch.load(std::memory_order_acquire);
-	v.shader_hash = l.shader_hash.load(std::memory_order_relaxed);
+	// ACQUIRE first, then the values, exactly as begin_pass does: bump(k_ident) stores the hashes
+	// relaxed and then releases the epoch, so acquiring here is what makes the group visible.
+	v.epoch          = l.ident_epoch.load(std::memory_order_acquire);
+	v.shader_hash    = l.shader_hash.load(std::memory_order_relaxed);
+	v.dlss_sr        = l.dlss_sr.load(std::memory_order_relaxed);
+	v.sr_shader_hash = l.sr_shader_hash.load(std::memory_order_relaxed);
 	return v;
+}
+
+/// THE HASH THIS DISPATCH MUST MATCH. One place, so the render path and the arm banner cannot
+/// drift apart on it.
+///
+/// sr_shader_hash carries the MainUpsampling permutation's hash without disturbing the DLSS-NR
+/// pin, so the two features can be A/B'd on one install. 0 falls back to shader_hash, which is
+/// also what dlss_sr=0 uses unconditionally. Everything here comes out of ONE ident_view, i.e.
+/// out of one acquire, so a user who retypes both hashes cannot be observed half way.
+inline uint64_t want_hash(const ident_view &v)
+{
+	return (v.dlss_sr && v.sr_shader_hash != 0) ? v.sr_shader_hash : v.shader_hash;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1188,6 +1283,18 @@ inline bool live_require_trampoline() { return live().require_trampoline.load(st
 inline bool live_populate_parameters() { return live().populate_parameters.load(std::memory_order_relaxed); }
 inline bool     live_rt_census()        { return live().rt_census.load(std::memory_order_relaxed); }
 inline uint32_t live_rt_census_frames() { return live().rt_census_frames.load(std::memory_order_relaxed); }
+// ---- DLSS-SR. Read at their own sites, on threads or at moments the per-pass snapshot does not
+// cover: nr_init_device (main thread, before any dispatch), nr_lazy_ngx_init (recording thread,
+// before begin_pass has ever run for this device) and nr_service_reconfigure (present thread).
+// Every one of them is the same relaxed load the accessors above are.
+inline bool     live_dlss_sr()             { return live().dlss_sr.load(std::memory_order_relaxed); }
+inline bool     live_dlss_nr()             { return live().dlss_nr.load(std::memory_order_relaxed); }
+inline bool     live_sr_mvec_decode()      { return live().sr_mvec_decode.load(std::memory_order_relaxed); }
+inline bool     live_sr_mvec_reconstruct() { return live().sr_mvec_reconstruct.load(std::memory_order_relaxed); }
+inline bool     live_sr_suppress_taa()     { return live().sr_suppress_taa.load(std::memory_order_relaxed); }
+inline uint32_t live_sr_perf_quality()     { return live().sr_perf_quality.load(std::memory_order_relaxed); }
+inline uint32_t live_sr_render_preset()    { return live().sr_render_preset.load(std::memory_order_relaxed); }
+inline uint64_t live_sr_shader_hash()      { return live().sr_shader_hash.load(std::memory_order_relaxed); }
 
 // =============================================================================================
 // PERSISTENCE
@@ -1237,7 +1344,7 @@ inline void fmt_float(char *buf, size_t n, float v)
 	std::snprintf(buf, n, "%.9g", static_cast<double>(v));
 }
 
-/// The 33 keys the overlay owns - the OVERLAY_OWNED_FIELDS list, spelling aliases included.
+/// The 41 keys the overlay owns - the OVERLAY_OWNED_FIELDS list, spelling aliases included.
 /// Returns false for anything else, which is what leaves app_id and unrecognised keys alone.
 inline bool owned_value(const std::string &key_lower, const live_block &l, std::string &out)
 {
@@ -1283,6 +1390,19 @@ inline bool owned_value(const std::string &key_lower, const live_block &l, std::
 	// Hex, zero-padded to 16, which is how every shader hash in this tree's logs, its README and
 	// its shipped ini is written. A decimal here would round-trip correctly and be unreadable.
 	if (key_lower == "shader_hash")              { std::snprintf(buf, sizeof(buf), "0x%016llx", (unsigned long long)l.shader_hash.load(std::memory_order_relaxed)); out = buf; return true; }
+	// ---- DLSS-SR and the two feature master switches. Owned for the reason every other key here
+	// is owned: a control that applies and then forgets on relaunch is still a control that lies.
+	// dlss_nr is in this list even though it is launch-time - being launch-time is exactly why it
+	// has to survive a Save.
+	if (key_lower == "dlss_sr")                  { out = l.dlss_sr.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "dlss_nr")                  { out = l.dlss_nr.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "sr_suppress_taa")          { out = l.sr_suppress_taa.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "sr_mvec_decode")           { out = l.sr_mvec_decode.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "sr_mvec_reconstruct")      { out = l.sr_mvec_reconstruct.load(std::memory_order_relaxed) ? "1" : "0"; return true; }
+	if (key_lower == "sr_perf_quality")          { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.sr_perf_quality.load(std::memory_order_relaxed)); out = buf; return true; }
+	if (key_lower == "sr_render_preset")         { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.sr_render_preset.load(std::memory_order_relaxed)); out = buf; return true; }
+	// Hex for the same reason shader_hash is hex: it is copied out of ReShade.log by eye.
+	if (key_lower == "sr_shader_hash")           { std::snprintf(buf, sizeof(buf), "0x%016llx", (unsigned long long)l.sr_shader_hash.load(std::memory_order_relaxed)); out = buf; return true; }
 	return false;
 }
 
@@ -1302,6 +1422,10 @@ inline const char *const *owned_keys(size_t &n)
 		"mvec_clip_row", "mvec_clip_transpose",
 		"populate_parameters", "require_trampoline",
 		"rt_census", "rt_census_frames",
+		// DLSS-SR and the two feature master switches.
+		"dlss_nr", "dlss_sr", "sr_shader_hash", "sr_suppress_taa",
+		"sr_mvec_decode", "sr_mvec_reconstruct",
+		"sr_perf_quality", "sr_render_preset",
 	};
 	n = sizeof(keys) / sizeof(keys[0]);
 	return keys;
@@ -1819,27 +1943,28 @@ inline void slider_u32(const char *label, std::atomic<uint32_t> &a, int lo, int 
 /// a slider is the wrong shape and ImGui::InputScalar is not on the safe list either; InputText
 /// plus strtoull is, and it accepts both "0x…" and decimal exactly as the ini parser does.
 ///
-/// The buffer is a function-local static because the panel is drawn from one thread only (the
-/// present thread) and there is exactly one of these controls.
-inline void input_hash(std::atomic<uint64_t> &a, const char *why)
+/// THERE ARE TWO OF THESE NOW - shader_hash and sr_shader_hash - so the edit buffer and the
+/// "typed but not applied" flag are the CALLER'S, not function-local statics. Two controls
+/// sharing one static buffer would have made typing in either one overwrite the other's display,
+/// which is a control that lies about its own value. Both callers are in draw_controls, which is
+/// drawn from the present thread only, so a plain static at each call site is correct.
+inline void input_hash(const char *label, const char *button_label, std::atomic<uint64_t> &a,
+                       const char *why, char *buf, size_t buf_n, bool &editing, const char *unapplied)
 {
-	static char s_buf[32] = {};
-	static bool s_editing = false;
-
 	const uint64_t cur = a.load(std::memory_order_relaxed);
-	if (!s_editing)
-		std::snprintf(s_buf, sizeof(s_buf), "0x%016llx", (unsigned long long)cur);
+	if (!editing)
+		std::snprintf(buf, buf_n, "0x%016llx", (unsigned long long)cur);
 
 	ImGui::SetNextItemWidth(200.0f);
-	if (ImGui::InputText("shader_hash", s_buf, sizeof(s_buf), 0, nullptr, nullptr))
-		s_editing = true;
+	if (ImGui::InputText(label, buf, buf_n, 0, nullptr, nullptr))
+		editing = true;
 
 	ImGui::SameLine();
-	if (ImGui::Button("Apply hash"))
+	if (ImGui::Button(button_label))
 	{
 		char *end = nullptr;
-		const unsigned long long parsed = std::strtoull(s_buf, &end, 0);
-		if (end != s_buf)
+		const unsigned long long parsed = std::strtoull(buf, &end, 0);
+		if (end != buf)
 		{
 			a.store(static_cast<uint64_t>(parsed), std::memory_order_relaxed);
 			// k_ident: the per-PSO memo has to be invalidated on EVERY command list, and the
@@ -1847,12 +1972,10 @@ inline void input_hash(std::atomic<uint64_t> &a, const char *why)
 			// against the new hash.
 			request(0u, why, k_ident);
 		}
-		s_editing = false;
+		editing = false;
 	}
-	if (s_editing)
-		overlay_imgui::textf_colored(col::amber,
-			"    typed but not applied - press Apply hash. 0 means \"any shader passing every "
-			"census gate\", which is not recommended.");
+	if (editing && unapplied != nullptr)
+		overlay_imgui::textf_colored(col::amber, "%s", unapplied);
 }
 
 /// A read-only line for a setting that exists but cannot be changed at runtime. Greyed rather
@@ -2655,6 +2778,137 @@ inline void draw_controls(const host_facts &f)
 
 	ImGui::EndDisabled();
 
+	// ---- DLSS Super Resolution --------------------------------------------------------------------
+	ImGui::SeparatorText("DLSS Super Resolution (NGX feature 1, nvngx_dlss.dll)");
+
+	{
+		const bool want_sr    = l.dlss_sr.load(std::memory_order_relaxed);
+		// f.valid is false when the DllMain hook has not run, which is the ABI probe's case. Treat
+		// an unknown arm state as NOT armed rather than as armed: the panel's whole contract is
+		// that it never reports a success it has not been told about.
+		const bool sr_armed   = f.valid && f.sr_armed;
+		const bool sr_loaded  = f.valid && f.sr_snippet_loaded;
+
+		checkbox_action("Use DLSS Super Resolution for the accepted dispatch (dlss_sr)", l.dlss_sr,
+			a_teardown | a_reconcile, "dlss_sr", k_rebuild,
+			"HALF LIVE, AND THE UI SAYS WHICH HALF - the same shape as require_trampoline below.\n\n"
+			"THE BRANCH IS LIVE IN BOTH DIRECTIONS. The decision that sends the accepted TAA dispatch "
+			"to DLSS-SR instead of DLSS-NR is taken after the per-pass snapshot, so unticking this "
+			"hands the dispatch straight back to DLSS-NR on the next frame with the SR feature and its "
+			"textures released. That direction is complete and is the one to use for an A/B.\n\n"
+			"1 -> 0 IS FULLY LIVE. 0 -> 1 NEEDS A RELAUNCH WHEN THE SNIPPET WAS NOT LOADED AT LAUNCH, "
+			"and here is the specific reason: arming DLSS-SR means a 59 MB LoadLibraryW of "
+			"nvngx_dlss.dll claiming the trampoline's SLOT B, and then NVSDK_NGX_D3D12_Init_Ext "
+			"through that slot from a render thread with a fully built device. That call happens "
+			"exactly once per process, on the first accepted dispatch, and this tree's one measured "
+			"fact about Init_Ext's fragility is that it can HANG - so a second one is not offered, on "
+			"exactly the argument app_id is refused for. The value is saved and takes effect next "
+			"launch, the status line beside this box says so, and the reconfigure banner reports "
+			"RELAUNCH REQUIRED rather than APPLIED.\n\n"
+			"NOTE: DLSS-SR TAKES the dispatch. With this on, the DLSS-NR evaluate does not run.");
+
+		if (want_sr && sr_armed)
+			overlay_imgui::textf_colored(col::green, "    DLSS-SR is ARMED - the branch is live now.");
+		else if (want_sr && sr_loaded)
+			overlay_imgui::textf_colored(col::red,
+				"    nvngx_dlss.dll LOADED but Init_Ext through slot B FAILED - see ReShade.log. "
+				"sr_try_run bails on \"not armed\" and the game's own TAA is untouched. This cannot "
+				"be retried in-process; fix the cause and relaunch.");
+		else if (want_sr)
+			overlay_imgui::textf_colored(col::amber,
+				"    NOT ARMED: nvngx_dlss.dll was never loaded, because dlss_sr was 0 in "
+				"stray_dlssnr.ini at launch. Press Save below and relaunch. Until then this box is a "
+				"saved preference, not a running state, and DLSS-SR does NOT run.");
+		else if (sr_armed)
+			overlay_imgui::textf_colored(col::dim,
+				"    armed but not selected - the dispatch is going to DLSS-NR. Re-ticking is live.");
+
+		// Everything below only means anything while SR is actually taking the dispatch.
+		ImGui::BeginDisabled(!(want_sr && sr_armed));
+
+		// a_reconcile, not 0u, and it is not decoration: the render path prints a one-shot ERROR
+		// when this is 1 while sr_direct_output and sr_copy_back are both 0, because that
+		// combination is REFUSED rather than obeyed. A one-shot latch plus a live key is the
+		// "control that lies" shape - turn it on, read the refusal, turn it off, turn it on again
+		// and the second refusal is silent. The service re-arms the latch on every reconcile.
+		checkbox_action("Suppress the game's own TAA dispatch (sr_suppress_taa)", l.sr_suppress_taa,
+			a_reconcile, "sr_suppress_taa", k_plain,
+			"Live, per dispatch, free. OFF is the SAFE shape and the bring-up default: the game's "
+			"TAAU still runs and DLSS writes on top - one wasted dispatch and a correct frame on every "
+			"failure path, because the game's TAAU unconditionally writes every pixel of the output "
+			"view rect. ON stops that re-issue.\n\n"
+			"ONE COMBINATION IS REFUSED RATHER THAN OBEYED, and the render path says so in the log: "
+			"suppressing while sr_direct_output=0 AND sr_copy_back=0 would stop the game's TAA and "
+			"then evaluate into a texture nothing reads, leaving the frame holding whatever was last "
+			"in u0. That is not a rung on any ladder. Turn sr_copy_back on first.\n\n"
+			"NOTE: ReShade's event dispatch does not short-circuit, so this suppression applies to "
+			"EVERY co-loaded add-on and they have no way to learn it.");
+
+		static const char *const perf_items[] = {
+			"0  MaxPerf", "1  Balanced", "2  MaxQuality",
+			"3  UltraPerformance", "4  UltraQuality", "5  DLAA",
+		};
+		combo_u32("PerfQualityValue (sr_perf_quality)", l.sr_perf_quality, perf_items, 6, k_plain,
+			"Live, at the cost of ONE feature recreate - which is what the Apply below is for. It is "
+			"latched into the DLSS create-params at CreateFeature and there is no evaluate-time "
+			"equivalent, so the value cannot be re-read without releasing the feature. Changing it "
+			"here stores the value; press \"Recreate the SR feature\" to make it take.\n\n"
+			"It does NOT choose the render preset - the snippet picks that slot from Width/OutWidth. "
+			"0 is right for 1920 -> 3840; use 5 (DLAA) when you run r.ScreenPercentage=100.");
+
+		slider_u32("DLSS.Hint.Render.Preset (sr_render_preset, 0 = auto)", l.sr_render_preset, 0, 15,
+			0u, "sr_render_preset", k_plain,
+			"Live on the same terms as PerfQualityValue above: create-time, so it needs the recreate "
+			"button to take. The value goes into the ONE Hint.Render.Preset slot the render/display "
+			"ratio selects, which is why a preset set for the wrong ratio silently does nothing. "
+			"0 = auto, i.e. let the snippet choose.");
+
+		checkbox_b("Decode UE4's velocity encoding for SR (sr_mvec_decode)", l.sr_mvec_decode, k_reset,
+			"Live, one Reset frame. Independent of the DLSS-NR mvec_decode above in VALUE, but the "
+			"two share ONE compiled pipeline: the root signature, the PSO and the DXBC are a single "
+			"set, built when EITHER feature asks for it, and each feature writes into its own target "
+			"- DLSS-NR on the colour grid, DLSS-SR on the render grid.\n\n"
+			"If neither feature wanted it at launch the pipeline was never built; ticking this asks "
+			"the present-thread service to build it, which compiles DXBC and will stall a frame once.");
+
+		ImGui::BeginDisabled(!l.sr_mvec_decode.load(std::memory_order_relaxed));
+		checkbox_b("Reconstruct camera motion from depth for SR (sr_mvec_reconstruct)",
+			l.sr_mvec_reconstruct, k_reset,
+			"Live, one Reset frame. Same argument as the DLSS-NR control above: OFF writes EXACTLY "
+			"ZERO wherever the velocity texel is the cleared sentinel, which under UE 4.27 is the "
+			"static world, the sky, translucency and every movable that did not move. It is a "
+			"bring-up A/B, not a setting to ship.");
+		ImGui::EndDisabled();
+
+		if (ImGui::Button("Recreate the SR feature (apply create-time settings)"))
+			request(a_teardown | a_reconcile, "sr create-time settings", k_rebuild);
+		ImGui::SetItemTooltip(
+			"Releases the DLSS-SR feature handle and its textures on the next present, after idling "
+			"the queue. sr_try_run creates a fresh feature on the next accepted dispatch, reading "
+			"PerfQualityValue and the render preset as they now stand.\n\n"
+			"This is the SAME action a resolution change already takes, on the same seam, so it is "
+			"not a new mechanism. It costs the frames one CreateFeature costs and nothing else; the "
+			"DLSS-NR half is released and rebuilt with it, because they share one teardown.");
+
+		ImGui::EndDisabled();
+
+		// dlss_nr is NOT inside the disabled block: it is the key a user reaches for precisely when
+		// they want SR alone, i.e. while SR is not yet armed.
+		checkbox_action("Load and initialise DLSS-NR at all (dlss_nr)", l.dlss_nr,
+			0u, "dlss_nr", k_plain,
+			"LAUNCH-TIME, AND THIS IS THE ONE PLACE THAT SAYS SO. Unlike every other control on this "
+			"panel, changing it does NOTHING to the running session - not because it was not worth "
+			"wiring, but because both of its read sites have already happened: the 166 MB "
+			"LoadLibraryW of nvngx_dlssnr.dll in init_device, and the Init_Ext gate on the first "
+			"dispatch. There is no third site for a live value to reach.\n\n"
+			"It is saved and reverted like everything else, and it takes effect next launch. Set it "
+			"to 0 alongside dlss_sr=1 when you want DLSS-SR alone and would rather not pay 166 MB for "
+			"a denoiser that will not be evaluated - with dlss_sr=1 the SR pass TAKES the accepted "
+			"dispatch and the DLSS-NR evaluate does not run either way.\n\n"
+			"To turn the DLSS-NR pass off for THIS session, use \"Enable DLSS Neural Rendering\" or "
+			"`enabled` above. Both are live; this one is not.");
+	}
+
 	// ---- identification --------------------------------------------------------------------------
 	ImGui::SeparatorText("Identification - which dispatch this add-on hooks");
 
@@ -2664,7 +2918,14 @@ inline void draw_controls(const host_facts &f)
 		"WAITING FOR GAME DLSS - but writing the denoised image over the wrong render target would "
 		"look like a game bug rather than an add-on bug, so nothing here is guessed.");
 
-	input_hash(l.shader_hash, "shader_hash");
+	{
+		static char s_buf[32] = {};
+		static bool s_editing = false;
+		input_hash("shader_hash", "Apply hash", l.shader_hash, "shader_hash",
+		           s_buf, sizeof(s_buf), s_editing,
+		           "    typed but not applied - press Apply hash. 0 means \"any shader passing every "
+		           "census gate\", which is not recommended.");
+	}
 	ImGui::SetItemTooltip(
 		"Live. The exact DXBC hash of the target compute shader, as ReShade.log prints it.\n\n"
 		"It is the one identification input that is MEMOIZED per pipeline state object, so a live "
@@ -2703,6 +2964,27 @@ inline void draw_controls(const host_facts &f)
 		"temporal-feedback detector.");
 
 	// ---- NGX bring-up ------------------------------------------------------------------------------
+	// The DLSS-SR re-pin sits HERE, beside the key it overrides, rather than in the DLSS-SR section
+	// below: it is an identification input, it goes through the identification epoch, and a reader
+	// looking for "which dispatch" must find both in one place.
+	{
+		static char s_buf[32] = {};
+		static bool s_editing = false;
+		input_hash("sr_shader_hash", "Apply SR hash", l.sr_shader_hash, "sr_shader_hash",
+		           s_buf, sizeof(s_buf), s_editing,
+		           "    typed but not applied - press Apply SR hash.");
+	}
+	ImGui::SetItemTooltip(
+		"Live, through the same identification epoch shader_hash uses, and it is consulted ONLY "
+		"while dlss_sr=1. 0 means \"use shader_hash\", which is what dlss_sr=0 does "
+		"unconditionally.\n\n"
+		"WHY IT EXISTS AT ALL. TAA_PASS_CONFIG and TAA_SCREEN_PERCENTAGE_RANGE are #defines, so "
+		"flipping r.TemporalAA.Upsampling or dropping r.ScreenPercentage below 100 produces "
+		"different DXBC and therefore a different fnv1a64 - and the ONLY symptom is that the pass "
+		"silently stops being identified. DLSS-SR wants the MainUpsampling permutation, which is a "
+		"different shader from the one DLSS-NR is pinned to, so this carries its hash without "
+		"disturbing that pin and the two features can be A/B'd on one install.");
+
 	ImGui::SeparatorText("NGX bring-up");
 
 	{
@@ -2884,14 +3166,16 @@ inline void draw_controls(const host_facts &f)
 // ---------------------------------------------------------------------------------------------
 inline void draw_load_only(const host_facts &f)
 {
-	if (!ImGui::CollapsingHeader("Settings a relaunch is still needed for (2)"))
+	if (!ImGui::CollapsingHeader("Settings a relaunch is still needed for (4)"))
 		return;
 
 	char buf[160];
 
-	ImGui::TextWrapped("Everything else in stray_dlssnr.ini is a live control above. These two are "
+	ImGui::TextWrapped("Everything else in stray_dlssnr.ini is a live control above. These four are "
 	                   "not, for the reasons given - and the reason is specific in each case, not a "
-	                   "general caution.");
+	                   "general caution. Two of them have a real control above as well, because "
+	                   "one of their two directions IS live; this section is where the other "
+	                   "direction is spelled out.");
 	ImGui::Spacing();
 
 	std::snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)f.app_id);
@@ -2918,6 +3202,33 @@ inline void draw_load_only(const host_facts &f)
 		"this tree - stray_dlssnr.cpp:4339-4341 declines to FreeLibrary even at device teardown, "
 		"because a 166 MB module may still hold worker threads. The new value is saved and takes "
 		"effect next launch.");
+
+	load_only("dlss_nr", live_dlss_nr() ? "1" : "0",
+		"Launch-time in BOTH directions, and it is the only key on this panel of which that is "
+		"true. Its two read sites are the 166 MB LoadLibraryW of nvngx_dlssnr.dll in init_device "
+		"and the Init_Ext gate on the first accepted dispatch; both have already happened by the "
+		"time this panel can be drawn, and there is no third site a live value could reach. "
+		"Wiring it into the per-pass snapshot would have put a value in front of a reader that "
+		"does not exist - a control that looks right in every layer and reaches nothing, which is "
+		"the exact failure the kParam CI gate was added for.\n\n"
+		"It IS saved, reverted and dirty-tracked like every other key, and the checkbox for it "
+		"lives in the DLSS Super Resolution section above. To turn the DLSS-NR pass off for THIS "
+		"session use `enabled` or \"Enable DLSS Neural Rendering\"; both are live.");
+
+	load_only("dlss_sr: 0 -> 1 only", live_dlss_sr() ? "1" : "0",
+		"The 1 -> 0 direction IS live and has a real checkbox above: the branch that sends the "
+		"accepted dispatch to DLSS-SR is taken after the per-pass snapshot, so unticking hands it "
+		"back to DLSS-NR on the next frame with the SR feature and its textures released.\n\n"
+		"Only 0 -> 1 needs a relaunch, and only when nvngx_dlss.dll was not loaded at launch. "
+		"Arming DLSS-SR means a 59 MB LoadLibraryW claiming the trampoline's SLOT B and then "
+		"NVSDK_NGX_D3D12_Init_Ext through that slot, from a render thread, with a fully built "
+		"device - a call this process makes exactly once, on the first accepted dispatch. Doing "
+		"it a second time is the same unverified action app_id is refused for above, and the only "
+		"measurement this project has of Init_Ext's fragility is that it HANGS when called at a "
+		"moment the snippet does not tolerate. A hang is not a failure that degrades, and the "
+		"standing rule for this ladder is that a reconfigure which fails leaves the previous "
+		"working state. So the new value is saved and takes effect next launch, and the "
+		"reconfigure banner says RELAUNCH REQUIRED rather than APPLIED.");
 
 	load_only("stray_dlssnr.ini", f.ini_found ? "found" : "NOT FOUND (every setting is at its built-in default)",
 		"Not a setting. A missing file is not an error - every default in addon_config.hpp is the "

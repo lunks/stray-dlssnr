@@ -209,6 +209,52 @@ Per key:
 | `rt_census`, `rt_census_frames` | R0, into the census's own atomics | its counters are **cumulative from the first arm** and are not reset by an off/on cycle — read the deltas between summaries, not the totals |
 | `require_trampoline` | R5 one way only | **1→0 is live**; 0→1 needs a relaunch — see below |
 | `app_id` | **relaunch** | see below |
+| `dlss_sr` | R4 one way + branch R0 | **1→0 is fully live**: the branch into `sr_try_run` is taken after the snapshot, so unticking hands the dispatch back to DLSS-NR on the next frame with the SR feature and both SR textures released. **0→1 needs a relaunch** when `nvngx_dlss.dll` was not loaded at launch — see below |
+| `sr_shader_hash` | R3 | the DLSS-SR re-pin, through the same `read_ident()` + identification epoch `shader_hash` uses. Consulted only while `dlss_sr=1`; `0` means "use `shader_hash`" |
+| `sr_suppress_taa` | R0 + latch re-arm | free per dispatch. The one-shot that reports the refused `suppress=1, direct=0, copy_back=0` combination is re-armed on every reconfigure, or a live toggle would make the second refusal silent |
+| `sr_mvec_decode`, `sr_mvec_reconstruct` | R1 | independent of `mvec_decode` in VALUE, but the decode pipeline is **one** root signature, PSO and DXBC shared by both features and built when either asks. off→on therefore costs the same R5 build `mvec_decode` does when nothing had built it yet |
+| `sr_perf_quality`, `sr_render_preset` | R0 value + **explicit recreate button** | both are latched into the DLSS create-params at `CreateFeature` and have no evaluate-time equivalent, so the value is live but cannot be *re-read* without releasing the feature. "Recreate the SR feature" raises R4 on the same seam a resolution change uses |
+| `dlss_nr` | **relaunch, both directions** | its only two read sites are the 166 MB `LoadLibraryW` in `init_device` and the `Init_Ext` gate on the first dispatch. It is owned, saved and reverted like every other key; it is deliberately **not** in the per-pass snapshot, because writing it into `g_cfg` would put a value in front of a reader that does not exist. To turn the DLSS-NR pass off for *this* session, use `enabled` |
+
+#### `dlss_sr` — live one way, and the UI says which way
+
+The branch is live in both directions. The **arm** is not, and the reason is specific rather than a
+general caution: arming DLSS-SR is a 59 MB `LoadLibraryW` of `nvngx_dlss.dll` claiming the
+trampoline's **slot B**, followed by `NVSDK_NGX_D3D12_Init_Ext` through that slot from a render
+thread with a fully built device. That call is made exactly once per process, inside
+`nr_lazy_ngx_init`, on the first accepted dispatch. Making the ON direction live would mean a
+*second* `Init_Ext` in the session, which is the same unverified action `app_id` is refused for —
+and the only measurement this project has of `Init_Ext`'s fragility is that it **hangs** when called
+at a moment the snippet does not tolerate. A hang is not a failure that degrades.
+
+So with `dlss_sr = 0` in the ini at launch, ticking the box:
+
+* changes the branch immediately — the next accepted dispatch really does go to `sr_try_run`;
+* is refused there on the second line with `DLSS-SR: pass did not run - not armed`, leaving ReShade
+  to issue the game's own TAA, i.e. a correct frame and a strict no-op;
+* is reported by the reconfigure banner as **RELAUNCH REQUIRED**, not APPLIED, and by a permanent
+  amber line beside the checkbox that names *which* of the two unarmed cases applies — the snippet
+  was never loaded, or it loaded and `Init_Ext` through slot B failed. Those have different fixes;
+* is saved by the Save button and takes effect next launch.
+
+#### The DLSS-SR keys that are still ini-only
+
+Nineteen of the keys `main` added have an ini entry and a documented meaning but **no control yet**.
+Every one of them is read inside `sr_try_run`, i.e. downstream of the per-pass snapshot, so each is
+one `live_block` atomic, one `OVERLAY_OWNED_FIELDS` entry, one snapshot line and one widget away
+from being live — the mechanism is already there and none of them needs new machinery:
+
+* **tier 0, free** — `sr_copy_back`, `sr_direct_output`, `sr_mv_scale_x`, `sr_mv_scale_y`,
+  `sr_jitter_scale_x`, `sr_jitter_scale_y`, `sr_jitter_projection_only`
+* **tier 1, needs the SR feature releasing** (all latched into the create-params) — `sr_hdr`,
+  `sr_hw_depth`, `sr_depth_inverted`, `sr_mv_lowres`, `sr_mv_jittered`, `sr_auto_exposure`,
+  `sr_alpha_upscaling`, `sr_out_width`, `sr_out_height`, `sr_group_tile`, `sr_use_view_rect`
+* **arm-time diagnostic, not a render-path setting** — `sr_optimal_settings`
+
+Until they have controls they behave exactly as they did before this branch: read from
+`stray_dlssnr.ini` at load, constant for the session. **They are listed here rather than left to be
+discovered**, because a key the ini can express and the UI silently cannot is the exact failure this
+overlay exists to remove.
 
 #### `hdr_codec`, both directions — the hard one
 
@@ -869,6 +915,100 @@ first `Init_Ext` result in the log answers it: `0xbad00002` is the caller gate (
 trampoline); anything else tells you whether the D3D12 backend can see the device at all. If it
 cannot, the fallback is `ID3D12DXVKInteropDevice` to recover the `VkDevice`/`VkImage` behind each
 resource and drive the verified Vulkan path instead.
+
+---
+
+## 6b. DLSS Super Resolution — `dlss_sr`, default `0`
+
+A second NGX feature now lives in this add-on: **DLSS Super Resolution, NGX feature 1,
+`nvngx_dlss.dll`**. It is **off by default**, and the runbook for turning it on is
+[`STAGING-sr.md`](STAGING-sr.md), which is written to be walked without help.
+
+### What executes when `dlss_sr = 0`
+
+This matters more than anything else in this section, because DLSS-NR ships and is played on.
+With `dlss_sr = 0` the build is **bit-identical in behaviour** to the build before SR existed.
+Exactly this much runs:
+
+* the key is parsed and one `bool` is stored;
+* `nr_init_device` tests it once and does **not** `LoadLibraryW` `nvngx_dlss.dll`;
+* `nr_lazy_ngx_init` tests it once and does not call `Init_Ext` on the SR snippet, does not
+  allocate the SR parameter block, and never touches the trampoline's slot B — and when the
+  DLSS-NR half of that function fails, it takes the **same early exit it took before SR existed**,
+  so the HDR-codec and mvec pipelines are not built on that path either;
+* `nr_try_run` tests it once per accepted TAA dispatch, *before* anything SR-related, and takes
+  the DLSS-NR branch unchanged;
+* `nr_pick_output_uav` tests it once per accepted dispatch and applies the **original**
+  "extent must equal the colour SRV's" rule;
+* `nr_ensure_output` is called exactly as before (the SR guard short-circuits);
+* the teardown path calls `dlss_sr::release_feature` / `destroy_resources` on null handles, which
+  is a handful of `!= 0` tests.
+
+No SR resource is created, no SR code reaches the GPU, and `g_sr_armed` is never set. The cost is
+a handful of perfectly-predicted branches per frame.
+
+### The trampoline now has two slots, and this is the one deployment trap
+
+The NGX caller gate is a property of the **module a call is issued from**, which is why every gated
+export goes through `remix_nvngx.dll`. But that module holds *one set of forwarding pointers per
+slot*, so calling `RemixNgxTrampoline_SetSnippet` twice would silently re-point **DLSS-NR's own
+calls** at the SR snippet — the shipping feature would break with no diagnostic.
+
+So the trampoline now carries two independent slots:
+
+| slot | claim export | forwarders | snippet |
+|---|---|---|---|
+| A | `RemixNgxTrampoline_SetSnippet` | `NVSDK_NGX_D3D12_*` | `nvngx_dlssnr.dll` (DLSS-NR) |
+| B | `RemixNgxTrampoline_SetSnippetB` | `NVSDK_NGX_D3D12_B_*` | `nvngx_dlss.dll` (DLSS-SR) |
+
+Slot A's pointers, exports and generated code are untouched. `build.sh` and the MSVC CI job both
+disassemble **all eighteen** forwarders and assert `call=1, tailjmp=0` on each — a tail jump would
+reuse the caller's return address and hand the snippet the ReShade add-on's module identity.
+
+**Redeploy `remix_nvngx.dll` from this build.** An older one has slot A only, and DLSS-SR then
+fails with a message that says exactly that.
+
+### What DLSS-SR does differently from DLSS-NR
+
+| | DLSS-NR (feature 18) | DLSS-SR (feature 1) |
+|---|---|---|
+| `Color` | the TAA pass's **output** (`u0`, resolved), optionally through the HDR codec's proxy | the TAA pass's **input** (`t5`, `InputSceneColor`), at render resolution |
+| `Output` | an add-on texture at the colour extent, copied back | an add-on texture at the **output** extent, copied back — or `u0` **directly** (`sr_direct_output`) |
+| jitter | not a parameter | **`Jitter.Offset.X/Y`, unconditionally required.** Same hard gate as the four resources |
+| motion guide extent | the **output** grid | the **render** grid — SR's colour input is the TAA *input* |
+| subrect spelling | `DLSSNRColorSubrectBaseX` (**no dot**) | `DLSS.Input.Color.Subrect.Base.X` (dotted) |
+| `DLSS.Use.HW.Depth` | does not exist in the NR snippet | **exists, is read at CREATE only, and defaults to `0 = Linear`** |
+| the game's dispatch | always re-issued | re-issued, or **suppressed** (`sr_suppress_taa`) |
+
+Every parameter name the add-on emits was verified against `nvngx_dlss.dll` as an exactly
+NUL-delimited string occurring exactly once — 63 of them, all present. The SDK headers were not
+used as a source for any name. See the header comment in `src/dlss_sr.hpp` for the method and the
+instruction-level citations.
+
+### The one interaction nobody else in the process can see
+
+`reshade::invoke_addon_event` does **not** short-circuit — it ORs every callback with no `break`.
+So when `sr_suppress_taa = 1` and this add-on reports "already issued", the TAA dispatch is
+suppressed **for every co-loaded add-on too**, and they are given no way to learn it. DLSS-NR never
+had this property, because it re-issued. If you run RenoDX or Luma alongside, this is the rung
+where something can break for reasons that are not in their logs.
+
+### Proving it ran, rather than merely linked
+
+An earlier pass in this tree compiled cleanly and was dead code because its `build`/`create` were
+never called. The SR path is instrumented so that cannot happen quietly:
+
+* `DLSS-SR: EVALUATE #1 OK ...` is printed from the branch **immediately after**
+  `EvaluateFeature` returned `Success`. It is unreachable by a feature that only linked.
+* the periodic census prints `--- DLSS-SR @ frame N: evaluates=... suppressed_dispatches=...
+  mvec_decodes=... geometry=WxH -> WxH`, and `evaluates` is incremented on that same branch.
+* every early return names itself once: `DLSS-SR: pass did not run - <reason>`.
+* the create path prints its full parameter set, including which
+  `DLSS.Hint.Render.Preset.*` slot the snippet will actually read — the snippet chooses that slot
+  **by the `Width/OutWidth` ratio**, not by `PerfQualityValue`, so the log can never silently
+  disagree with it.
+
+Success is never reported from the absence of an error.
 
 ---
 

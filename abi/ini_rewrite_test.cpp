@@ -129,7 +129,16 @@ static const char *const kFixture =
     "use_auto_mask = 1\r\n"
     "\r\n"
     "; ui_correction is deliberately ABSENT, so the append path is exercised too.\r\n"
-    "totally_unknown_key = 42\r\n";
+    "totally_unknown_key = 42\r\n"
+    "\r\n"
+    "; DLSS-SR. dlss_sr and sr_perf_quality are PRESENT so the in-place rewrite path is exercised\r\n"
+    "; for the new keys; sr_shader_hash and sr_suppress_taa are deliberately ABSENT so the append\r\n"
+    "; path is exercised for them too. dlss_nr is present and UNCHANGED - it is the launch-time key,\r\n"
+    "; and a key that only takes effect next launch is exactly the one a dropped Save would lose\r\n"
+    "; without any symptom until the relaunch.\r\n"
+    "dlss_sr = 0\r\n"
+    "dlss_nr = 1\r\n"
+    "sr_perf_quality  = 0\r\n";
 
 int main()
 {
@@ -167,6 +176,15 @@ int main()
     // not. Both have to survive correctly, and for opposite reasons.
     l.srv_velocity.store(3u, std::memory_order_relaxed);
     l.hdr_codec.store(false, std::memory_order_relaxed);
+    // ---- DLSS-SR. Four shapes in one go: a bool rewritten in place, a uint32 rewritten in place
+    // WITH column alignment, a 64-bit hex pin appended, and a bool appended. If any of these is in
+    // the live_block and the widget list but missing from OVERLAY_OWNED_FIELDS, owned_value() or
+    // owned_keys(), exactly one of the checks below fails and names it - which is the whole point:
+    // a key the panel can change and Save silently drops is a control that lies, just more slowly.
+    l.dlss_sr.store(true, std::memory_order_relaxed);
+    l.sr_perf_quality.store(5u, std::memory_order_relaxed);
+    l.sr_shader_hash.store(0x901e041a7cadc9dbull, std::memory_order_relaxed);
+    l.sr_suppress_taa.store(true, std::memory_order_relaxed);
 
     check(overlay_ui::dirty(), "dirty() reports the pending edits");
 
@@ -214,6 +232,16 @@ int main()
     check(out.find("srv_color = ") == std::string::npos,
           "no duplicate American spelling of srv_colour was appended");
 
+    // --- DLSS-SR's keys ---
+    check(has_line(out, "dlss_sr = 1"), "dlss_sr took the new value in place");
+    check(has_line(out, "dlss_nr = 1"), "dlss_nr, the launch-time key, came back unchanged");
+    check(has_line(out, "sr_perf_quality  = 5"),
+          "sr_perf_quality took the new value AND kept its column alignment");
+    check(has_line(out, "sr_shader_hash = 0x901e041a7cadc9db"),
+          "the appended sr_shader_hash is hex, zero-padded, like shader_hash");
+    check(has_line(out, "sr_suppress_taa = 1"), "the appended sr_suppress_taa took the new value");
+    check(has_line(out, "sr_mvec_decode = 1"), "an untouched DLSS-SR default was appended");
+
     check(out.find("\r\n") != std::string::npos, "CRLF line endings survived on the lines we rewrote");
 
     // --- and it must still parse back to exactly what we set ---
@@ -235,6 +263,13 @@ int main()
         check(back.enabled == true,                      "reparse: enabled");
         check(back.srv_colour == 5u,                     "reparse: the appended srv_colour");
         check(back.app_id == 0x24480451ull,              "reparse: app_id is untouched");
+        // The whole DLSS-SR round trip, through the real parser in addon_config.hpp.
+        check(back.dlss_sr == true,                      "reparse: dlss_sr");
+        check(back.dlss_nr == true,                      "reparse: dlss_nr");
+        check(back.sr_perf_quality == 5u,                "reparse: sr_perf_quality");
+        check(back.sr_shader_hash == 0x901e041a7cadc9dbull, "reparse: sr_shader_hash in hex");
+        check(back.sr_suppress_taa == true,              "reparse: sr_suppress_taa");
+        check(back.sr_mvec_decode == true,               "reparse: the appended sr_mvec_decode");
     }
 
     // ---------------------------------------------------------------- case B: no file at all

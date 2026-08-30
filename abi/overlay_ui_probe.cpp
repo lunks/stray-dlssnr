@@ -58,6 +58,20 @@ extern "C" __declspec(dllexport) bool overlay_ui_pass_probe()
     (void)overlay_ui::live_populate_parameters();
     (void)overlay_ui::live_rt_census();
     (void)overlay_ui::live_rt_census_frames();
+    // DLSS-SR's accessors, for the same reason the eleven above are here: the add-on build
+    // compiles them, but the mingw add-on job is continue-on-error and mingw is the toolchain of
+    // the binary on the user's machine today. This job is gating on both.
+    (void)overlay_ui::live_dlss_sr();
+    (void)overlay_ui::live_dlss_nr();
+    (void)overlay_ui::live_sr_mvec_decode();
+    (void)overlay_ui::live_sr_mvec_reconstruct();
+    (void)overlay_ui::live_sr_suppress_taa();
+    (void)overlay_ui::live_sr_perf_quality();
+    (void)overlay_ui::live_sr_render_preset();
+    (void)overlay_ui::live_sr_shader_hash();
+    // want_hash() is the whole of the identification merge: it is the one function both the
+    // DLSS-NR pin and the DLSS-SR re-pin go through, and it must be reachable and coherent.
+    (void)overlay_ui::want_hash(overlay_ui::read_ident());
     (void)overlay_ui::dirty();
     return run;
 }
