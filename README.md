@@ -183,6 +183,167 @@ The five tuning knobs default to the snippet's **own internal fallbacks**, recov
 disassembly. `1.0` is a fallback, **not a calibrated neutral midpoint**, and the scale these
 values sit on is not known. Change them one at a time.
 
+### Every setting is live — what each one costs, and the two that are not
+
+The overlay (`src/overlay_ui.hpp`) can change **every key in the table above except `app_id`**
+without restarting the game. That is a deliberate property, not a convenience: this add-on exists
+because a whole play session once ran with nothing running and nobody knew, and a control that
+looks editable but silently needs a relaunch is the same failure in a smaller box.
+
+The mechanism is one ladder with six rungs, each implying every rung below it. There is exactly
+one deferred-work seam — `nr_state::pending_work`, raised on a recording thread, serviced on the
+next present by `nr_service_reconfigure` on the main thread, where idling the GPU queue and
+destroying a resource are legal. That is the same seam a resolution change has always used; it was
+generalised rather than duplicated.
+
+| Rung | What it does | Cost you can see |
+|---|---|---|
+| **R0** snapshot | `begin_pass` copies the overlay's atomics into `g_cfg` once per pass, on the render thread, under the lock the pass already holds | none |
+| **R1** reset | + one `DLSSNR.Reset` frame, because the accumulated temporal history was built under the other geometry | one un-accumulated frame |
+| **R2** flush | + the armed pristine copy is dropped (it names a raw `ID3D12Resource` address held across a frame, and UE 4.27's pool recycles those) | one frame of temporal feedback |
+| **R3** ident | + the per-PSO identification memo is invalidated on **every** command list at once, and the identification one-shot log lines are re-armed | one frame |
+| **R4** rebuild | + the NGX feature, every view and every texture are released on the next present and rebuilt on the following dispatch | a visible hitch |
+| **R5** rearm | + pipelines built, parameter block replaced, or the snippet loaded, on the present thread | a stalled frame |
+
+Per key:
+
+| Key | Rung | Note |
+|---|---|---|
+| `intensity`, `local_tone_strength`, `local_structure_strength`, `skin_structure_strength`, `style`, `use_auto_mask`, `ui_correction` | R0 | every NGX tuning parameter is written from `g_cfg` on **every** accepted dispatch and none is baked at `CreateFeature`, so these are free |
+| `paper_white_scale`, `transfer_strength`, `color_strength`, `restore_graphics_root` | R0 | read more than once per pass; the snapshot is what makes the reads agree. A `restore_graphics_root` tear between `capture_state` and `restore_state` would be **corrupting**, not a tuning difference |
+| `copy_back`, `history_restore` | R2 | both edges must drop the armed copy |
+| `depth_inverted`, `mvec_scale_x`, `mvec_scale_y`, `mvec_reconstruct`, `mvec_dilate` | R1 | |
+| `mvec_clip_row`, `mvec_clip_transpose` | R1 + latch clear | a bad value latches `view_layout_failed` **permanently** for the resolution; the reconfigure clears it, so the knob stays a knob after the first wrong answer |
+| `shader_hash` | R3 | read *before* `st->mutex` and *before* `begin_pass`, so it cannot ride the snapshot — it goes through a lock-free `read_ident()` at its own site, and a per-command-list epoch invalidates every cached answer at once |
+| `srv_depth`, `srv_velocity`, `srv_colour`, `uav_output` | R3 | these *do* ride the snapshot; they need the arm drop and the latch re-arm, not the memo. `srv_colour` is the only setting in the add-on that tears **across** frames — it is also the history-restore refusal test |
+| `hdr_codec` | R4 (+R5 on) | **both directions.** See below |
+| `mvec_decode` | R4 + R5 on | off→on builds the decode pipeline (runtime `D3DCompile`, hence the present thread) |
+| `enabled` | R4 + R5 on | off→on runs the shipping startup path: `ngx::load_snippet` then `g_nr_pending_init`, which the render thread's existing deferred initialiser consumes. **LoadLibraryW of a 166 MB module — expect one stalled frame** |
+| `populate_parameters` | R4 + R5, **explicit Apply button** | a gated export whose exact signature is unverified against this snippet build; a checkbox that fired on click would be the wrong shape |
+| `diagnostics` | R0, **atomic at its own site** | read on every draw and every dispatch in the process, on arbitrary recording threads, outside any snapshot. It could never go through `g_cfg`; one relaxed load at each of the three sites makes it live at zero risk |
+| `rt_census`, `rt_census_frames` | R0, into the census's own atomics | its counters are **cumulative from the first arm** and are not reset by an off/on cycle — read the deltas between summaries, not the totals |
+| `require_trampoline` | R5 one way only | **1→0 is live**; 0→1 needs a relaunch — see below |
+| `app_id` | **relaunch** | see below |
+| `dlss_sr` | R4 one way + branch R0 | **1→0 is fully live**: the branch into `sr_try_run` is taken after the snapshot, so unticking hands the dispatch back to DLSS-NR on the next frame with the SR feature and both SR textures released. **0→1 needs a relaunch** when `nvngx_dlss.dll` was not loaded at launch — see below |
+| `sr_shader_hash` | R3 | the DLSS-SR re-pin, through the same `read_ident()` + identification epoch `shader_hash` uses. Consulted only while `dlss_sr=1`; `0` means "use `shader_hash`" |
+| `sr_suppress_taa` | R0 + latch re-arm | free per dispatch. The one-shot that reports the refused `suppress=1, direct=0, copy_back=0` combination is re-armed on every reconfigure, or a live toggle would make the second refusal silent |
+| `sr_mvec_decode`, `sr_mvec_reconstruct` | R1 | independent of `mvec_decode` in VALUE, but the decode pipeline is **one** root signature, PSO and DXBC shared by both features and built when either asks. off→on therefore costs the same R5 build `mvec_decode` does when nothing had built it yet |
+| `sr_perf_quality`, `sr_render_preset` | R0 value + **explicit recreate button** | both are latched into the DLSS create-params at `CreateFeature` and have no evaluate-time equivalent, so the value is live but cannot be *re-read* without releasing the feature. "Recreate the SR feature" raises R4 on the same seam a resolution change uses |
+| `dlss_nr` | **relaunch, both directions** | its only two read sites are the 166 MB `LoadLibraryW` in `init_device` and the `Init_Ext` gate on the first dispatch. It is owned, saved and reverted like every other key; it is deliberately **not** in the per-pass snapshot, because writing it into `g_cfg` would put a value in front of a reader that does not exist. To turn the DLSS-NR pass off for *this* session, use `enabled` |
+
+#### `dlss_sr` — live one way, and the UI says which way
+
+The branch is live in both directions. The **arm** is not, and the reason is specific rather than a
+general caution: arming DLSS-SR is a 59 MB `LoadLibraryW` of `nvngx_dlss.dll` claiming the
+trampoline's **slot B**, followed by `NVSDK_NGX_D3D12_Init_Ext` through that slot from a render
+thread with a fully built device. That call is made exactly once per process, inside
+`nr_lazy_ngx_init`, on the first accepted dispatch. Making the ON direction live would mean a
+*second* `Init_Ext` in the session, which is the same unverified action `app_id` is refused for —
+and the only measurement this project has of `Init_Ext`'s fragility is that it **hangs** when called
+at a moment the snippet does not tolerate. A hang is not a failure that degrades.
+
+So with `dlss_sr = 0` in the ini at launch, ticking the box:
+
+* changes the branch immediately — the next accepted dispatch really does go to `sr_try_run`;
+* is refused there on the second line with `DLSS-SR: pass did not run - not armed`, leaving ReShade
+  to issue the game's own TAA, i.e. a correct frame and a strict no-op;
+* is reported by the reconfigure banner as **RELAUNCH REQUIRED**, not APPLIED, and by a permanent
+  amber line beside the checkbox that names *which* of the two unarmed cases applies — the snippet
+  was never loaded, or it loaded and `Init_Ext` through slot B failed. Those have different fixes;
+* is saved by the Save button and takes effect next launch.
+
+#### The DLSS-SR keys that are still ini-only
+
+Nineteen of the keys `main` added have an ini entry and a documented meaning but **no control yet**.
+Every one of them is read inside `sr_try_run`, i.e. downstream of the per-pass snapshot, so each is
+one `live_block` atomic, one `OVERLAY_OWNED_FIELDS` entry, one snapshot line and one widget away
+from being live — the mechanism is already there and none of them needs new machinery:
+
+* **tier 0, free** — `sr_copy_back`, `sr_direct_output`, `sr_mv_scale_x`, `sr_mv_scale_y`,
+  `sr_jitter_scale_x`, `sr_jitter_scale_y`, `sr_jitter_projection_only`
+* **tier 1, needs the SR feature releasing** (all latched into the create-params) — `sr_hdr`,
+  `sr_hw_depth`, `sr_depth_inverted`, `sr_mv_lowres`, `sr_mv_jittered`, `sr_auto_exposure`,
+  `sr_alpha_upscaling`, `sr_out_width`, `sr_out_height`, `sr_group_tile`, `sr_use_view_rect`
+* **arm-time diagnostic, not a render-path setting** — `sr_optimal_settings`
+
+Until they have controls they behave exactly as they did before this branch: read from
+`stray_dlssnr.ini` at load, constant for the session. **They are listed here rather than left to be
+discovered**, because a key the ini can express and the UI silently cannot is the exact failure this
+overlay exists to remove.
+
+#### `hdr_codec`, both directions — the hard one
+
+Two separate things blocked it, one per direction, and neither was a design constraint:
+
+* **off→on was blocked by one line.** `nr_lazy_ngx_init`'s `else` branch read
+  `st->codec_failed = true;   // not a failure, but the same "do not use it" state`. That is the
+  **run-latched shader-build failure** flag, and `nr_release_feature_and_output` deliberately never
+  clears it — because a resolution change cannot undo a failed `D3DCompile`. So `hdr_codec=0` at
+  load latched a permanent failure state to mean "the user configured it off". That assignment is
+  **deleted**, not cleared at reconfigure time: clearing the latch to service a config change would
+  also erase a *real* build failure and make the add-on retry a broken compile every frame.
+  `mvec_decode` carried the identical defect at `st->mvec_failed = true;`, with the same comment;
+  it is deleted too.
+* **on→off was blocked by the format.** `out_tex` is forced to `r16g16b16a16_float` for its
+  lifetime whenever the codec is on. With the codec off it becomes the copy-back source, its format
+  no longer matches an `r11g11b10_float` TAA output, and the copy-back guard **silently skips** —
+  which on screen reads as "no denoise" while every other indicator stays healthy. The fix needed
+  no new code: the teardown destroys `out_tex` and zeroes `out_w`/`out_h`, so the next accepted
+  dispatch re-enters `nr_ensure_output` on the create branch and re-decides the format against the
+  new value.
+
+#### The two that still need a relaunch, and the proof
+
+* **`require_trampoline`, 0→1 only.** Honouring it would mean unloading an already-initialised
+  snippet, and there is no in-process unload path anywhere in this tree — `nr_destroy_device`
+  declines to `FreeLibrary` even at device teardown, on the grounds that "a 166 MB module that may
+  still hold worker threads" buys nothing. The 1→0 direction **is** live, and it is the direction
+  that matters: on that path `ngx::load_snippet` already called `unload()`, so nothing is loaded and
+  re-running it is clean.
+* **`app_id`.** The mechanism exists — `Shutdown1` is resolved, is required at load, and is already
+  called in-process at device teardown, so `Shutdown1` + `Init_Ext` would be one more action on the
+  service. What is **not** proven is that `Init_Ext` survives a second call, and the only
+  measurement this project has of its fragility is that it *hangs* when called at a moment the
+  snippet does not tolerate: the log stops between `loaded nvngx_dlssnr.dll` and the `Init_Ext`
+  result, the process sits at ~2% CPU, and the title never reaches its menu. A hang is not a failure
+  that degrades, and the standing rule for the ladder is that a reconfigure which fails leaves the
+  previous working state. Since `app_id` has **no render-path effect at all** — the snippet resolves
+  its weights from its own embedded `WEIGHTS_HT` resource, so it only names the log file written
+  beside the add-on — shipping an unverified path that can hang the game to rename a log file is the
+  wrong trade. It is stated as exactly that in the UI, not as "load-only".
+
+The same reasoning is why `enabled = 0` **releases the feature and stops the pass** rather than
+tearing NGX down: clearing the armed flag would make the next `enabled = 1` call `Init_Ext` a second
+time in the session. Off gives back the VRAM, which is where the memory actually is; NGX itself
+stays initialised, and turning it back on rebuilds everything with no second `Init_Ext`.
+
+#### What a reconfigure looks like in the log
+
+One line, and it fires only when a rung was actually climbed — the service returns early when there
+is no work, so this is never per-frame noise:
+
+```
+DLSS-NR reconfigure APPLIED: "hdr_codec" -> tier 1 (feature recreate) +ident-epoch +reconcile. codec=built mvec=built feature=released
+```
+
+A failure names itself the same way and leaves the previous state running:
+
+```
+DLSS-NR reconfigure FAILED: "hdr_codec" - the HDR codec's shaders or pipelines could not be built; the denoise still runs, undecoded. The PREVIOUS working state is still running and nothing is half-applied.
+```
+
+The overlay draws that failure in red above every other status rung, because the add-on may well be
+evaluating perfectly happily on the old settings — and "EVALUATING" on its own would then be a true
+headline answering the wrong question.
+
+#### Saving
+
+The overlay's Save button now round-trips every key it can change, which is all of them except
+`app_id`. It still rewrites `stray_dlssnr.ini` **in place** — every comment, blank line, column
+alignment, trailing comment and your own spelling of `colour`/`color` survives — via a temp file and
+`MoveFileExW(REPLACE_EXISTING)`, because a half-written ini is worse than none.
+
+
 ### `rt_census` — the DXR dispatch census
 
 Read-only instrumentation (`src/rt_census.hpp`) that measures which ray tracing effects the title
