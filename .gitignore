@@ -1,0 +1,14 @@
+# build outputs
+*.addon64
+*.dll
+*.o
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+# local backups
+*.prepatch-working
+*.bak-*
+# shader cache the add-on writes next to the exe
+*.dxbc

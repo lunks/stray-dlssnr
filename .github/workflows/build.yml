@@ -1,0 +1,119 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------------------------------------
+  # The build we actually ship today: mingw-w64 cross-compile. This is the green/red signal.
+  # ---------------------------------------------------------------------------------------------
+  mingw:
+    name: mingw-w64 (shipping)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mingw-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+
+      - name: Build
+        run: ./build.sh
+        # build.sh also runs the trampoline tail-jump verification and exits non-zero if any
+        # forwarder tail-jumps. A tail jump preserves the caller's return address, so the NGX
+        # snippet's "called from nvngx.dll" check would see the ReShade add-on and every gated
+        # export would return 0xbad00002. That check failing must fail CI.
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stray-dlssnr-mingw
+          path: |
+            stray_dlssnr.addon64
+            remix_nvngx.dll
+            stray_dlssnr.ini
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------------------------
+  # The build we WANT: native MSVC, matching ReShade's own toolchain.
+  #
+  # Why this job exists. ReShade is built with MSVC; we cross-compile with mingw/GCC. The two ABIs
+  # disagree in two places that this add-on has already been bitten by, and both workarounds are
+  # carried in the tree specifically because of the mingw choice:
+  #
+  #   src/msvc_abi.hpp     three ReShade device virtuals return a class BY VALUE, which GCC and
+  #                        MSVC pass differently. Handled with out-parameter thunks plus vtable
+  #                        offset verification at load.
+  #   src/ngx_interop.hpp  MSVC numbers an overload set in REVERSE declaration order, so
+  #                        NVSDK_NGX_Parameter's 17-slot vtable is laid out by hand.
+  #
+  # A native MSVC build makes that entire hazard class disappear, which matters most for the
+  # ReShade overlay: ImGui reaches add-ons through a function table and several of its entry
+  # points pass ImVec2 BY VALUE.
+  #
+  # It is expected to fail until those two headers grow _MSC_VER branches. It is allowed to fail
+  # on purpose: this job's output is the to-do list for getting there, not a gate.
+  # ---------------------------------------------------------------------------------------------
+  msvc:
+    name: MSVC (experimental - target ABI)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build add-on
+        shell: cmd
+        run: |
+          cl /nologo /std:c++17 /EHsc /O2 /LD /MT ^
+             /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+             /I include ^
+             src\*.cpp ^
+             /Fe:stray_dlssnr.addon64 ^
+             /link /DLL
+
+      - name: Build trampoline
+        shell: cmd
+        # No /O2 sibling-call concern under MSVC the way there is under GCC, but the property still
+        # has to hold, so it is verified below rather than assumed.
+        run: |
+          cl /nologo /std:c++17 /EHsc /O2 /LD /MT ^
+             /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+             trampoline\remix_nvngx.cpp ^
+             /Fe:remix_nvngx.dll ^
+             /link /DLL
+
+      - name: Verify trampoline forwarders make real calls (no tail jumps)
+        shell: pwsh
+        run: |
+          # Same invariant build.sh checks under objdump, expressed for dumpbin.
+          $fns = @('Init_Ext','Shutdown1','CreateFeature','ReleaseFeature','EvaluateFeature',
+                   'PopulateParameters_Impl','AllocateParameters','DestroyParameters',
+                   'GetFeatureRequirements')
+          $dis = dumpbin /disasm /nologo remix_nvngx.dll | Out-String
+          $fail = 0
+          foreach ($fn in $fns) {
+            $name = "NVSDK_NGX_D3D12_$fn"
+            $m = [regex]::Match($dis, "(?ms)^$name.*?(?=^\S|\z)")
+            if (-not $m.Success) { Write-Host "  ?? $name : not found in disassembly"; $fail = 1; continue }
+            $body  = $m.Value
+            $calls = ([regex]::Matches($body, '\bcall\s+qword ptr')).Count
+            $tails = ([regex]::Matches($body, '\bjmp\s+qword ptr')).Count
+            if ($calls -ge 1 -and $tails -eq 0) { Write-Host "  OK   $name : call=$calls tailjmp=$tails" }
+            else { Write-Host "  FAIL $name : call=$calls tailjmp=$tails"; $fail = 1 }
+          }
+          if ($fail -ne 0) { throw "a forwarder tail-jumps; the snippet caller check would see the add-on" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stray-dlssnr-msvc
+          path: |
+            stray_dlssnr.addon64
+            remix_nvngx.dll
+          if-no-files-found: error
