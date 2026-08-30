@@ -42,6 +42,14 @@
 // Every handler body is wrapped so a C++ exception cannot escape into ReShade and terminate the
 // process. If this add-on destabilises STRAY we lose the ability to test anything at all.
 
+// ---- BEGIN overlay_ui hook ----
+// MUST STAY ABOVE reshade_compat.hpp. include/reshade_overlay.hpp has NO include guard and its
+// whole body is `#if defined(IMGUI_VERSION_NUM)`, so anything that pulls in reshade.hpp before
+// <imgui.h> deletes namespace ImGui from this translation unit permanently - and reshade.hpp's
+// own #pragma once means it never gets a second chance. src/overlay_imgui.hpp #errors if this
+// moves, and a gating CI step fails the build if the wrong order ever compiles.
+#include "overlay_ui.hpp"
+// ---- END overlay_ui hook ----
 #include "reshade_compat.hpp"
 
 #include "shader_detect.hpp"
@@ -2735,6 +2743,25 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	// runs once a frame, and it is what makes the one-shot log latches sound.
 	std::lock_guard<std::mutex> lock(st->mutex);
 
+	// ---- BEGIN overlay_ui hook ----
+	// THE ONE PLACE THE OVERLAY REACHES THE RENDER PATH. On this thread, under the lock this pass
+	// already holds, it copies its atomics into g_cfg ONCE - which is what makes the several
+	// settings that are read more than once per pass (restore_graphics_root by capture_state and
+	// again by restore_state, paper_white_scale twice inside one expression, copy_back at six
+	// sites) coherent for the whole pass instead of a set of independently torn reads. It also
+	// turns a changed depth convention or motion scale into one DLSSNR.Reset frame, drops
+	// st->pending_res when the thing that armed it was toggled, and services the overlay's
+	// "Reset NR feature" button through the existing deferred-teardown path. The full argument,
+	// with line references, is in the header comment of src/overlay_ui.hpp.
+	//
+	// A plain `return`, NOT NR_BAIL: NR_BAIL's one-shot latch would burn itself on the first
+	// toggle and never speak again. Returning here leaves 'issued' false, so ReShade issues the
+	// game's own Dispatch - a strict no-op.
+	if (!overlay_ui::begin_pass(g_cfg, st->need_reset, st->pending_res, st->pending_teardown,
+	                            st->feature_failed, st->codec.ok, st->codec_failed, st->orig_ok))
+		return;
+	// ---- END overlay_ui hook ----
+
 	// ---------------------------------------------------------------- resolve the SRVs
 	shader_record shader;
 	{
@@ -3575,8 +3602,34 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 		// Negative means "inherit LocalStructureStrength". 0.0 is NOT neutral.
 		ngx::set_f32(p, ngx::kParamSkinStructureStrength,  g_cfg.skin_structure_strength);
 		ngx::set_u32(p, ngx::kParamStyle,                  g_cfg.style);
+		// ---- BEGIN overlay_ui hook ----
+		// The overlay's "NR UI Correction" checkbox. Per-evaluate, exactly like Style, and NOT
+		// baked at create time - and st->params is the SAME parameter block nr_ensure_feature
+		// writes into, so a later CreateFeature sees it as well. DLSSNR.UICorrection is a real
+		// parameter of THIS snippet build: exactly one exact-line match in nvngx_dlssnr.dll's
+		// string table, against ZERO for DLSSNR.Upscaling. Without this write the checkbox would
+		// be a control that does nothing - the user would A/B it, see no change, and record a
+		// false negative. Default 0, which is also the snippet's own fallback, so an untouched
+		// install is bit-identical to one without this line.
+		ngx::set_u32(p, ngx::kParamUICorrection,           g_cfg.ui_correction);
+		// ---- END overlay_ui hook ----
 
 		const ngx::Result r = g_snippet.evaluate_feature(d3d12_cmd, st->feature, p, nullptr);
+
+		// ---- BEGIN overlay_ui hook ----
+		// Everything the overlay's status block needs, published as relaxed atomics that flow ONE way
+		// - render thread to overlay - exactly as st->hist_restored and census_codec_on already do.
+		// The overlay keeps its own evaluate counter rather than reading st->evaluate_count, which is
+		// a plain uint64 under st->mutex. The timestamp taken inside is the point of the exercise: a
+		// cumulative count cannot tell "14203 and climbing" from "14203 and stopped four minutes ago",
+		// which is exactly the confusion that cost a whole play session.
+		overlay_ui::publish_evaluate(
+			static_cast<uint32_t>(r), ngx::result_to_string(r), !ngx::failed(r),
+			st->out_w, st->out_h, probe::format_name(st->out_fmt), probe::format_name(st->neural_fmt),
+			velocity.w, velocity.h, scale_x, scale_y, codec_encoded,
+			st->hist_restored.load(std::memory_order_relaxed),
+			st->hist_dropped.load(std::memory_order_relaxed));
+		// ---- END overlay_ui hook ----
 		if (ngx::failed(r))
 		{
 			if (!st->logged_eval_fail)
@@ -3952,6 +4005,13 @@ static void nr_init_device(device *dev)
 		// the title runs is useful whether or not the DLSS-NR pass itself is turned on. It is
 		// gated only by its own key.
 		rt_census::arm(g_cfg.rt_census, g_cfg.rt_census_frames, &rt_census_log);
+		// ---- BEGIN overlay_ui hook ----
+		// Copy the live half of the freshly parsed ini into the overlay's atomics. Main thread,
+		// before any dispatch and before any overlay draw, so nothing can observe a half-seeded
+		// state. Also records the directory the Save button rewrites, and the baseline that the
+		// "Revert to stray_dlssnr.ini" button and the dirty test compare against.
+		overlay_ui::seed_from_config(g_cfg, dir);
+		// ---- END overlay_ui hook ----
 	}
 
 	if (!g_cfg.enabled)
@@ -4476,13 +4536,25 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 		// dispatch with 'dropped' flat is the success signature; 'dropped' climbing means the
 		// resource we denoised is NOT turning up as a colour SRV at the next dispatch, i.e. the
 		// UE 4.27 history model does not hold for this build and the loop is NOT broken.
-		if (nst != nullptr && (nr_hist_applied != 0 || nr_hist_dropped != 0 || g_cfg.history_restore))
+		// ---- BEGIN overlay_ui hook ----
+		// history_restore and copy_back are LIVE now, and the value in g_cfg is written by the
+		// overlay's snapshot on a RECORDING thread; on_present runs on the main thread. So the
+		// GATE and the values it prints both read the overlay's atomics - the gate included,
+		// because a racy gate is the same data race as a racy argument AND can additionally admit
+		// a line that then reports the opposite state. This is the only place outside nr_try_run
+		// that would otherwise read a snapshot-written field.
+		//
+		// Three tokens differ from the original statement, which read:
+		//     ... || g_cfg.history_restore))            in the condition
+		//     (int)g_cfg.history_restore, (int)g_cfg.copy_back,   in the argument list
+		if (nst != nullptr && (nr_hist_applied != 0 || nr_hist_dropped != 0 || overlay_ui::live_history_restore()))
 			LOGI("--- DLSS-NR history restore @ frame %llu: applied=%llu dropped=%llu "
 			     "(history_restore=%d copy_back=%d hdr_codec_running=%d pristine=%s)",
 			     (unsigned long long)g.frame,
 			     (unsigned long long)nr_hist_applied, (unsigned long long)nr_hist_dropped,
-			     (int)g_cfg.history_restore, (int)g_cfg.copy_back,
+			     (int)overlay_ui::live_history_restore(), (int)overlay_ui::live_copy_back(),
 			     (int)nr_codec_on, nr_orig_on ? "allocated" : "MISSING");
+		// ---- END overlay_ui hook ----
 
 		// The motion-vector decode's own accounting. 'decoded' climbing at one per accepted
 		// dispatch with mode=full is the success signature. 'cb_reuse' climbing means the
@@ -4622,6 +4694,38 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 			return FALSE;
 		register_events();
 		LOGI("STRAY DLSS-NR registered at RESHADE_API_VERSION=%u.", (unsigned)RESHADE_API_VERSION);
+		// ---- BEGIN overlay_ui hook ----
+		// DllMain is the one point in this file that sits BELOW every global the overlay reports on,
+		// so the status hook is installed here rather than scattered through init. It copies BY VALUE
+		// and only the LOAD-ONLY half of g_cfg: the live half is written by the snapshot on a
+		// recording thread, and handing the overlay a pointer would make reading one of those by
+		// accident possible.
+		overlay_ui::facts_hook() = [](overlay_ui::host_facts &f) {
+			f.addon_name          = NAME;
+			f.enabled_at_load     = g_cfg.enabled;
+			f.diagnostics         = g_cfg.diagnostics;
+			f.hdr_codec_at_load   = g_cfg.hdr_codec;
+			f.shader_hash         = g_cfg.shader_hash;
+			f.srv_depth           = g_cfg.srv_depth;
+			f.srv_velocity        = g_cfg.srv_velocity;
+			f.srv_colour          = g_cfg.srv_colour;
+			f.uav_output          = g_cfg.uav_output;
+			f.populate_parameters = g_cfg.populate_parameters;
+			f.require_trampoline  = g_cfg.require_trampoline;
+			f.app_id              = g_cfg.app_id;
+			f.ini_found           = g_cfg.ini_found;
+			f.snippet_loaded      = g_snippet.available;
+			f.trampoline          = g_snippet.trampoline_module != nullptr;
+			f.armed               = g_nr_armed.load(std::memory_order_relaxed);
+			f.abi_thunks_active   = probe::msvc_abi_thunks_active();
+			std::snprintf(f.snippet_reason, sizeof(f.snippet_reason), "%s",
+				g_snippet.not_available_reason.c_str());
+		};
+		// Binding the ImGui table is GetProcAddress on an already-loaded module plus a call that
+		// returns the address of a static table, so it is loader-lock safe. A ReShade build without
+		// add-on ImGui support costs the overlay and nothing else; the denoise is unaffected.
+		overlay_ui::install();
+		// ---- END overlay_ui hook ----
 		{
 			// The C++ ABI self-check. See msvc_abi.hpp: the three device virtuals that return a
 			// class by value are the only place where a non-MSVC build of this add-on and an

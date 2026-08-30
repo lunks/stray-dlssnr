@@ -248,6 +248,13 @@ struct config
 	// 0.0 is NOT neutral - it flattens skin structure.
 	float    skin_structure_strength  = -1.0f;
 	uint32_t style                    = 0;
+	// ---- BEGIN overlay_ui hook ----
+	// DLSSNR.UICorrection. A real parameter of THIS snippet build, unlike DLSSNR.Upscaling: the
+	// exact string is in nvngx_dlssnr.dll's table (measured), and the snippet reads it with a
+	// proper failure guard whose fallback is 0. Its VISUAL effect on this content has not been
+	// verified, so the default here is the snippet's own. Exposed by the overlay as a live knob.
+	uint32_t ui_correction            = 0;
+	// ---- END overlay_ui hook ----
 
 	// Gates BOTH structure strengths. With this at 0 the snippet internally forces both to -1 and
 	// neither does anything. Binding an explicit ControlMask also forces it to 0 inside the
@@ -393,6 +400,9 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "local_structure_strength") c.local_structure_strength = parse_float(v, c.local_structure_strength);
 		else if (key == "skin_structure_strength")  c.skin_structure_strength = parse_float(v, c.skin_structure_strength);
 		else if (key == "style")                    c.style = static_cast<uint32_t>(parse_u64(v, c.style));
+		// ---- BEGIN overlay_ui hook ----
+		else if (key == "ui_correction")            c.ui_correction = static_cast<uint32_t>(parse_u64(v, c.ui_correction));
+		// ---- END overlay_ui hook ----
 		else if (key == "use_auto_mask")            c.use_auto_mask = parse_bool(v, c.use_auto_mask);
 		else if (key == "app_id")                   c.app_id = parse_u64(v, c.app_id);
 		else                                        known = false;
