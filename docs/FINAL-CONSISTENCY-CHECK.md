@@ -204,3 +204,15 @@ but a fresh read for what a checklist cannot see: unsound abstractions, comments
 describe the code, error paths nobody would notice failing, and complexity that no longer pays for
 itself. Report findings ranked by severity with a concrete failure scenario each; an empty result is
 a real outcome and padding it is worse than useless.
+
+---
+
+## Appendix: branches retired, and why
+
+`§1` requires every branch to be merged or **abandoned with the reason recorded**. This is that record.
+
+| branch | disposition |
+|---|---|
+| `mvec-decode`, `overlay-ui`, `rr-census`, `rr-experiments`, `parity-fixes`, `dlss-sr`, `renodx-hdr`, `nr-sr-chain`, `live-settings` | merged into `main` |
+| `overlay-ui-concurrency-probe` | **retired unmerged.** A throwaway that explored the live-settings concurrency shape under both toolchains. Its two unique files, `src/live_settings.hpp` and `src/live_settings_probe.cpp`, were superseded by `abi/overlay_ui_probe.cpp`, which ships on `main` and is gated in CI. The branch was cut from an ancient `main` (its diff against current `main` is -25,492 lines), so nothing on it can be merged without reverting most of the project. |
+| `nr-tuning-live` | open at time of writing — the five NR tuning controls |
