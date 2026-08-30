@@ -36,12 +36,15 @@ extern "C" __declspec(dllexport) bool overlay_ui_pass_probe()
     static cfg::config             scratch;
     static overlay_ui::seen_epochs seen_pass;
     static bool                    need_reset = false;
+    // DLSS-SR's own Reset flag. Two out-params, not one: see begin_pass's header for why the two
+    // features' Reset flags are raised together on an edge and never mirrored level-to-level.
+    static bool                    sr_need_reset = false;
     static uint64_t                pending_res = 0;
 
     overlay_ui::seed_from_config(c, L"C:\\nowhere\\");
 
-    const bool run = overlay_ui::begin_pass(c, scratch, seen_pass, need_reset, pending_res,
-                                            true, false, true);
+    const bool run = overlay_ui::begin_pass(c, scratch, seen_pass, need_reset, sr_need_reset,
+                                            pending_res, true, false, true);
 
     overlay_ui::publish_evaluate(0u, "Success", true, 1920u, 1080u,
                                  "r16g16b16a16_float", "r16g16b16a16_float",
