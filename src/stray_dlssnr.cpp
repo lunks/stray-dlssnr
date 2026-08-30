@@ -1648,6 +1648,12 @@ struct nr_state
 	// the GPU.
 	uint32_t sr_render_w = 0, sr_render_h = 0, sr_out_w = 0, sr_out_h = 0;
 
+	// The COARSE geometry key, recorded UNCONDITIONALLY every frame the SR pass reaches the
+	// resolution latch - whether or not anything was ever allocated at it. sr_render_w/sr_out_w
+	// above are written ONLY on the create-SUCCESS branch and are therefore still 0 after a
+	// failed create, so they cannot be compared against to notice a move. This pair can.
+	uint32_t sr_seen_col_w = 0, sr_seen_col_h = 0, sr_seen_out_w = 0, sr_seen_out_h = 0;
+
 	// RUN-latched. Set when EvaluateFeature fails 8 frames running: at that point every further
 	// attempt is a per-frame call into a 59 MB DLL for a result we already have, and - critically
 	// - under sr_suppress_taa=1 it is also 8 frames of the game's own TAA running as the fallback.
@@ -1816,6 +1822,13 @@ static void nr_release_feature_and_output(device *dev, nr_state &st, const char 
 	st.sr_render_w = st.sr_render_h = st.sr_out_w = st.sr_out_h = 0;
 	st.sr_feat.failed = false;          // per-geometry, exactly like feature_failed above
 	st.sr_eval_fail_streak = 0;
+	// The one-shot ERROR latches that PAIR with the two counters above. Clearing the latch while
+	// leaving the "printed once" flag set would make the retry at the new geometry silent: the
+	// create would fail again, or the evaluate streak rebuild, with nothing in the log - and the
+	// message the previous failure printed promises exactly this retry. The INFO latches
+	// (logged_preset and the host's own) are deliberately left alone; only the errors reset.
+	st.sr_feat.logged_create_fail = false;
+	st.sr_feat.logged_eval_fail   = false;
 	st.sr_feat.need_reset = true;
 	// The jitter layout is per-resolution: discovery validates the view rect against the render
 	// extent, so a layout accepted at one resolution says nothing about the next.
@@ -2867,6 +2880,55 @@ static void sr_try_run(command_list *cmd, device *dev, probe::device_shadow &sh,
 		     colour.h != 0 ? (double)want_out_h / (double)colour.h : 0.0);
 	}
 
+	// ---------------------------------------------------------------- the COARSE geometry key
+	//
+	// Recorded UNCONDITIONALLY, and consulted BEFORE any per-geometry failure latch.
+	//
+	// The finer-grained geometry_moved test further down keys on state that EXISTS - a live
+	// feature handle, an allocated output texture, an allocated mvec texture - and with
+	// sr_direct_output=1 no add-on output texture is ever allocated, so with the mvec texture
+	// also absent (sr_mvec_decode=0, or the shared pipeline failed to build) there is NONE. A
+	// CreateFeature that failed at extent A would then latch sr_feat.failed with no clause able
+	// to notice a move to extent B, and DLSS-SR would be off for the rest of the process with no
+	// further diagnostic - while the error it printed says it will be retried when the geometry
+	// moves. nr_ensure_output had this property unconditionally on the DLSS-NR path; dlss_sr=1
+	// skips that call, so the property has to be restored here.
+	//
+	// The key is the COLOUR INPUT extent and the OUTPUT extent, both of which are known before
+	// the jitter read. render_w below can only differ from colour.w by the view rect, which is a
+	// sub-texture refinement of the same movement, and the finer test still catches that.
+	const uint32_t prev_col_w = st.sr_seen_col_w, prev_col_h = st.sr_seen_col_h;
+	const uint32_t prev_out_w = st.sr_seen_out_w, prev_out_h = st.sr_seen_out_h;
+	const bool key_moved = (prev_out_w != 0) &&
+		(prev_col_w != colour.w || prev_col_h != colour.h ||
+		 prev_out_w != want_out_w || prev_out_h != want_out_h);
+	st.sr_seen_col_w = colour.w;   st.sr_seen_col_h = colour.h;
+	st.sr_seen_out_w = want_out_w; st.sr_seen_out_h = want_out_h;
+	if (key_moved)
+	{
+		LOGI("DLSS-SR: the geometry moved (colour input %ux%u -> %ux%u, output %ux%u -> %ux%u). "
+		     "Everything per-geometry - the feature, both add-on textures, and every failure "
+		     "latch on them - is queued for release on the next present; this frame runs the "
+		     "game's own TAA untouched.",
+		     prev_col_w, prev_col_h, colour.w, colour.h,
+		     prev_out_w, prev_out_h, want_out_w, want_out_h);
+		st.pending_teardown = true;
+		return;
+	}
+
+	// THE PER-GEOMETRY CREATE LATCH, and it gates the WHOLE PASS rather than just create_feature.
+	//
+	// dlss_sr::create_feature short-circuits on f.failed, but everything ABOVE it in this
+	// function would still run every frame for a feature that can never exist: sr_find_view_pool
+	// plus five Map/Unmap round trips of UE's upload pool in update_jitter, the ClipToPrevClip
+	// read, a full render-extent mvec_decode dispatch, two barriers on the guide, and
+	// probe::restore_state. The frames stay correct - issued is left false and ReShade re-issues
+	// the game's TAAU - but the cost is permanent and silent. Bail here instead, AFTER the key
+	// check above so a genuine geometry change still queues the teardown that clears the latch.
+	if (st.sr_feat.failed)
+		SR_BAIL("CreateFeature failed for this geometry, so the WHOLE PASS is off until the "
+		        "colour-input or output extent moves - see the CreateFeature error above");
+
 	// ---------------------------------------------------------------- JITTER, and it is MANDATORY
 	//
 	// Jitter.Offset.X/Y sit in the same hard gate as Color/MotionVectors/Depth/Output. There is no
@@ -2982,6 +3044,20 @@ static void sr_try_run(command_list *cmd, device *dev, probe::device_shadow &sh,
 	// SR's own, and it is allocated at the RENDER extent rather than the output extent - because
 	// SR's colour input is the TAA pass's INPUT (t5), not its output. A guide at the output extent
 	// would be read by DLSS at 2x the correct scale per axis under Performance mode, silently.
+	// THE LADDER, and it is the DLSS-NR path's ladder rung for rung. A missing or unvalidated
+	// View.ClipToPrevClip falls back to RAW, never to decode-only: decode-only hands DLSS ZERO
+	// motion for every texel UE did not write - the entire static world, the sky, translucency -
+	// which is the failure this pass exists to prevent and is strictly worse than a uniformly-
+	// wrong guide. Decode-only is reachable ONLY because sr_mvec_reconstruct=0 asked for it.
+	//
+	// This is not hypothetical here. The clip failure is a PERMANENTLY LATCHED, once-logged
+	// condition (view_layout_failed) with several reachable triggers, and the likeliest one is
+	// specific to the configuration DLSS-SR targets: the clip-row disagreement test compares the
+	// View-CB content signature against shader.info.clip_to_prev_clip_start_index, which is DXBC
+	// instruction analysis of THIS shader - and under r.TemporalAA.Upsampling=1 that is a
+	// different permutation (MainUpsampling) than the one the test was validated against. SR's
+	// jitter uses its own cache with its own tier policy, so jitter can validate while the clip
+	// path latches off, and the pass still runs.
 	enum class sr_mvec_mode { raw = 0, decode_only = 1, full = 2 };
 	sr_mvec_mode run_mvec = sr_mvec_mode::raw;
 
@@ -2990,27 +3066,36 @@ static void sr_try_run(command_list *cmd, device *dev, probe::device_shadow &sh,
 	                         vel_view.handle != 0 && depth_view.handle != 0;
 	if (mvec_wanted && dlss_sr::ensure_mvec(dev, st.sr_res, colour.w, colour.h, &sr_log))
 	{
+		// Read unconditionally, exactly as the DLSS-NR path does, so the once-logged diagnostic
+		// inside it fires whichever rung is taken.
 		const bool clip = nr_update_clip_to_prev_clip(dev, sh, cs, st, shader, colour.w, colour.h);
-		run_mvec = (clip && st.clip_ok) ? sr_mvec_mode::full : sr_mvec_mode::decode_only;
+
+		if (!g_cfg.sr_mvec_reconstruct)
+			run_mvec = sr_mvec_mode::decode_only;
+		else if (clip && st.clip_ok)
+			run_mvec = sr_mvec_mode::full;
+		// else: raw. nr_update_clip_to_prev_clip already logged exactly why, once.
 	}
 
 	if (run_mvec != sr_mvec_mode::full && !st.logged_sr_mvec_off)
 	{
 		st.logged_sr_mvec_off = true;
-		LOGW("DLSS-SR: the motion guide is %s. %s This message is printed once.",
-		     run_mvec == sr_mvec_mode::raw
-		        ? "the game's RAW ENCODED velocity buffer"
-		        : "DECODED but NOT camera-reconstructed",
-		     run_mvec == sr_mvec_mode::raw
-		        ? "UE4 writes screen-space velocity with a scale AND a bias, so a normalised-integer "
-		          "velocity buffer is not in absolute pixels at all and MV.Scale.X/Y can rescale a "
-		          "grid but cannot remove a bias. For DLSS-NR that was survivable; for DLSS-SR it is "
-		          "not, because there is no second temporal filter behind it - expect ghosting and "
-		          "smearing that does not track camera motion. Check sr_mvec_decode, and the "
-		          "mvec_decode messages above for the specific reason."
-		        : "View.ClipToPrevClip could not be located or validated, so every texel UE did not "
-		          "write - the entire static world, the sky, translucency - carries ZERO motion. "
-		          "That is worse than the raw buffer for actual play; it is here as a bring-up A/B.");
+		if (run_mvec == sr_mvec_mode::raw)
+			LOGW("DLSS-SR: the motion guide is the game's RAW ENCODED velocity buffer. UE4 writes "
+			     "screen-space velocity with a scale AND a bias, so a normalised-integer velocity "
+			     "buffer is not in absolute pixels at all and MV.Scale.X/Y can rescale a grid but "
+			     "cannot remove a bias. For DLSS-NR that was survivable; for DLSS-SR it is not, "
+			     "because there is no second temporal filter behind it - expect ghosting and "
+			     "smearing that does not track camera motion. Check sr_mvec_decode, and the "
+			     "mvec_decode / View.ClipToPrevClip messages above for the specific reason. This "
+			     "message is printed once.");
+		else
+			LOGW("DLSS-SR: sr_mvec_reconstruct=0. The velocity texture is decoded correctly, but "
+			     "every INVALID texel - which under r.BasePassOutputsVelocity=1 is still the whole "
+			     "static world, the sky, translucency and every movable that did not move - is "
+			     "written as EXACTLY ZERO. That is a bring-up A/B for isolating the decode from "
+			     "the camera reconstruction, and it is WORSE than sr_mvec_decode=0 for actual "
+			     "play. This message is printed once.");
 	}
 
 	// ================================================================ FROM HERE WE MAY OWN THE DISPATCH
@@ -4692,14 +4777,25 @@ static void nr_init_device(device *dev)
 		if (!ngx::load_snippet(g_snippet, dir, ngx::spec_dlssnr(), g_cfg.require_trampoline))
 		{
 			// A missing snippet is the EXPECTED state for a stock install, and is not an error.
+			//
+			// AND IT MUST NOT RETURN FROM HERE. The DLSS-SR block below loads a SECOND,
+			// INDEPENDENT snippet: a return here would mean a missing or unloadable
+			// nvngx_dlssnr.dll silently made dlss_sr=1 unreachable - no LoadLibraryW of
+			// nvngx_dlss.dll, slot B never claimed, g_nr_pending_init never set, so
+			// nr_lazy_ngx_init never runs, g_sr_armed stays false, and nr_try_run bails on
+			// !g_nr_armed before sr_try_run is even entered. Not one of the SR diagnostics would
+			// fire, because every one of them lives inside sr_try_run. The both-absent case is
+			// handled below, AFTER both attempts have been made.
 			LOGI("DLSS-NR not available: %s", g_snippet.not_available_reason.c_str());
-			return;
 		}
-		LOGI("DLSS-NR: loaded nvngx_dlssnr.dll%s.",
-			g_snippet.trampoline_module != nullptr
-				? " and routed every call through remix_nvngx.dll"
-				: " (WITHOUT remix_nvngx.dll - require_trampoline=0; every GATED export is "
-				  "expected to return 0xbad00002)");
+		else
+		{
+			LOGI("DLSS-NR: loaded nvngx_dlssnr.dll%s.",
+				g_snippet.trampoline_module != nullptr
+					? " and routed every call through remix_nvngx.dll"
+					: " (WITHOUT remix_nvngx.dll - require_trampoline=0; every GATED export is "
+					  "expected to return 0xbad00002)");
+		}
 	}
 
 	// ---- DLSS SUPER RESOLUTION -----------------------------------------------------------
@@ -4805,6 +4901,26 @@ static bool nr_lazy_ngx_init(device *dev)
 	{
 		LOGI("DLSS-NR: dlss_nr=0, so nvngx_dlssnr.dll is neither loaded nor initialised and the "
 		     "DLSS-NR evaluate never runs. This is the pure-DLSS-SR configuration.");
+	}
+
+	// THE PRE-SR EARLY EXIT, restored.
+	//
+	// Before DLSS-SR existed, a failed Init_Ext or a failed parameter-block allocation returned
+	// from here IMMEDIATELY and nothing below - the HDR codec pipelines, the mvec pipeline - was
+	// ever built. Replacing those two returns with nr_ok moved the exit past both blocks, so on
+	// that failure path dlss_sr=0 would have started building pipelines a pre-SR build never
+	// touched. It costs nothing at runtime and changes no pixel, but "dlss_sr=0 is byte for byte
+	// the build before SR existed" has to be true as stated, not nearly true. The exit is taken
+	// whenever DLSS-SR is not going to arm either; the mvec block below must stay reachable when
+	// it IS, because the two features share that one pipeline.
+	const bool sr_will_try = g_cfg.dlss_sr && g_sr_snippet.available;
+	if (!nr_ok && !sr_will_try)
+	{
+		if (g_cfg.dlss_sr)
+			LOGE("DLSS-SR: dlss_sr=1 but nvngx_dlss.dll never loaded (the reason is above), so "
+			     "there is nothing to initialise. Neither feature is armed and the game renders "
+			     "exactly as it does with the add-on unloaded.");
+		return false;
 	}
 
 	// ---- the HDR codec -----------------------------------------------------------------------
@@ -5031,8 +5147,9 @@ static bool nr_lazy_ngx_init(device *dev)
 		     (g_cfg.sr_jitter_scale_x != 1.0f || g_cfg.sr_jitter_scale_y != 1.0f)
 		        ? "  <-- OVERRIDDEN, this is the sign A/B" : "",
 		     g_cfg.sr_jitter_projection_only ? "projection_only permitted" : "strict (full/no_params)");
-		LOGI("  motion guide    sr_mvec_decode=%d (pipeline %s) scale=%s/%s",
-		     (int)g_cfg.sr_mvec_decode, st->mvec.ok ? "built" : "NOT BUILT",
+		LOGI("  motion guide    sr_mvec_decode=%d sr_mvec_reconstruct=%d (pipeline %s) scale=%s/%s",
+		     (int)g_cfg.sr_mvec_decode, (int)g_cfg.sr_mvec_reconstruct,
+		     st->mvec.ok ? "built" : "NOT BUILT",
 		     g_cfg.sr_mv_scale_x != 0.0f ? "OVERRIDDEN" : "auto",
 		     g_cfg.sr_mv_scale_y != 0.0f ? "OVERRIDDEN" : "auto");
 		LOGW("DLSS-SR: the confirmation that the feature actually RAN is the line "

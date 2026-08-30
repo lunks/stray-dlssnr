@@ -240,7 +240,9 @@ struct config
 	//   * this key is parsed, and one bool is stored;
 	//   * nr_init_device tests it once and does NOT LoadLibraryW nvngx_dlss.dll;
 	//   * nr_lazy_ngx_init tests it once and does not call Init_Ext on the SR snippet, does not
-	//     allocate the SR parameter block, and does not touch remix_nvngx.dll's slot B;
+	//     allocate the SR parameter block, and does not touch remix_nvngx.dll's slot B - and on
+	//     the DLSS-NR FAILURE path it takes the same early exit it took before SR existed, so
+	//     the HDR-codec and mvec pipelines are not built there either;
 	//   * nr_try_run tests it once per accepted TAA dispatch, before anything else SR-related,
 	//     and takes the DLSS-NR branch unchanged;
 	//   * nr_pick_output_uav tests it once per accepted dispatch and applies the ORIGINAL
@@ -316,6 +318,14 @@ struct config
 	// INPUT. 0 binds the game's raw encoded velocity, which is README gap 2 unmitigated - for SR
 	// that is worse than for NR, because SR has no second temporal filter behind it.
 	bool     sr_mvec_decode = true;
+	// Reconstruct camera motion from depth through View.ClipToPrevClip wherever UE4 left the
+	// velocity texel invalid. THE SAME KEY mvec_reconstruct is on the DLSS-NR path, and it exists
+	// for the same reason: so that decode-only is only ever reached because someone ASKED for it.
+	// 0 writes EXACTLY ZERO motion for the whole static world, the sky and translucency, which is
+	// a bring-up A/B for isolating the decode from the reconstruction and is worse than
+	// sr_mvec_decode=0 for actual play. A ClipToPrevClip that cannot be located or validated
+	// falls back to the RAW buffer, not to this.
+	bool     sr_mvec_reconstruct = true;
 	// MV.Scale.X / MV.Scale.Y overrides. 0 = derive (exactly 1.0 with the decode on, because the
 	// decode already emits absolute pixels on the render grid; the extent ratio otherwise).
 	// A SINGLE key at -1 tests a per-axis sign error; BOTH at -1 together tests the direction
@@ -336,12 +346,37 @@ struct config
 	bool     sr_jitter_projection_only = false;
 
 	// ---- DLSS.Feature.Create.Flags ------------------------------------------------------------
-	// Bit 0. [ASSUMED] for STRAY - the two researchers agree that nothing in the snippet bears on
-	// whether this game's colour buffer is HDR, and it is a property of the game's TAA pass, not
-	// of the DLL. It defaults OFF, which is the conservative choice, and it is worth knowing that
-	// IsHDR=0 SILENTLY PINS DLSS.Pre.Exposure and DLSS.Exposure.Scale to 1.0 inside the snippet -
-	// so with it clear there is no exposure contract to get wrong. A/B it once SR renders.
-	bool     sr_hdr = false;
+	// Bit 0. IsHDR is NOT an exposure gate - it SELECTS A DIFFERENT TRAINED NETWORK, exactly like
+	// DepthInverted and MVLowRes, and the binary says so [SRC nvngx_dlss.dll sha256
+	// c85f971c..0b7e]:
+	//   * the engine ships PAIRED _hdr_/_ldr_ CUDA kernels for every other combination -
+	//     hiluma_engine_{input,output}_depth{inv,reg}_mv{lo,hi}_{hdr,ldr}_v{1,2}_rel and the
+	//     _max_v2_ variants (44 names at file offsets 0x12f9f8-0x1301b8), plus
+	//     cuda_engine_input_kernel_rel_{hdr,ldr}_{colvar,mvdiff}_mv{lo,hi} and
+	//     cuda_engine_output_kernel_rel_{hdr,ldr}_gauss{3x3,5x5} at 0x12f710-0x12f970.
+	//   * the loader registers each one under a descriptor word it stores at [rbp+0x38]
+	//     immediately before passing the name. For the INPUT set the four bytes are, LSB first,
+	//     {v2, IsHDR, MVLowRes, DepthInverted}: depthinv_mvlo_hdr_v2 = 0x01010101,
+	//     depthinv_mvlo_ldr_v2 = 0x01010001, depthreg_mvhi_ldr_v2 = 0x00000001
+	//     [SRC .text 0x18004f87d-0x18004fc2e]. The OUTPUT set spends the low two bytes on
+	//     {max, v2} and carries DepthInverted in the separate byte at [rbp+0x3c] - 1 for every
+	//     depthinv_ name, r12b (zeroed at 0x18004ee0b) for every depthreg_ one - leaving IsHDR
+	//     and MVLowRes as the high two bytes: depthinv_mvlo_hdr_v2 = 0x01010100,
+	//     depthinv_mvhi_hdr_v2 = 0x00010100 [SRC .text 0x18004fc64-0x18005082f].
+	//   * CreateDlssInstance logs the three together: "HDR %d / Motion Vectors LowRes %d /
+	//     Motion Vectors Jittered %d / Depth Inverted %d" [SRC 0x12dfe0-0x12e098].
+	// Two of those three discriminators are already set from STRAY's measured properties, so the
+	// third has to be too. SR binds ed.color = STRAY's t5 SceneColor: r16g16b16a16_float, linear,
+	// unbounded, upstream of bloom, eye adaptation and the film tone curve, with no codec in
+	// front of it. That is the HDR input, so this is 1. Clearing it would run the _ldr_ engine on
+	// out-of-distribution data: EvaluateFeature returns Success, no diagnostic fires anywhere,
+	// and the image comes back wrong in the same way README gap 1 documents.
+	// The key stays so LDR remains A/B-able. Setting it does NOT create an exposure obligation:
+	// with IsHDR set the snippet reads DLSS.Pre.Exposure and DLSS.Exposure.Scale, and this add-on
+	// writes neither - the snippet's own miss-default for both is 1.0f
+	// [SRC 0x18003ca9d / 0x18003cac4], and the <= 0 clamp at 0x18003cc51 is a second net under
+	// that. sr_auto_exposure (bit 6) is meaningful only for HDR input, so the two now agree.
+	bool     sr_hdr = true;
 	// Bit 1. Velocity lives at the render resolution, which under any real upscale is LOWER than
 	// the output - so this is set. At 1:1 (DLAA) it should be cleared.
 	bool     sr_mv_lowres = true;
@@ -536,6 +571,7 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "sr_direct_output")         c.sr_direct_output = parse_bool(v, c.sr_direct_output);
 		else if (key == "sr_copy_back")             c.sr_copy_back = parse_bool(v, c.sr_copy_back);
 		else if (key == "sr_mvec_decode")           c.sr_mvec_decode = parse_bool(v, c.sr_mvec_decode);
+		else if (key == "sr_mvec_reconstruct")      c.sr_mvec_reconstruct = parse_bool(v, c.sr_mvec_reconstruct);
 		else if (key == "sr_mv_scale_x")            c.sr_mv_scale_x = parse_float(v, c.sr_mv_scale_x);
 		else if (key == "sr_mv_scale_y")            c.sr_mv_scale_y = parse_float(v, c.sr_mv_scale_y);
 		else if (key == "sr_jitter_scale_x")        c.sr_jitter_scale_x = parse_float(v, c.sr_jitter_scale_x);

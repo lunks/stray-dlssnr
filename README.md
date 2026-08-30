@@ -737,7 +737,9 @@ Exactly this much runs:
 * the key is parsed and one `bool` is stored;
 * `nr_init_device` tests it once and does **not** `LoadLibraryW` `nvngx_dlss.dll`;
 * `nr_lazy_ngx_init` tests it once and does not call `Init_Ext` on the SR snippet, does not
-  allocate the SR parameter block, and never touches the trampoline's slot B;
+  allocate the SR parameter block, and never touches the trampoline's slot B — and when the
+  DLSS-NR half of that function fails, it takes the **same early exit it took before SR existed**,
+  so the HDR-codec and mvec pipelines are not built on that path either;
 * `nr_try_run` tests it once per accepted TAA dispatch, *before* anything SR-related, and takes
   the DLSS-NR branch unchanged;
 * `nr_pick_output_uav` tests it once per accepted dispatch and applies the **original**

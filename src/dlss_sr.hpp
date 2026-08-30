@@ -63,7 +63,33 @@
 //                   both forced to 1.0f whenever IsHDR (create-flag bit 0) is CLEAR or the value
 //                   is <= 0 [SRC 0x18003cc47 / 0x18003cc51 / 0x18003cc62]. So the exposure
 //                   contract is coupled to a CREATE-time flag, which is not documented anywhere.
+//                   BUT DO NOT READ THAT AS "IsHDR IS THE EXPOSURE GATE" - see the note below;
+//                   this coupling is a side effect, not what the flag is for. It also means
+//                   setting IsHDR costs nothing here: neither key is written by this header and
+//                   the snippet's own miss-default for both is 1.0f
+//                   [SRC 0x18003ca9d / 0x18003cac4].
 // None of them is written by this header.
+//
+// ============================================================================================
+// WHAT IsHDR ACTUALLY DOES - it selects a NETWORK
+// ============================================================================================
+// IsHDR is a discriminator on the trained kernel, in exactly the same class as DepthInverted and
+// MVLowRes, and not a hint about exposure:
+//   * paired _hdr_/_ldr_ CUDA kernels exist for every other combination -
+//     hiluma_engine_{input,output}_depth{inv,reg}_mv{lo,hi}_{hdr,ldr}_v{1,2}_rel and the
+//     _max_v2_ variants, 44 names at file offsets 0x12f9f8-0x1301b8, plus
+//     cuda_engine_{input,output}_kernel_rel_{hdr,ldr}_* at 0x12f710-0x12f970;
+//   * the loader stores a descriptor word at [rbp+0x38] immediately before passing each name.
+//     For the INPUT set the bytes are, LSB first, {v2, IsHDR, MVLowRes, DepthInverted} -
+//     depthinv_mvlo_hdr_v2 = 0x01010101, depthinv_mvlo_ldr_v2 = 0x01010001,
+//     depthreg_mvhi_ldr_v2 = 0x00000001 [SRC .text 0x18004f87d-0x18004fc2e]. The OUTPUT set
+//     spends the low two bytes on {max, v2} and carries DepthInverted in the byte at [rbp+0x3c]
+//     instead - 1 for every depthinv_ name, r12b (zeroed at 0x18004ee0b) for every depthreg_ one
+//     [SRC .text 0x18004fc64-0x18005082f];
+//   * CreateDlssInstance prints the three together: "HDR %d / Motion Vectors LowRes %d / Motion
+//     Vectors Jittered %d / Depth Inverted %d" [SRC 0x12dfe0-0x12e098].
+// So it must be set from the real property of the colour buffer being bound, the same way the
+// other two are. Getting it wrong runs an out-of-distribution network and returns Success.
 //
 // ============================================================================================
 // APP ID
@@ -109,7 +135,7 @@ static constexpr uint32_t kFeatureSuperSampling = 1u;
 // DLSS.Feature.Create.Flags. The bit<->name binding is MEASURED, not assumed: CreateDlssInstance
 // shifts and masks each bit immediately before printing its own name for it
 // [SRC 0x18003a338-0x18003a449, dlaa.cpp:2127-2133].
-static constexpr uint32_t kFlagIsHDR          = 1u << 0;  // ALSO gates Pre.Exposure/Exposure.Scale
+static constexpr uint32_t kFlagIsHDR          = 1u << 0;  // NETWORK SELECTOR; also gates Pre.Exposure/Exposure.Scale
 static constexpr uint32_t kFlagMVLowRes       = 1u << 1;
 static constexpr uint32_t kFlagMVJittered     = 1u << 2;
 static constexpr uint32_t kFlagDepthInverted  = 1u << 3;
@@ -584,8 +610,11 @@ inline bool create_feature(const ngx::snippet &sn, feature &f, ID3D12GraphicsCom
 			f.logged_create_fail = true;
 			char buf[1400];
 			std::snprintf(buf, sizeof(buf),
-				"DLSS-SR: CreateFeature(feature %u) FAILED: 0x%08x %s. %s The feature is latched "
-				"off for render %ux%u -> output %ux%u and will only be retried if one of those "
+				"DLSS-SR: CreateFeature(feature %u) FAILED: 0x%08x %s. %s THE WHOLE DLSS-SR PASS IS "
+				"NOW OFF - not just the feature: the host bails at the top of its dispatch hook "
+				"rather than paying for the jitter read, the motion-vector decode and the state "
+				"restore every frame for a feature that cannot exist. It is latched for render "
+				"%ux%u -> output %ux%u and is retried when the colour-input or output extent "
 				"moves. The game's own TAA is untouched.",
 				kFeatureSuperSampling, (unsigned)r, ngx::result_to_string(r), explain_result(r),
 				c.render_w, c.render_h, c.out_w, c.out_h);

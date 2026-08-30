@@ -198,11 +198,19 @@ first time you see DLSS's image.** It costs a full-extent 4K copy per frame.
    contract, not in these keys.
 3. **Ghosting/smearing that does not track the camera.** That is the **motion guide**. A/B:
    * `sr_mvec_decode = 0` → the game's raw encoded velocity (expect this to be *worse*).
+   * `sr_mvec_reconstruct = 0` → decoded but **not** camera-reconstructed. Isolates the decode
+     from the reconstruction. Expect it to be worse than both of the above for actual play — it
+     writes exactly zero motion for the whole static world — and note that this is now the *only*
+     way to reach that mode: a `View.ClipToPrevClip` that cannot be located or validated falls
+     back to the **raw** buffer, matching the DLSS-NR ladder.
    * `sr_mv_scale_x = -1`, then `sr_mv_scale_y = -1`, then **both** — the same two distinct tests
      the DLSS-NR path documents. Only "both together" can settle the direction convention.
-4. **Brightness.** `sr_hdr` is `0` — `[ASSUMED]`, see §3. Try `sr_hdr = 1`. Note that with
-   `sr_hdr = 0` the snippet *silently pins* `DLSS.Pre.Exposure` and `DLSS.Exposure.Scale` to 1.0,
-   so there is no exposure contract to get wrong at 0.
+4. **Brightness.** `sr_hdr` is `1`, and that is **[SRC]**, not a guess — see §3. `IsHDR` selects
+   a different trained network (paired `_hdr_`/`_ldr_` CUDA kernels, and the flag sits in the same
+   descriptor word as `MVLowRes` and `DepthInverted`), and SR binds STRAY's linear pre-tonemap
+   `t5` SceneColor. If the image is *still* wrong in brightness, A/B `sr_hdr = 0` to confirm the
+   direction, then look at `sr_auto_exposure` — but report both, because `sr_hdr = 0` is running
+   the LDR network on HDR input by construction.
 
 ---
 
@@ -303,7 +311,7 @@ Every one is tagged in the code and in `stray_dlssnr.ini`. These are the ones th
 |---|---|---|---|
 | `r.SecondaryScreenPercentage` is honoured from `[SystemSettings]` | **[ASSUMED]** | never tested on the shipping build | rung 0 |
 | the output view rect equals `8 * group_count` | **[ASSUMED]** | `GetGroupCount` is `DivideAndRoundUp`, so the true value is in `(8gx-8, 8gx]`; it is exact whenever the output is a multiple of 8, which every display resolution is | the `OUTPUT EXTENT` log line prints both the band and the u0 texture; `sr_out_width`/`sr_out_height` pin it |
-| `IsHDR` (`sr_hdr = 0`) | **[ASSUMED]** | nothing in the snippet bears on whether STRAY's colour buffer is HDR — it is a property of the game's TAA pass. The **conservative** choice was taken: with `IsHDR` clear the snippet pins `DLSS.Pre.Exposure`/`DLSS.Exposure.Scale` to 1.0, so there is no exposure contract to get wrong | rung 3, item 4 |
+| `IsHDR` (`sr_hdr = 1`) | **[SRC** `nvngx_dlss.dll` sha256 `c85f971c…0b7e` **]** | it is a **network selector**, not an exposure gate. The DLL ships paired `_hdr_`/`_ldr_` CUDA kernels for every other combination — `hiluma_engine_{input,output}_depth{inv,reg}_mv{lo,hi}_{hdr,ldr}_v{1,2}_rel`, 44 names at `0x12f9f8‑0x1301b8`, plus `cuda_engine_{input,output}_kernel_rel_{hdr,ldr}_*` at `0x12f710‑0x12f970` — and the loader registers each under a descriptor word in which `IsHDR` sits in the same four bytes as `MVLowRes` and `DepthInverted` (`.text 0x18004f87d‑0x18005082f`; `DepthInverted` moves to the byte at `[rbp+0x3c]` for the output set, `1` for every `depthinv_` name and `r12b`, zeroed at `0x18004ee0b`, for every `depthreg_` one). `CreateDlssInstance` logs the three together (`0x12dfe0‑0x12e098`). SR binds `t5` SceneColor: `r16g16b16a16_float`, linear, pre‑tonemap, no codec — HDR input. **No exposure obligation follows:** with `IsHDR` set the snippet reads `DLSS.Pre.Exposure`/`DLSS.Exposure.Scale`, this add-on writes neither, and the snippet's miss‑default for both is `1.0f` (`0x18003ca9d` / `0x18003cac4`), with a `<= 0` clamp behind it (`0x18003cc51`) | rung 3, item 4 |
 | `MVJittered` (`sr_mv_jittered = 0`) | **[ASSUMED]** | UE4's velocity buffer is believed not jitter-compensated; never measured | A/B at rung 3 |
 | `ViewRectMin == (0,0)` in the motion decode | **[ASSUMED]** | `SetupViewRect` forces `OutputViewRect.Min = (0,0)` for upsampling configs and `SceneRendering.cpp` shifts every view rect to the top-left. The same assumption the DLSS-NR path already makes | a non-zero `ViewRectMin` shows up as a uniform smear that does not vary with camera motion |
 | the snippet's own log sink is **not** wired | **[ASSUMED / deliberately skipped]** | `NGXDLAA::Init` reads `Log.Callback` out of the parameter block during `Init_Ext`, and routing it into `ReShade.log` would carry every internal error with its `dlaa.cpp` line number — the cheapest diagnostic on this path. It is **not implemented** because the callback's ABI signature was never verified against this binary, and handing NGX a wrong-arity function pointer is a crash, not a log line. Worth doing once that signature is measured | measure the callback's arity in the disassembly first |
