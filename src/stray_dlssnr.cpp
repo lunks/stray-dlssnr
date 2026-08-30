@@ -3801,31 +3801,43 @@ static void nr_codec_decode(command_list *cmd, nr_state &st, resource_view origi
                             float proxy_scale, float transfer_strength, float color_strength,
                             uint32_t graft_mode, bool &out_in_srv)
 {
-	// ---- THE NR PROBE, BEFORE THE BARRIER (nr_probe=1 only) ---------------------------------
-	// Deliberately ahead of the transition below: out_tex is still in unordered_access, exactly
-	// as NGX left it, so this reads the texture through a UAV by the same route NGX wrote it.
-	//
-	// Reading it AFTER the barrier, through st.out_srv, returned EXACTLY zero on validated
-	// gameplay content (IN [0.786 .. 4912.7], OUT [0.0 .. 0.0], 1.7M samples/step, means
-	// agreeing with the extremes). That is either an empty texture or a broken SRV/state, and
-	// the two are indistinguishable from that side. This dispatch is the same texture in the
-	// same frame by the other route, which separates them.
-	if (g_cfg.nr_probe != 0 && st.probe.ready)
-	{
-		nr_probe::frame(cmd->get_device(), cmd, st.probe, st.probe_run,
-		                original_srv, st.out_srv, g_cfg.nr_probe_selftest != 0, st.out_w, st.out_h,
-		                g_cfg.nr_probe_frames, g_cfg.nr_probe_warmup,
-		                [](const char *fmt, auto... args) {
-			                logf(reshade::log::level::info, fmt, args...);
-		                });
-	}
-
 	// NGX wrote out_tex OUTSIDE anything that tracks it, so nothing knows the decode's read of
 	// it has to wait. This transition is that dependency, and it is also what makes the
 	// texture readable as an SRV. (rtx_neural_rendering.cpp:408-441 records the same two
 	// hazards in Vulkan terms.)
 	cmd->barrier(st.out_tex, resource_usage::unordered_access, resource_usage::shader_resource_non_pixel);
 	out_in_srv = true;
+
+	// ---- THE NR PROBE (nr_probe=1 only) ------------------------------------------------------
+	// AFTER the barrier, and that placement is the whole point.
+	//
+	// This block previously sat BEFORE the transition above, from when it read out_tex through a
+	// UAV. The shader was later reverted to an SRV read and the call site was not moved, so it
+	// was sampling out_tex as a shader resource while the texture was still in
+	// unordered_access - an invalid state for that read, and undefined reads come back as ZERO.
+	//
+	// That single mistake produced every "the network's output is zero" result: the zero was
+	// invariant across r16g16b16a16_float and r10g10b10a2_unorm, across the proxy and the game's
+	// colour as DLSSNR.Color, and with populate_parameters on and off - invariance across every
+	// property of the texture, which is the signature of a reader bug, not an empty texture.
+	//
+	// The probe's own self-test could not catch it: it binds in_srv into the second slot, and
+	// orig_tex IS in a valid SRV state, so it proved the BINDING was sound while saying nothing
+	// about the STATE of out_tex.
+	//
+	// Corroborating evidence that out_tex was never empty: with hdr_codec=0, copy_back writes
+	// out_tex straight to the screen and produces a real frame (mean luma 29.29, against 36.02
+	// with copy_back=0).
+	if (g_cfg.nr_probe != 0 && st.probe.ready)
+	{
+		nr_probe::frame(cmd->get_device(), cmd, st.probe, st.probe_run,
+		                original_srv, st.out_srv, g_cfg.nr_probe_selftest != 0,
+		                st.out_w, st.out_h,
+		                g_cfg.nr_probe_frames, g_cfg.nr_probe_warmup,
+		                [](const char *fmt, auto... args) {
+			                logf(reshade::log::level::info, fmt, args...);
+		                });
+	}
 
 	// The cache sync again, and this is the call whose absence is a device removal: NGX has
 	// just rebound the descriptor heaps and the compute root signature on the RAW list, and
