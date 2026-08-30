@@ -350,7 +350,7 @@ cbuffer NrDecodeArgs : register(b0)
 	// g_decodePad0, so the root-constant COUNT and the root signature are unchanged - this is a
 	// tier-0 live knob, not a pipeline rebuild.
 	uint  g_hdrGraft;
-	// THE POPULATED REGION OF InNeural, in texels. 0 (or equal to g_width/g_height) means "the
+	// THE POPULATED REGION OF InNeural, in texels. 0 (or equal to g_imageSize) means "the
 	// network filled the whole surface", which is the historical behaviour and an exact no-op.
 	uint  g_neuralW;
 	uint  g_neuralH;
@@ -382,12 +382,12 @@ static const float kNrMinChromaLuminance = 0.001f;
 int2 nrNeuralCoord(uint2 threadId)
 {
 	if (g_neuralW == 0u || g_neuralH == 0u ||
-	    (g_neuralW == g_width && g_neuralH == g_height))
+	    (g_neuralW == g_imageSize.x && g_neuralH == g_imageSize.y))
 		return int2(threadId);
 
 	// Same scene location, lower sampling grid: map the output texel's centre into the populated
 	// region, so the residual still pairs neural and proxy at the same point in the image.
-	const float2 uv  = (float2(threadId) + 0.5f) / float2(g_width, g_height);
+	const float2 uv  = (float2(threadId) + 0.5f) / float2(g_imageSize);
 	const float2 pos = uv * float2(g_neuralW, g_neuralH);
 	return int2(clamp(pos, float2(0.0f, 0.0f),
 	                  float2(float(g_neuralW) - 1.0f, float(g_neuralH) - 1.0f)));
