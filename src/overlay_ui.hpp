@@ -322,6 +322,19 @@ struct status_block
 	std::atomic<bool>         codec_pipelines_ok{ false };
 	std::atomic<bool>         orig_ok{ false };
 
+	// Whether the DECODE IN HAND can actually do hdr_graft = 1. Two separate ways it cannot, and
+	// in both the combo would otherwise be a control wired to nothing while every status line
+	// reported the mode as active - the exact defect this panel exists to prevent.
+	//   codec_graft_available   false when the decode was built from the survival source, i.e.
+	//                           the compile WITH the reference graft failed on this machine and
+	//                           hdr_codec::build fell back so the default would survive.
+	//   codec_decode_overridden true when the decode came from a user-supplied
+	//                           stray_dlssnr_decode.dxbc. That blob is whatever the user built;
+	//                           it may predate g_hdrGraft entirely and read the constant not at
+	//                           all. We cannot know, so we say we cannot know.
+	std::atomic<bool>         codec_graft_available{ true };
+	std::atomic<bool>         codec_decode_overridden{ false };
+
 	std::atomic<float>        auto_scale_x{ 0.0f }, auto_scale_y{ 0.0f };
 	std::atomic<uint64_t>     hist_applied{ 0 }, hist_dropped{ 0 };
 
@@ -462,6 +475,16 @@ inline void seed_from_config(const cfg::config &c, const std::wstring &directory
 // assignment block at the top of the pass fixes every one of them at once and leaves the reads
 // alone. The cost is one documented writer of g_cfg; see the note on the census line below.
 // ---------------------------------------------------------------------------------------------
+// Published ONCE, from the codec build site in nr_lazy_ngx_init, rather than through begin_pass:
+// it is settled before the first dispatch and never changes for the run, and threading it through
+// begin_pass would widen a signature that other work is editing.
+inline void publish_codec_build(bool graft_available, bool decode_overridden)
+{
+	status_block &s = status();
+	s.codec_graft_available.store(graft_available, std::memory_order_relaxed);
+	s.codec_decode_overridden.store(decode_overridden, std::memory_order_relaxed);
+}
+
 inline bool begin_pass(cfg::config &c,
                        bool &need_reset,
                        uint64_t &pending_res,
@@ -1575,19 +1598,45 @@ inline void draw_controls(const host_facts &f)
 			"Live. 0.0 keeps the original's chromaticity exactly and transfers only the network's "
 			"luminance change; 1.0 takes the network's colour too. Lower it if the image picks up a "
 			"colour cast.\n\n"
-			"NOT ORTHOGONAL TO THE GRAFT BELOW. At 0.0 both grafts reduce to \"rescale the original "
-			"to the new luminance\", and their new luminances are the same number, so the two modes "
-			"are very nearly the SAME IMAGE there. The graft only genuinely changes anything as this "
-			"approaches 1.0. A/B the grafts at 1.0.");
+			"NOT ORTHOGONAL TO THE GRAFT BELOW, BUT NOT A CONTROL FOR IT EITHER. At 0.0 both grafts "
+			"reduce to \"rescale the original to the new luminance\" and their new luminances are the "
+			"same number, so on ORDINARY pixels the two modes agree to well under one 8-bit code "
+			"value. They do NOT agree in SHADOWS: mode 0 has a chroma floor that hands a near-black "
+			"pixel over to the network's own colour below Y = 0.001/s, and mode 1 has no such floor "
+			"at all, so it keeps the original's chromaticity and rescales it by an unbounded ratio. "
+			"Measured over 400,000 dark chromatic pixels at 0.0: worst 27.6 code values, 42.5%% of "
+			"them differing by 2 or more.\n\n"
+			"So A/B the grafts at 1.0 for the HIGHLIGHT difference and at 0.0 on a DARK, COLOURED "
+			"area - shadowed alley walls, unlit interiors - for the shadow difference. Neither "
+			"setting shows both.");
 
 		{
 			// The graft-back selector. Both items are REAL and both are exercised by the same
 			// dispatch - this is a root constant the decode reads, not a second code path that
 			// could be left uncalled.
+			//
+			// TWO WAYS THE DECODE IN HAND CANNOT HONOUR IT, both said out loud rather than left
+			// for the user to discover by seeing nothing change. Neither is hypothetical: the
+			// first is what keeps a compiler that cannot build the OkLab matrices from taking the
+			// DEFAULT graft down with it, and the second is the documented workflow for a machine
+			// with no working D3DCompile at all.
+			const bool graft_avail   = s.codec_graft_available.load(std::memory_order_relaxed);
+			const bool decode_overri = s.codec_decode_overridden.load(std::memory_order_relaxed);
+			if (!graft_avail)
+				overlay_imgui::textf_colored(col::amber,
+					"The decode was built WITHOUT the reference graft (it did not compile here), so "
+					"hdr_graft is pinned to 0 for this run. Mode 0 is unaffected - see ReShade.log.");
+			else if (decode_overri)
+				overlay_imgui::textf_colored(col::amber,
+					"A user-supplied stray_dlssnr_decode.dxbc is in use. If it was not built from "
+					"this add-on's shader source it does not read hdr_graft at all, and this control "
+					"will do nothing however it reads. Delete the .dxbc to be sure.");
+
 			static const char *const graft_items[] = {
 				"0 - Additive residual (ours, default)",
 				"1 - renodx UpgradeToneMap (OkLab hue lock)",
 			};
+			ImGui::BeginDisabled(!graft_avail);
 			combo_u32("HDR Graft", l.hdr_graft, graft_items, 2, k_plain,
 				"Live, and free: it is one root constant in the decode's constant block, so the very "
 				"next frame uses the other graft. Nothing is recreated.\n\n"
@@ -1610,15 +1659,26 @@ inline void draw_controls(const host_facts &f)
 				"clipped highlight toward the white point; mode 0 leaves its chromaticity exactly "
 				"alone. On a bright neon sign that is the difference between keeping its colour and "
 				"washing it out.\n\n"
-				"SO THIS IS A COLOUR EXPERIMENT, NOT A HIGHLIGHT FIX. Neither mode can recover a "
-				"highlight above about 3.5x paper white: the soft clip saturates the proxy to "
-				"exactly 1.0 there, so the network has no way to signal a change and (neural - "
-				"proxy) is zero for both. If highlights are being lost, the knee is in the wrong "
-				"place - that is what Scene Paper-White Scale above is for.\n\n"
+				"THE OTHER HALF OF THE DIFFERENCE IS IN THE SHADOWS, and it shows at Color Strength "
+				"0.0 rather than 1.0. Mode 0's chroma floor hands a near-black pixel over to the "
+				"network's colour below Y = 0.001/s; mode 1 has no floor and rescales the "
+				"original's chromaticity by an unbounded ratio. 400,000 dark chromatic pixels at "
+				"0.0: worst 27.6 code values, 42.5%% of them 2 or more.\n\n"
+				"SO THIS IS A COLOUR EXPERIMENT, NOT A HIGHLIGHT FIX. Neither mode recovers a "
+				"bright highlight, and the ceiling is LOWER than the soft clip suggests because "
+				"the proxy is stored in an FP16 surface: the encoded proxy quantises to exactly "
+				"1.0 at 1.81x paper white (the 3.47x figure is FP32 and is not the one that "
+				"governs), and of a requested +30%% gain the decode already delivers only ~50%% at "
+				"1.15x and ~5%% at 1.86x. Those are ratios TO paper white and do not move with "
+				"Scene Paper-White Scale - what moves is the scene-linear magnitude they land at, "
+				"in proportion (at 4.0, full gain reaches magnitude 3.17 instead of 0.79). If "
+				"highlights are being lost, the knee is in the wrong place, and that slider above "
+				"is exactly the right thing to raise.\n\n"
 				"Mode 1 is also NOT an exact bypass at transfer_strength=0: it works display-"
 				"referred throughout, so the result is (original * s) / s, exact only when s is a "
 				"power of two. Mode 0 is exact at every value, which is why it is the default and "
 				"why the identity A/B should be run on it.");
+			ImGui::EndDisabled();
 		}
 
 		ImGui::EndDisabled();

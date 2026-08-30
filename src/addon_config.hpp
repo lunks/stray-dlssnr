@@ -166,12 +166,25 @@ struct config
 	// our additive residual:
 	//     neural_y + max(0, original_y - proxy_y)  ==  Y(original + (neural - proxy))
 	// The two modes therefore deliver the SAME luminance gain at every source magnitude. The whole
-	// difference is CHROMA: where the soft clip has crushed the proxy to white the network's answer
-	// is neutral, so mode 1 drags a clipped highlight toward the white point while mode 0 leaves
-	// its chromaticity alone. Mode 1 is a colour experiment, NOT a highlight-recovery fix - neither
-	// mode can recover a highlight above ~3.5x paper white, because the soft clip saturates the
-	// proxy to exactly 1.0 there and the network has no way to signal a change. That is what
-	// paper_white_scale is for.
+	// difference is CHROMA, and it has TWO halves that show at OPPOSITE ends of color_strength:
+	//   * HIGHLIGHTS, at color_strength = 1. Where the soft clip has crushed the proxy to white the
+	//     network's answer is neutral, so mode 1 drags a clipped highlight toward the white point
+	//     while mode 0 leaves its chromaticity alone.
+	//   * SHADOWS, at color_strength = 0. Mode 0 has a chroma floor - it crossfades to the
+	//     network's own colour below Y = 0.001/s - and mode 1, faithfully to renodx, has none at
+	//     all, so it keeps the original's chromaticity and rescales it by an unbounded ratio.
+	//     Measured over 400,000 dark chromatic pixels: worst 27.6 8-bit code values, 42.5 % of them
+	//     differing by 2 or more. Forcing mode 0's valve open collapses that to 0.0, which is what
+	//     pins the cause on the valve. So color_strength = 0 is NOT a control that cancels the
+	//     graft difference; it swaps which half of it you are looking at.
+	//
+	// Mode 1 is a colour experiment, NOT a highlight-recovery fix. Neither mode recovers a bright
+	// highlight, and the ceiling is lower than the soft clip suggests because the proxy is stored
+	// in an r16g16b16a16_float surface: the encoded proxy quantises to exactly 1.0 at 1.81x paper
+	// white (3.47x is the FP32 figure and is not the one that governs), and of a requested +30 %
+	// gain the decode already delivers only ~50 % at 1.15x and ~5 % at 1.86x. Those ratios are to
+	// PAPER WHITE and do not move with paper_white_scale; the scene-linear magnitude they land at
+	// moves in proportion. That is what paper_white_scale is for.
 	//
 	// Mode 1 is also NOT an exact bypass at transfer_strength=0: it works in display-referred space
 	// throughout, so the result is (original * s) / s, which is exact only when s is a power of two
@@ -182,7 +195,12 @@ struct config
 	// rest of the pass. No feature recreate, no pipeline rebuild - flip it in the overlay and the
 	// very next frame uses the other graft.
 	//
-	// A value other than 0 or 1 is treated as 1 by the shader (`g_hdrGraft == 0u ? ours : theirs`).
+	// NORMALISED TO {0, 1} AT PARSE, not left as the user typed it. The shader branch is
+	// `g_hdrGraft == 0u ? ours : theirs`, so there is no third behaviour for a third value to
+	// name - and an unlisted value made the overlay drop the combo entirely and print
+	// "2  (not a listed value - sent as-is)", leaving no way back to either mode without editing
+	// this file and restarting. Contrast DLSSNR.Style, where an unlisted value really does reach
+	// NGX with a meaning of its own and is therefore preserved.
 	uint32_t hdr_graft = 0;
 
 	// ---- temporal feedback ----------------------------------------------------------------
@@ -426,7 +444,7 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "transfer_strength")        c.transfer_strength = parse_float(v, c.transfer_strength);
 		else if (key == "color_strength" || key == "colour_strength")
 		                                            c.color_strength = parse_float(v, c.color_strength);
-		else if (key == "hdr_graft")                c.hdr_graft = static_cast<uint32_t>(parse_u64(v, c.hdr_graft));
+		else if (key == "hdr_graft")                c.hdr_graft = (parse_u64(v, c.hdr_graft) != 0ull) ? 1u : 0u;
 		else if (key == "history_restore")          c.history_restore = parse_bool(v, c.history_restore);
 		else if (key == "restore_graphics_root")    c.restore_graphics_root = parse_bool(v, c.restore_graphics_root);
 		else if (key == "populate_parameters")      c.populate_parameters = parse_bool(v, c.populate_parameters);

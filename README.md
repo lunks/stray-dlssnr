@@ -487,7 +487,8 @@ two encoders as "byte-identical": the curve is, the shader is not.
 | what it scales | the **original**, uniformly across RGB | the **network's answer** |
 | hue | cannot drift — RGB is scaled by one number | can drift, so it is locked to the *neural's* hue in OkLab, then AP1-clamped for negatives |
 | `transfer_strength = 0` | **bit-exact no-op at every `paper_white_scale`** | `(original · s) / s` — exact only when `s` is a power of two; otherwise ~`1e-7` relative on 22–36 % of pixels |
-| NaN firewall, FP16 clamp, alpha from the original | yes | yes — **ours, kept**; theirs has none of the three |
+| NaN firewall, FP16 clamp | yes | yes — **ours, kept**; theirs has neither |
+| alpha from the original | yes | yes — and this is **not** a difference: their decode loads `float4 source = OutputOriginal.Load(...)` and writes `source.a` (`renodx-codec-shaders.hlsl:199`, `:222`), and `OutputOriginal` (`t3`) *is* their original. Same behaviour, arrived at independently |
 
 Their branch, reproduced verbatim including its asymmetry:
 
@@ -527,40 +528,94 @@ every source level:
 
 `0.1340` is the *full* rg-chromaticity distance to the white point. So:
 
-* **Both modes deliver the same luminance.** Neither one corrects a bright highlight, and for the
-  same reason: above about **3.5× paper white** the soft clip saturates the proxy to exactly `1.0`
-  in FP32 (`0.25·exp(−5.77·(v − 0.75))` drops below `2⁻²⁵` at `v > 3.51`), so the network cannot
-  signal a change at all and `neural − proxy` is zero. If highlights are being lost, **the knee is
-  in the wrong place, and `paper_white_scale` is the knob** — at `paper_white_scale = 4.0` the same
-  sweep holds full gain out to ~2.3× paper white in *both* modes.
+* **Both modes deliver the same luminance.** Neither one corrects a bright highlight, and the
+  ceiling is **much lower than the soft clip suggests**, because the proxy is not kept in FP32 — it
+  is written to an `r16g16b16a16_float` texture and read *back out of it* (`proxy_desc` in
+  `src/stray_dlssnr.cpp`; the "why the decode re-reads the proxy" section of `src/hdr_codec.hpp`).
+  A half has ~11 mantissa bits, so `fp16(SrgbEncode(SoftClip(v)))` is **exactly `1.0` at
+  `v ≥ 1.81× paper white`**. `3.47×` is the value at which `SoftClip(v)` itself rounds to `1.0f` in
+  FP32 (`0.25·exp(−5.77·(v − 0.75))` below `2⁻²⁵`) — it is a real number about a value this codec
+  never stores, and quoting it overstated the headroom by nearly a factor of two.
+
+  The transfer is mostly gone well before even `1.81×`, because the soft clip is a curve, not a
+  wall. Of a requested **+30 %** display-referred gain, measured through the real FP16 surfaces:
+
+  | delivered | out to |
+  |---|---|
+  | ≥ 95 % of the request | `0.79×` paper white |
+  | ≥ 50 % | `1.15×` |
+  | ≥ 5 % | `1.86×` |
+
+  **Those figures are ratios *to paper white* and do not move with `paper_white_scale`** — the
+  earlier claim that `paper_white_scale = 4.0` "holds full gain out to ~2.3× paper white" mixed the
+  units, and also compared "where full gain still holds" against "where all signal is lost", which
+  are not the same measurement. What `paper_white_scale` moves is the **scene-linear magnitude**
+  those ratios land at, in proportion: at `4.0`, full gain reaches a source magnitude of `3.17`
+  instead of `0.79`. So if highlights are being lost, **the knee is in the wrong place and
+  `paper_white_scale` is exactly the right knob to raise** — just do not expect the ×-paper-white
+  ceiling to move with it. (Selftest section 8 measures all of this, so the numbers cannot drift
+  from the code.)
 * **The entire difference is chroma, and it runs the other way.** Mode 1 rebuilds the pixel from the
   network's answer and locks the hue to *that*; where the proxy clipped, the network's answer is
   neutral white, so a saturated highlight is pulled toward the white point. `[6.0, 5.2, 3.0]` comes
   back as `[6.0, 5.2, 3.0]` in mode 0 and as roughly `[5.21, 5.21, 5.21]` in mode 1. Over 60,000
-  random pixels at `color_strength = 1` the two differ by up to **83 % of the pixel's magnitude** — the
-worst case is `[10.04, 10.12, 0.94]`, which mode 0 leaves essentially alone and mode 1 returns as
-`[9.45, 9.45, 9.45]`.
+  random pixels at `color_strength = 1` the two differ by up to **84 % of the pixel's magnitude** —
+the worst case is a source of `[0.68, 0.95, 11.16]`, which mode 0 returns as `[0.60, 0.87, 11.04]`
+and mode 1 returns as `[1.17, 1.64, 1.73]`: a deep blue highlight, flattened. (The worst case moved
+from the one quoted here before because selftest section 5 was restructured and draws a different
+part of the sequence; the *magnitude* of the divergence did not.)
 
 **So `hdr_graft = 1` is a colour experiment, not a highlight-recovery fix.** It is a defensible,
 different aesthetic — *trust the network's colour* — and STRAY's neon signage is exactly where you
 will see it. Just do not run it expecting recovered highlights.
 
-##### `color_strength` is the third point of comparison, and it is not orthogonal
+##### `color_strength` is the third point of comparison — and it does *not* cancel the graft
 
 `color_strength` already **is** a genuine luminance-ratio mode, not a partial one:
 `luminanceOnly = lerp(transferred, original · luminanceRatio, chromaWeight)` with
-`chromaWeight = saturate(originalLuminance / (0.001/s))`, and that weight measures `1.0000` for
-every realistic pixel — the chroma floor only engages below `Y = 0.001·(1/s)`, i.e. essentially
-black. At `color_strength = 0` the output is `original · (Y_transferred / Y_original)`: an
-RGB-uniform, hue-exact rescale.
+`chromaWeight = saturate(originalLuminance / (0.001/s))`. At `color_strength = 0` and above the
+chroma floor the output is `original · (Y_transferred / Y_original)`: an RGB-uniform, hue-exact
+rescale. Their decode has the *same* construction (`luminance_only = original · ratio`, then
+`lerp(luminance_only, upgraded, ColorStrength)`) and their upgraded luminance equals our
+transferred luminance, so on ordinary pixels the two modes agree there to **under one 8-bit code
+value**.
 
-Their decode has the *same* construction (`luminance_only = original · ratio`, then
-`lerp(luminance_only, upgraded, ColorStrength)`), and their upgraded luminance equals our
-transferred luminance — so **at `color_strength = 0` the two graft modes are very nearly the same
-image** (worst 4.74 % of a channel over 60,000 pixels, versus 83 % at `color_strength = 1`). There is
-no fourth mode worth adding; there are two real graft behaviours and one crossfade between
-*luminance-only* and *full colour* that applies to both. **A/B the grafts at
-`color_strength = 1`.**
+**But `color_strength = 0` is not a control that cancels the graft — it swaps which half of the
+graft difference you are looking at**, and the earlier text here got that wrong. Mode 0's chroma
+floor is a real term with a real effect: below `Y = 0.001·(1/s)` it crossfades away from the
+hue-exact rescale and hands the pixel to the network's own colour. **Mode 1 has no floor at all** —
+`luminanceOnlyRdx = originalDisplay · ratioY`, faithfully to renodx — so it keeps the original's
+chromaticity all the way down and rescales it by an unbounded ratio. That region is not a curiosity:
+it is where a *denoiser* changes the image most.
+
+Measured over 400,000 dark, strongly chromatic pixels (scene-linear magnitude ≤ `0.01`, network gain
+`0.3×`–`6×` with a `0.6` pull toward the pixel's own mean, `transfer_strength = 1`,
+`color_strength = 0`):
+
+| | worst difference | pixels differing ≥ 2 code values |
+|---|---|---|
+| mode 0 vs mode 1 | **27.6** 8-bit code values | **42.5 %** |
+| mode 0 *with its chroma valve forced open* vs mode 1 | **0.0** | 0 % |
+
+The second row is the point: force mode 0's valve open and the shadow difference vanishes entirely,
+so the valve is the whole cause and nothing else in either graft is moving. The shortest statement
+of it — a dim red shadow the network denoises to a neutral `0.2`, at `color_strength = 0`:
+
+```
+src [1e-5, 0, 0]   mode 0 -> [0.20166, 0.19965, 0.19965]   the valve handed it to the network's grey
+                   mode 1 -> [0.94077, 0.00000, 0.00000]   no valve: the original's red, rescaled
+```
+
+The earlier figure quoted here — "worst 4.74 % of a channel, so the two are nearly the same image at
+`color_strength = 0`" — was an artefact of the selftest's sampler: `random_pixel` draws all three
+channels as `mag·(0.05 + 0.95u)`, which bounds chromaticity at about 20:1 and never approaches
+black, and `network_answer` never departs from the proxy by more than `0.6×`–`1.8×`. Neither could
+reach the region where the modes part company. Section 5 of the selftest now measures both regions
+and asserts the shadow divergence as a *lower* bound, so the sampler cannot be quietly narrowed back.
+
+There is still no fourth mode worth adding: two real graft behaviours, one crossfade that applies to
+both. But **A/B the grafts at `color_strength = 1` for the highlight difference *and* at
+`color_strength = 0` on a dark coloured area for the shadow difference.** Neither setting shows both.
 
 ##### Verified on the build host
 
@@ -574,7 +629,14 @@ c++ -std=c++17 -O2 -Wall -o /tmp/hdr_codec_selftest tools/hdr_codec_selftest.cpp
   && /tmp/hdr_codec_selftest
 ```
 
-**31 assertions, all passing:**
+`tools/hdr_source_variants_test.cpp` is the companion gate for the *survival* build described
+below: it calls the real `full_source_decode()` and proves the graft-free variant differs by
+exactly one byte, that both `#define` markers are where the code thinks they are, and that every
+graft symbol (`float3x3`, `nrRdxToOkLab`, …) has all of its code uses **inside** the `#if` — so
+the preprocessor really removes them and the retry is not theatre. It needs `<d3dcompiler.h>`, so
+it runs on the Windows toolchains only; CI runs it under both MSVC and mingw.
+
+**37 assertions, all passing:**
 
 | check | result |
 |---|---|
@@ -587,19 +649,53 @@ c++ -std=c++17 -O2 -Wall -o /tmp/hdr_codec_selftest tools/hdr_codec_selftest.cpp
 | headroom term ≡ additive residual | worst relative difference `3.82e-07` over 150,250 else-branch samples |
 | their asymmetric branch | fires 49,750 / 200,000 times on FP16 data — real, not an edge case |
 | mode 1 at `transfer_strength = 0` | exact at `paper_white_scale` 1.0 / 2.0 / 0.5; **7144**, **4365**, **7076** of 20,000 non-exact at 1.5 / 2.2 / 0.75, worst `1.08e-07` relative. Mode 0: **0/20,000 at every one** |
-| divergence | 4.74 % of a channel at `color_strength = 0`; 83 % at `color_strength = 1` |
+| divergence, `color_strength = 0`, ordinary pixels | **0.8** of an 8-bit code value over 60,000 pixels — they *do* agree here |
+| divergence, `color_strength = 0`, **shadows** | **27.6** code values over 400,000 dark chromatic pixels, **42.5 %** of them ≥ 2 |
+| …and its cause | mode 0 with its chroma valve forced open vs mode 1, same 400,000 pixels: **0.0** code values |
+| divergence, `color_strength = 1` | **84 %** of the pixel's magnitude (135 code values) |
+| the transfer's ceiling | `fp16(SrgbEncode(SoftClip(v))) == 1.0` at `v ≥ 1.8088`; `SoftClip(v) == 1.0f` in FP32 at `v ≥ 3.4740`; the ×-paper-white ceiling is invariant across `paper_white_scale` 1.0 / 2.0 / 4.0 |
 
 CI runs the same replay under **both** MSVC and mingw — and the two agree to the printed digit on
-every figure above — and separately compiles the codec's HLSL —
-extracted from the string literals in `src/hdr_codec.hpp` exactly as `full_source()` assembles it —
-with **`fxc /T cs_5_0 /O3 /Ges /Gis`**, the compiler and the flags the add-on itself uses at load. A
-typo in that HLSL has no compile-time symptom in the C++ build and no crash at runtime: the codec
+every figure above — and separately compiles the codec's HLSL — extracted from the string literals
+in `src/hdr_codec.hpp` exactly as `full_source_decode()` assembles it, in **both** of its variants —
+with **`fxc /T cs_5_0 /O3 /Ges /Gis`**, the same *flags* the add-on passes to `D3DCompile` at load.
+A typo in that HLSL has no compile-time symptom in the C++ build and no crash at runtime: the codec
 just latches **off** and the user silently gets the darkened frame back. That gate is the only thing
 in the tree that would notice.
 
+**`fxc` is not the compiler that runs on the play box, and the gate must not be read as if it were.**
+Under Proton, `D3DCompile` resolves to whatever `d3dcompiler_47.dll` is in the prefix, which may be
+Wine's builtin — vkd3d-shader's HLSL front end, whose SM5 compute coverage varies by version. Mode 1
+introduced this tree's first `float3x3` literals, first `mul(matrix, vector)`, first `sign()` and
+first `length()`, and adding `hdr_graft` changed the decode's source hash from
+`0x397c6b5d90cbe29b` to `0x34fc9b8beea4af4e`, so every existing on-disk cache is orphaned and a
+*fresh* compile of the new code is mandatory on first launch. A green CI run does not de-risk that.
+
+**So the decode is compiled twice, and mode 0 survives the experiment failing.** The literal carries
+`#define NR_RDX_GRAFT 1`; everything of renodx's lives behind that `#if`, inside one function, so
+`main()` is byte-identical in both variants and mode 0's expression tree is untouched. If the
+compile with it at `1` fails, `hdr_codec::build` flips that one character to `0` and recompiles.
+Mode 1's body becomes a stub, `blobs::decode_has_graft` comes back false, and the CPU **pins
+`hdr_graft` to 0 for the run** — the log says so, and the overlay shows an amber line and disables
+the combo. The default graft the user plays on every day is unaffected. Losing the shipping path to
+a compiler that cannot build an experiment would have been strictly worse than not shipping the
+experiment.
+
+A **user-supplied `stray_dlssnr_decode.dxbc`** (the documented escape hatch when `D3DCompile` is
+unavailable at all) is preferred over both the cache and a fresh compile, and such a blob may
+predate `g_hdrGraft` and never read it — in which case `hdr_graft` is inert. That cannot be
+detected, so it is *reported*: `blobs::decode_overridden` reaches both the log and an amber line
+above the combo, saying that the control may do nothing while it is in place. To pin the *old*
+decode deliberately, rename `stray_dlssnr_decode.397c6b5d90cbe29b.dxbc` (if you still have it) to
+`stray_dlssnr_decode.dxbc`.
+
 ##### The exact A/B to run on hardware
 
-All ini-only, no rebuild; or flip **HDR Graft** in the overlay, which is live.
+All ini-only, no rebuild; or flip **HDR Graft** in the overlay, which is live. `ReShade.log`
+re-prints its `GRAFT-BACK MODE` line **every time the mode changes**, so the log from a session in
+which you flipped the combo says which graft was running when, rather than asserting whichever one
+happened to be first. Check that line before trusting any A/B you report: it also warns if a
+`.dxbc` override is in place or if the decode was built without mode 1.
 
 | # | config | expectation |
 |---|---|---|
@@ -607,7 +703,8 @@ All ini-only, no rebuild; or flip **HDR Graft** in the overlay, which is live.
 | 2 | `hdr_graft=0 transfer_strength=1 color_strength=1` | today's image. The control. |
 | 3 | `hdr_graft=1 transfer_strength=1 color_strength=1` | **the comparison.** Same brightness as 2 everywhere; look only at *saturated bright* things — neon signage, wet-street reflections, the bar interiors. Mode 1 washes them toward white; mode 0 keeps their colour. If you cannot see a difference here, you are not looking at a clipped highlight. |
 | 4 | `hdr_graft=1 transfer_strength=0` | should be visually identical to 1. It is *not* bit-identical (see above); if it looks different, something other than the round trip is wrong. |
-| 5 | 2 and 3 with `color_strength=0` | the two should look **the same as each other**. This is the control that proves the difference in 2-vs-3 is chroma and nothing else. |
+| 5 | 2 and 3 with `color_strength=0`, looking at a **bright** area | the two should look **the same as each other** there. This is the control that proves the highlight difference in 2-vs-3 is chroma and nothing else. |
+| 5b | 2 and 3 with `color_strength=0`, looking at a **dark, coloured** area — shadowed alley walls, unlit interiors, anything dim with a hue | they should **not** match, and this is the graft's *other* characteristic behaviour. Mode 0's chroma floor hands a near-black pixel to the network's colour; mode 1 has no floor and keeps the original's chromaticity, rescaled. Up to 27.6 code values, on 42.5 % of such pixels. If you see shadow chroma speckle in mode 1, the graft **is** the cause. |
 | 6 | 2 and 3 at `paper_white_scale=4.0` | moves the soft-clip knee up. Both modes should regain gain on bright things; the *chroma* difference should shrink, because fewer pixels are clipped. This is the test that distinguishes "the graft is wrong" from "the knee is wrong". |
 
 ##### The neural target's resolution — settled, and it matters for DLSS-SR
@@ -1032,13 +1129,26 @@ extension, to make mingw's `__uuidof` macro parse.
   whole `.addon64` fail to load when the DLL is absent, taking the working NGX path down with it.
   Under Proton this may be Wine's builtin, whose SM5 compute coverage varies by version — which is
   exactly why a compile failure has to be survivable, and is.
+* **The decode is survivable *within itself*, too.** Both graft modes live in one shader and one
+  compile, so a failure anywhere in mode 1's OkLab/AP1 matrices would otherwise latch
+  `codec_failed` and take the *default* graft — the one that ships and that the user plays on —
+  down with the experiment. The literal carries `#define NR_RDX_GRAFT 1` and everything of
+  renodx's sits behind that `#if` inside one function; on failure `build()` flips that character
+  to `0`, recompiles, reports `decode_has_graft = false`, and the CPU pins `hdr_graft` to 0 for
+  the run. `main()` is byte-identical between the two variants, so mode 0 is not merely
+  "unaffected in principle" — it is the same text.
 
 On a successful compile the blob is cached beside the ini as
 `stray_dlssnr_encode.<source-hash>.dxbc` / `stray_dlssnr_decode.<source-hash>.dxbc`. The hash is
 FNV-1a over the exact source text handed to the compiler, so a stale blob from an older revision
 can never be picked up silently. A plain `stray_dlssnr_encode.dxbc` / `stray_dlssnr_decode.dxbc`
 (no hash) is honoured as a **user override** — drop one in on a machine whose `d3dcompiler` cannot
-build the shader — and the log says loudly when an override is in use.
+build the shader — and the log says loudly when an override is in use. Note what an override
+implies for a *root constant*: such a blob is whatever the user built and may predate a constant
+entirely, in which case the control bound to it does nothing. `hdr_graft` is the current example,
+so `blobs::decode_overridden` is now plumbed through to the log and to an amber line above the
+overlay's HDR Graft combo. A control that silently does nothing is this project's recurring defect;
+"we cannot know, so we say we cannot know" is the only honest handling.
 
 The shader source is reviewable in-tree, and it round-trips through glslang's HLSL front end
 cleanly, but note that **it has not been compiled by `fxc` on this host**. The first launch's log

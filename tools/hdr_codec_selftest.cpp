@@ -386,6 +386,77 @@ static F3 network_answer(F3 proxy_enc, Rng &r, float gain)
     return mk(fp16_rt(enc.x), fp16_rt(enc.y), fp16_rt(enc.z));
 }
 
+// A DARK, STRONGLY CHROMATIC pixel: a shadow with a colour in it. random_pixel above draws all
+// three channels as mag*(0.05 + 0.95*u), which bounds chromaticity at about 20:1 and never gets
+// near black - so it cannot reach the region where mode 0's chroma valve engages, which is
+// precisely the region the two grafts disagree in. Section 5 measures both.
+static F3 shadow_pixel(Rng &r)
+{
+    const float mag = std::pow(r.unit(), 2.0f) * 0.01f;   // scene-linear, at or below 0.01
+    const int dominant = int(r.u32() % 3u);
+    float ch[3] = { 0.02f*r.unit(), 0.02f*r.unit(), 0.02f*r.unit() };
+    ch[dominant] = 1.0f;
+    return mk(mag*ch[0], mag*ch[1], mag*ch[2]);
+}
+
+// A DENOISER's answer rather than a nudge: gain 0.3x..6x and a 0.6 pull toward the pixel's own
+// mean, i.e. chroma averaged away with the noise. network_answer's 0.6x..1.8x with a +-3% per
+// channel wobble is a fine model of a network that agrees with the proxy; it is not a model of
+// what a denoiser does to a dark, noisy, coloured pixel, which is the whole reason it exists.
+static F3 denoised_answer(F3 proxy_enc, Rng &r)
+{
+    const F3 lin = srgb_decode(proxy_enc);
+    const float mean = (lin.x + lin.y + lin.z) / 3.0f;
+    const float gain = 0.3f + 5.7f * r.unit();
+    const F3 pulled = mk(lerpf(lin.x, mean, 0.6f), lerpf(lin.y, mean, 0.6f), lerpf(lin.z, mean, 0.6f));
+    const F3 nudged = mk(satf(pulled.x*gain), satf(pulled.y*gain), satf(pulled.z*gain));
+    const F3 enc = srgb_encode(nudged);
+    return mk(fp16_rt(enc.x), fp16_rt(enc.y), fp16_rt(enc.z));
+}
+
+// MODE 0 WITH THE CHROMA VALVE FORCED OPEN (chromaWeight == 1). Not a shader path - a DIAGNOSTIC,
+// and the only way to say WHICH term the shadow divergence in section 5 comes from. Everything
+// else is decode_current's mode 0, character for character.
+static Out decode_mode0_no_valve(F3 src_rgb, F3 proxy_raw, F3 neural_raw,
+                                 float proxy_scale_arg, float transfer_strength, float color_strength)
+{
+    if (any_not_finite(src_rgb)) return Out{src_rgb, 1.0f, true};
+    const F3 original = max3(src_rgb, 0.0f);
+    const float scale = proxy_scale_clamp(proxy_scale_arg);
+    const F3 proxy = srgb_decode(proxy_raw), neural = srgb_decode(neural_raw);
+    const F3 neuralDelta = (neural - proxy) / scale;
+    if (any_not_finite(neuralDelta)) return Out{src_rgb, 1.0f, true};
+    const F3 transferred = max3(original + neuralDelta, 0.0f);
+    const float oy = bt709_lum(original), ty = bt709_lum(transferred);
+    const float luminanceRatio = oy > 0.0f ? ty / oy : 1.0f;
+    const F3 luminanceOnly = original * luminanceRatio;          // chromaWeight pinned to 1
+    const F3 graded = lerp3(luminanceOnly, transferred, color_strength);
+    const F3 result = lerp3(original, graded, transfer_strength);
+    return Out{ mk(std::fmin(std::fmax(result.x,0.0f),kMaxHalf),
+                   std::fmin(std::fmax(result.y,0.0f),kMaxHalf),
+                   std::fmin(std::fmax(result.z,0.0f),kMaxHalf)), 1.0f, false };
+}
+
+// The honest unit for "can you see it": an 8-bit sRGB display code value at paper white. A
+// relative-to-pixel-magnitude figure flatters bright pixels and exaggerates dark ones, and both
+// errors were made in the numbers this file used to print.
+static float srgb_code_value(float scene_linear)
+{
+    return 255.0f * srgb_encode_ch(satf(scene_linear));
+}
+static void worst_of(F3 a, F3 b, double &worst_rel, double &worst_cv)
+{
+    const float ca[3] = { a.x, a.y, a.z }, cb[3] = { b.x, b.y, b.z };
+    double mag = 1e-6;
+    for (int k = 0; k < 3; ++k)
+        mag = std::fmax(mag, std::fmax(std::fabs(double(ca[k])), std::fabs(double(cb[k]))));
+    for (int k = 0; k < 3; ++k)
+    {
+        worst_rel = std::fmax(worst_rel, std::fabs(double(ca[k]) - double(cb[k])) / mag);
+        worst_cv  = std::fmax(worst_cv,  std::fabs(double(srgb_code_value(ca[k])) - double(srgb_code_value(cb[k]))));
+    }
+}
+
 static bool same_bits(F3 a, F3 b)
 {
     return bits(a.x)==bits(b.x) && bits(a.y)==bits(b.y) && bits(a.z)==bits(b.z);
@@ -591,47 +662,130 @@ int main()
     }
 
     // ---------------------------------------------------------------------------------------
-    // 5. What the modes ACTUALLY differ by: chroma, and only as color_strength approaches 1.
+    // 5. WHERE THE TWO GRAFTS DIVERGE - and the answer is NOT "only as color_strength -> 1".
+    //
+    //    This section used to measure the color_strength = 0 case with random_pixel() and
+    //    network_answer(), and reported 4.74 % - from which the docs concluded the two modes are
+    //    nearly the same image there and told the user to A/B at 1.0. That conclusion was an
+    //    artefact of the sampler: random_pixel never draws a dark, strongly chromatic pixel and
+    //    network_answer never departs from the proxy by more than 0.6x..1.8x, so neither can
+    //    reach the region where the modes actually part company.
+    //
+    //    THE MECHANISM. Mode 0 has a CHROMA VALVE: chromaWeight = saturate(originalLuminance /
+    //    (kNrMinChromaLuminance/scale)) crossfades luminanceOnly toward the network's own colour
+    //    once the original's luminance falls below 0.001/s. Mode 1's luminanceOnlyRdx =
+    //    originalDisplay * ratioY has NO floor - faithfully to renodx - so it keeps the original's
+    //    chromaticity all the way down and rescales it by an unbounded ratio. A denoiser's whole
+    //    job is to move dark pixels a lot, so that region is not a curiosity.
+    //
+    //    Three measurements, in 8-bit sRGB code values at paper white, which is the unit a user
+    //    can actually see: bright pixels agree, shadows do not, and forcing mode 0's valve open
+    //    collapses the shadow difference to nothing - which pins the cause on the valve and not
+    //    on anything else in either graft.
     // ---------------------------------------------------------------------------------------
     std::printf("\n5. where the two grafts diverge\n");
     {
+        // 5a - the general sampler, color_strength = 0. Bright pixels: they DO agree here.
         Rng r{0xA409382229F31D00ull};
-        double worst_cs0 = 0.0, worst_cs1 = 0.0;
-        F3 worst_src{}, worst_a{}, worst_b{};
+        double g_rel = 0.0, g_cv = 0.0;
         for (int i = 0; i < 60000; ++i)
         {
             const F3 src = random_pixel(r);
-            const float s = 1.0f;
-            const F3 enc = encode(src, s);
+            const F3 enc = encode(src, 1.0f);
             const F3 stored = mk(fp16_rt(enc.x), fp16_rt(enc.y), fp16_rt(enc.z));
             const F3 neural = network_answer(stored, r, 0.6f + 1.2f*r.unit());
-            for (int c = 0; c < 2; ++c)
-            {
-                const float cs = c == 0 ? 0.0f : 1.0f;
-                const Out a = decode_current(src, 1.0f, stored, neural, s, 1.0f, cs, 0u);
-                const Out b = decode_current(src, 1.0f, stored, neural, s, 1.0f, cs, 1u);
-                const float ch_a[3] = { a.rgb.x, a.rgb.y, a.rgb.z };
-                const float ch_b[3] = { b.rgb.x, b.rgb.y, b.rgb.z };
-                // Denominator is the PIXEL's magnitude, not the channel's: a near-black channel
-                // beside a bright one would otherwise report a huge "relative" difference that no
-                // eye and no FP16 store could ever see.
-                double mag = 1e-6;
-                for (int k = 0; k < 3; ++k)
-                    mag = std::fmax(mag, std::fmax(std::fabs(double(ch_a[k])), std::fabs(double(ch_b[k]))));
-                double rel = 0.0;
-                for (int k = 0; k < 3; ++k)
-                    rel = std::fmax(rel, std::fabs(double(ch_a[k]) - double(ch_b[k])) / mag);
-                if (c == 0) { if (rel > worst_cs0) worst_cs0 = rel; }
-                else        { if (rel > worst_cs1) { worst_cs1 = rel; worst_src = src; worst_a = a.rgb; worst_b = b.rgb; } }
-            }
+            const Out a = decode_current(src, 1.0f, stored, neural, 1.0f, 1.0f, 0.0f, 0u);
+            const Out b = decode_current(src, 1.0f, stored, neural, 1.0f, 1.0f, 0.0f, 1u);
+            worst_of(a.rgb, b.rgb, g_rel, g_cv);
         }
-        char d0[128], d1[256];
-        std::snprintf(d0, sizeof(d0), "(worst relative channel difference %.4g over 60,000 pixels)", worst_cs0);
-        std::snprintf(d1, sizeof(d1), "(worst %.4g at src [%.4f %.4f %.4f]: mode0 [%.4f %.4f %.4f] mode1 [%.4f %.4f %.4f])",
-                      worst_cs1, worst_src.x, worst_src.y, worst_src.z,
-                      worst_a.x, worst_a.y, worst_a.z, worst_b.x, worst_b.y, worst_b.z);
-        ck(worst_cs0 < 0.10, "at color_strength = 0 the two grafts are nearly the same image", d0);
-        ck(worst_cs1 > 0.30, "at color_strength = 1 they genuinely differ - this is the A/B", d1);
+        char d[192];
+        std::snprintf(d, sizeof(d), "(60,000 pixels: worst %.1f 8-bit code values, worst %.4g of the pixel's magnitude)", g_cv, g_rel);
+        ck(g_cv < 2.0, "cs=0, ORDINARY pixels: the two grafts agree to under 2 code values", d);
+
+        // 5b - shadows, color_strength = 0. They do NOT agree here, and this is the claim the
+        //      shipped docs got wrong. Asserted as a LOWER bound so nobody can quietly narrow the
+        //      sampler until the divergence disappears again.
+        Rng rs{0x5DEECE66Dull};
+        double s_rel = 0.0, s_cv = 0.0; long long ge2 = 0, n = 0;
+        F3 ws{}, wa{}, wb{}; double at_cv = 0.0;
+        for (int i = 0; i < 400000; ++i)
+        {
+            const F3 src = shadow_pixel(rs);
+            const F3 enc = encode(src, 1.0f);
+            const F3 stored = mk(fp16_rt(enc.x), fp16_rt(enc.y), fp16_rt(enc.z));
+            const F3 neural = denoised_answer(stored, rs);
+            const Out a = decode_current(src, 1.0f, stored, neural, 1.0f, 1.0f, 0.0f, 0u);
+            const Out b = decode_current(src, 1.0f, stored, neural, 1.0f, 1.0f, 0.0f, 1u);
+            const double before = s_cv;
+            worst_of(a.rgb, b.rgb, s_rel, s_cv);
+            if (s_cv > before) { ws = src; wa = a.rgb; wb = b.rgb; at_cv = s_cv; }
+            double one_rel = 0.0, one_cv = 0.0;
+            worst_of(a.rgb, b.rgb, one_rel, one_cv);
+            if (one_cv >= 2.0) ++ge2;
+            ++n;
+        }
+        char d2[256];
+        std::snprintf(d2, sizeof(d2),
+            "(%lld dark chromatic pixels: worst %.1f code values, %.1f%% differ by >= 2; worst at src [%.3g %.3g %.3g] mode0 [%.5f %.5f %.5f] mode1 [%.5f %.5f %.5f])",
+            n, at_cv, 100.0*double(ge2)/double(n), ws.x, ws.y, ws.z, wa.x, wa.y, wa.z, wb.x, wb.y, wb.z);
+        ck(s_cv > 10.0, "cs=0, SHADOWS: the two grafts do NOT agree - mode 1 has no chroma floor", d2);
+
+        // 5c - the mechanism. Same shadow sampler, but mode 0's chroma valve forced open. If the
+        //      difference collapses, the valve is the whole cause; if it does not, something else
+        //      in one of the two grafts is also moving and the story above is incomplete.
+        Rng rm{0x5DEECE66Dull};
+        double m_rel = 0.0, m_cv = 0.0;
+        for (int i = 0; i < 400000; ++i)
+        {
+            const F3 src = shadow_pixel(rm);
+            const F3 enc = encode(src, 1.0f);
+            const F3 stored = mk(fp16_rt(enc.x), fp16_rt(enc.y), fp16_rt(enc.z));
+            const F3 neural = denoised_answer(stored, rm);
+            const Out a = decode_mode0_no_valve(src, stored, neural, 1.0f, 1.0f, 0.0f);
+            const Out b = decode_current(src, 1.0f, stored, neural, 1.0f, 1.0f, 0.0f, 1u);
+            worst_of(a.rgb, b.rgb, m_rel, m_cv);
+        }
+        char d3[192];
+        std::snprintf(d3, sizeof(d3), "(same 400,000 pixels: worst %.1f code values, worst %.4g of the pixel's magnitude)", m_cv, m_rel);
+        ck(m_cv < 1.0, "and it is ENTIRELY mode 0's chroma valve: force it open and the shadows agree", d3);
+
+        // 5d - color_strength = 1, the headline divergence. Unchanged sampler, unchanged claim.
+        Rng r1{0xA409382229F31D00ull};
+        double one_rel = 0.0, one_cv = 0.0;
+        F3 w1s{}, w1a{}, w1b{}; double best = 0.0;
+        for (int i = 0; i < 60000; ++i)
+        {
+            const F3 src = random_pixel(r1);
+            const F3 enc = encode(src, 1.0f);
+            const F3 stored = mk(fp16_rt(enc.x), fp16_rt(enc.y), fp16_rt(enc.z));
+            const F3 neural = network_answer(stored, r1, 0.6f + 1.2f*r1.unit());
+            const Out a = decode_current(src, 1.0f, stored, neural, 1.0f, 1.0f, 1.0f, 0u);
+            const Out b = decode_current(src, 1.0f, stored, neural, 1.0f, 1.0f, 1.0f, 1u);
+            const double before = one_rel;
+            worst_of(a.rgb, b.rgb, one_rel, one_cv);
+            if (one_rel > before) { w1s = src; w1a = a.rgb; w1b = b.rgb; best = one_rel; }
+        }
+        char d4[256];
+        std::snprintf(d4, sizeof(d4),
+            "(worst %.4g of the pixel's magnitude, %.1f code values, at src [%.4f %.4f %.4f]: mode0 [%.4f %.4f %.4f] mode1 [%.4f %.4f %.4f])",
+            best, one_cv, w1s.x, w1s.y, w1s.z, w1a.x, w1a.y, w1a.z, w1b.x, w1b.y, w1b.z);
+        ck(one_rel > 0.30, "cs=1: they genuinely differ on BRIGHT saturated pixels - this is the A/B", d4);
+
+        // 5e - the case the review supplied, printed verbatim: a dim red shadow the network
+        //      denoises to a neutral 0.2. It is the shortest statement of what 5b measures.
+        {
+            const F3 src = mk(1e-5f, 0.0f, 0.0f);
+            const F3 enc = encode(src, 1.0f);
+            const F3 stored = mk(fp16_rt(enc.x), fp16_rt(enc.y), fp16_rt(enc.z));
+            const F3 ne = srgb_encode(mk(0.2f, 0.2f, 0.2f));
+            const F3 neural = mk(fp16_rt(ne.x), fp16_rt(ne.y), fp16_rt(ne.z));
+            const Out a = decode_current(src, 1.0f, stored, neural, 1.0f, 1.0f, 0.0f, 0u);
+            const Out b = decode_current(src, 1.0f, stored, neural, 1.0f, 1.0f, 0.0f, 1u);
+            std::printf("       worked example, cs=0, src [1e-5 0 0], network returns a neutral 0.2:\n"
+                        "         mode0 [%.5f %.5f %.5f]  (the valve handed the pixel to the network's grey)\n"
+                        "         mode1 [%.5f %.5f %.5f]  (no valve: the original's red, rescaled)\n",
+                        a.rgb.x, a.rgb.y, a.rgb.z, b.rgb.x, b.rgb.y, b.rgb.z);
+        }
     }
 
     // ---------------------------------------------------------------------------------------
@@ -716,6 +870,75 @@ int main()
             std::printf("       %-8.2f %-10.4f %-10.4f %-10.4f %-10.4f %-10.4f\n", m, sy, py, ga, gb, dc);
         }
         std::printf("       (gains equal at every magnitude; the divergence is entirely chroma)\n");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // 8. THE TRANSFER'S CEILING, IN THE PRECISION IT IS ACTUALLY STORED IN.
+    //
+    //    The docs used to say "neither mode recovers a highlight above about 3.5x paper white",
+    //    derived from FP32: 0.25*exp(-5.77*(v-0.75)) drops below 2^-25, so SoftClip(v) rounds to
+    //    exactly 1.0f, at v > 3.47. That number is real and it is the WRONG ONE, because the
+    //    proxy is not kept in FP32 - it is written to an r16g16b16a16_float texture and read back
+    //    out of it (stray_dlssnr.cpp's proxy_desc; hdr_codec.hpp's "WHY THE DECODE RE-READS THE
+    //    PROXY" section). In half precision the encoded proxy quantises to exactly 1.0 far
+    //    earlier, and the usable transfer is nearly gone well before even that.
+    //
+    //    Both thresholds are measured here so the documented numbers cannot drift from the code.
+    // ---------------------------------------------------------------------------------------
+    std::printf("\n8. where the proxy saturates, FP32 vs the FP16 surface it is stored in\n");
+    {
+        float first_fp32 = -1.0f, first_fp16 = -1.0f;
+        for (double v = 0.5; v < 8.0 && (first_fp32 < 0.0f || first_fp16 < 0.0f); v += 0.0001)
+        {
+            const float f = float(v);
+            if (first_fp32 < 0.0f && soft_clip_ch(f) == 1.0f) first_fp32 = f;
+            if (first_fp16 < 0.0f && fp16_rt(srgb_encode_ch(soft_clip_ch(f))) == 1.0f) first_fp16 = f;
+        }
+        char d[192];
+        std::snprintf(d, sizeof(d), "(SoftClip(v) == 1.0f in FP32 at v >= %.4f; fp16(SrgbEncode(SoftClip(v))) == 1.0f at v >= %.4f)",
+                      first_fp32, first_fp16);
+        ck(first_fp16 > 1.75f && first_fp16 < 1.90f,
+           "the FP16-stored proxy saturates at ~1.81x paper white, NOT the FP32 figure", d);
+        ck(first_fp32 > 3.40f && first_fp32 < 3.55f,
+           "the FP32 soft clip saturates at ~3.47x - the number the docs used to quote", d);
+
+        // How much of a requested gain actually survives, as a function of v = magnitude * s.
+        // These figures are in units of PAPER WHITE and are invariant in paper_white_scale; what
+        // moves with paper_white_scale is the SCENE-LINEAR magnitude they land at.
+        std::printf("       delivered fraction of a requested +30%% display gain, by paper_white_scale:\n");
+        float inv95 = -1.0f;
+        for (float pw : { 1.0f, 2.0f, 4.0f })
+        {
+            const float s = 1.0f / pw;
+            float last95 = -1.0f, last50 = -1.0f, last05 = -1.0f;
+            for (float v = 0.05f; v <= 4.0f; v += 0.0005f)
+            {
+                const float m = v / s;
+                const F3 src = mk(1.00f*m, 0.72f*m, 0.42f*m);
+                const F3 enc = encode(src, s);
+                const F3 stored = mk(fp16_rt(enc.x), fp16_rt(enc.y), fp16_rt(enc.z));
+                const F3 lin = srgb_decode(stored);
+                const F3 nud = mk(satf(lin.x*1.30f), satf(lin.y*1.30f), satf(lin.z*1.30f));
+                const F3 ne = srgb_encode(nud);
+                const F3 neural = mk(fp16_rt(ne.x), fp16_rt(ne.y), fp16_rt(ne.z));
+                const Out a = decode_current(src, 1.0f, stored, neural, s, 1.0f, 1.0f, 0u);
+                const float sy = rdx_lum(src);
+                const float frac = ((rdx_lum(a.rgb) / sy) - 1.0f) / 0.30f;
+                if (frac >= 0.95f) last95 = v;
+                if (frac >= 0.50f) last50 = v;
+                if (frac >= 0.05f) last05 = v;
+            }
+            std::printf("         paper_white_scale=%-4.1f  >=95%% to %.2fx paper white (magnitude %.2f)"
+                        "   >=50%% to %.2fx (%.2f)   >=5%% to %.2fx (%.2f)\n",
+                        pw, last95, last95/s, last50, last50/s, last05, last05/s);
+            if (pw == 1.0f) inv95 = last95;
+            else
+            {
+                char dd[128]; std::snprintf(dd, sizeof(dd), "(pw=%.1f gives %.2fx, pw=1.0 gives %.2fx)", pw, last95, inv95);
+                ck(std::fabs(last95 - inv95) < 0.02f,
+                   "the ceiling is INVARIANT in units of paper white - pw moves the magnitude, not the ratio", dd);
+            }
+        }
     }
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);

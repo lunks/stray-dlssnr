@@ -88,7 +88,19 @@ jobs:
           $prelude = $m[0].Groups[1].Value
           # full_source() is prelude + "`n" + entry. Reproduce that exactly.
           Set-Content -NoNewline -Path encode_full.hlsl -Value ($prelude + "`n" + $m[1].Groups[1].Value)
-          Set-Content -NoNewline -Path decode_full.hlsl -Value ($prelude + "`n" + $m[2].Groups[1].Value)
+          $decode = $prelude + "`n" + $m[2].Groups[1].Value
+          Set-Content -NoNewline -Path decode_full.hlsl -Value $decode
+
+          # THE SECOND DECODE VARIANT. hdr_codec::full_source_decode(false) flips exactly one
+          # character - the 1 in `#define NR_RDX_GRAFT 1` - and build() compiles THAT if the first
+          # one failed, so that a d3dcompiler which cannot build the reference graft costs the
+          # experiment and not the default the user plays on. If this variant does not compile,
+          # the survival path is not a survival path, and nobody would find out until the day it
+          # was needed. Reproduce the substitution exactly as full_source_decode does.
+          if ($decode -notmatch '#define NR_RDX_GRAFT 1') {
+            throw "the NR_RDX_GRAFT marker is missing from the decode literal, so hdr_codec::full_source_decode(false) would return the same text and the graft-failure fallback has silently stopped existing."
+          }
+          Set-Content -NoNewline -Path decodenograft_full.hlsl -Value ($decode -replace '#define NR_RDX_GRAFT 1', '#define NR_RDX_GRAFT 0')
 
           $fxcPath = $null
           $found = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" -ErrorAction SilentlyContinue |
@@ -101,7 +113,7 @@ jobs:
           if (-not $fxcPath) { throw "fxc.exe was not found. This gate is the only thing that compiles the codec's HLSL; do not skip it." }
           Write-Host "fxc: $fxcPath"
 
-          foreach ($e in @('encode','decode')) {
+          foreach ($e in @('encode','decode','decodenograft')) {
             & $fxcPath /nologo /T cs_5_0 /E main /O3 /Ges /Gis /Fo "$e.dxbc" "${e}_full.hlsl" 2>&1 | Out-String | Write-Host
             if ($LASTEXITCODE -ne 0) { throw "fxc FAILED on the $e shader. At runtime this is a silent latch-off of the whole HDR codec." }
             $sz = (Get-Item "$e.dxbc").Length
@@ -460,6 +472,36 @@ jobs:
           g++ -std=gnu++17 -O2 -Wall -Wextra -static -static-libgcc -static-libstdc++ \
               tools/hdr_codec_selftest.cpp -o hdr_selftest_mingw.exe
           ./hdr_selftest_mingw.exe
+
+      # -----------------------------------------------------------------------------------------
+      # THE DECODE'S SECOND SOURCE VARIANT MUST BE REAL.
+      #
+      # Both graft modes live in ONE shader and ONE compile, so a d3dcompiler that cannot build
+      # mode 1's OkLab/AP1 matrices would - without a fallback - fail the decode outright, latch
+      # codec_failed, and hand the user back the darkened pre-codec frame they play without every
+      # day. hdr_codec::build therefore retries with full_source_decode(false), which flips one
+      # character. The fxc step above compiles BOTH variants, but it reimplements the substitution
+      # in PowerShell; this one calls the real function and checks that every graft symbol is
+      # behind the #if, so the preprocessor really removes them and the retry is not theatre.
+      # -----------------------------------------------------------------------------------------
+      - name: The decode's graft-free source variant is real (MSVC)
+        shell: cmd
+        run: |
+          cl /nologo /std:c++17 /EHsc /O2 /MT /W3 ^
+             /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+             /I include tools\hdr_source_variants_test.cpp /Fe:hdr_variants_msvc.exe
+          if errorlevel 1 exit /b 1
+          hdr_variants_msvc.exe
+          if errorlevel 1 exit /b 1
+
+      - name: The decode's graft-free source variant is real (mingw-w64)
+        shell: bash
+        run: |
+          export PATH="/c/mingw64/bin:$PATH"
+          g++ -std=gnu++17 -O2 -Wall -Wextra -static -static-libgcc -static-libstdc++ \
+              -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -DNOMINMAX -DNDEBUG \
+              -I include tools/hdr_source_variants_test.cpp -o hdr_variants_mingw.exe
+          ./hdr_variants_mingw.exe
 
       - name: ini writer round-trip (MSVC)
         shell: cmd

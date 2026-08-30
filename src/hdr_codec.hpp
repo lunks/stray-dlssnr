@@ -93,10 +93,21 @@
 //   where the proxy has clipped to white a saturated highlight is dragged toward the white point;
 //   ours scales RGB uniformly and cannot move the hue at all.
 //
-//   Neither mode recovers a highlight above ~3.5x paper white, for the same reason: the soft clip
-//   saturates the proxy to exactly 1.0 there (0.25*exp(-5.77*(v-0.75)) < 2^-25 for v > 3.51), so
-//   the network has nothing to signal and (neural - proxy) is zero. That is a KNEE problem, and
-//   paper_white_scale is the knob for it.
+//   NEITHER MODE RECOVERS A BRIGHT HIGHLIGHT, AND THE CEILING IS MUCH LOWER THAN THE SOFT CLIP
+//   SUGGESTS. The proxy is not kept in FP32: it is written to an r16g16b16a16_float texture and
+//   read BACK OUT of it (see the next section, which is why). A half has ~11 mantissa bits, so
+//   the sRGB-encoded soft-clipped proxy quantises to EXACTLY 1.0 at v >= 1.81x paper white -
+//   not the 3.47x at which the soft clip itself saturates in FP32. Above that the network cannot
+//   signal an increase at all and (neural - proxy) <= 0.
+//
+//   And the transfer is mostly gone well before that, because the soft clip is a curve, not a
+//   wall. Of a requested +30% display-referred gain, measured through the real FP16 surfaces
+//   (tools/hdr_codec_selftest.cpp section 8), the decode delivers >=95% out to 0.79x paper white,
+//   >=50% out to 1.15x, and >=5% out to 1.86x. Those figures are in units of PAPER WHITE and do
+//   not move with paper_white_scale - what moves is the SCENE-LINEAR magnitude they land at, in
+//   proportion: at paper_white_scale = 4.0, full gain reaches a source magnitude of 3.17 instead
+//   of 0.79. That is what makes paper_white_scale the knob for a lost highlight, and it is a KNEE
+//   problem, not a graft problem.
 //
 //   The identity property above is a MODE 0 GUARANTEE. Mode 1 normalises by s at both ends, so at
 //   transfer_strength = 0 it returns (o * s) / s - exact only when s is a power of two. That, and
@@ -311,6 +322,14 @@ void main(uint3 tid : SV_DispatchThreadID)
 // So every early-out except the genuine out-of-bounds guard COPIES THE SOURCE THROUGH and then
 // returns. That is behaviourally identical to Remix's in-place "leave the pixel alone".
 static const char *const kDecodeSource = R"HLSL(
+// WHETHER MODE 1'S CODE IS IN THIS SHADER AT ALL. 1 in the literal as written, which is what CI's
+// fxc gate and the first-launch compile both see. build() flips this ONE character to 0 and
+// recompiles if - and only if - the compile with it at 1 failed, so a d3dcompiler that cannot
+// build the reference graft's OkLab matrices costs the EXPERIMENT and not the default the user
+// plays on. See full_source_decode() and build() below; the CPU forces hdr_graft to 0 whenever
+// the shader in hand was built with this at 0, so the stub is never actually reached.
+#define NR_RDX_GRAFT 1
+
 Texture2D<float4>   InOriginal : register(t0);
 Texture2D<float4>   InProxy    : register(t1);
 Texture2D<float4>   InNeural   : register(t2);
@@ -344,6 +363,7 @@ float nrBt709Luminance(float3 linearColor)
 	return dot(linearColor, float3(0.2126f, 0.7152f, 0.0722f));
 }
 
+#if NR_RDX_GRAFT
 // =============================================================================================
 // MODE 1: the reference add-on's graft-back, reproduced.
 //
@@ -367,8 +387,14 @@ float nrBt709Luminance(float3 linearColor)
 //   * Their Luminance() weights are 0.212639/0.715169/0.072192 and ours are 0.2126/0.7152/0.0722.
 //     Mode 1 uses THEIRS (below); mode 0 keeps ours. Sharing one set would change mode 0's output
 //     and it would stop being bit-identical to the shipping build, which is not negotiable.
-//   * Their decode has no NaN firewall, no output clamp, and its alpha comes from the graft
-//     target. Ours keeps all three in BOTH modes - see the write at the bottom of main().
+//   * Their decode has no NaN firewall and no output clamp; ours keeps both in BOTH modes - see
+//     the write at the bottom of main(). Their ALPHA is NOT a difference: their decode loads
+//     `float4 source = OutputOriginal.Load(...)` and writes `source.a`
+//     (renodx-codec-shaders.hlsl:199 and :222), and OutputOriginal (t3) is their display-
+//     resolution graft target, i.e. their original. So their alpha comes from the original
+//     exactly as ours does. Do not describe alpha carry-through as a local invention: it is not,
+//     and a future port that "removes the divergence" would be removing the fix for STRAY's
+//     portal-particle transparency.
 //
 // A CLIFF THAT IS THEIRS AND IS KEPT: ratio = neural_y > 0 ? new_y / neural_y : 0. The limit as
 // neural_y -> 0+ is a finite colour of luminance new_y, but AT exactly zero it snaps to black and
@@ -478,6 +504,56 @@ float3 nrRdxUpgradeToneMap(float3 original, float3 proxy, float3 neural, float t
 	return lerp(original, scaled, transferStrength);
 }
 
+// THE WHOLE OF MODE 1's BODY, IN ONE FUNCTION. Not a tidy-up: it is what lets the #else below
+// replace mode 1 wholesale without altering ONE CHARACTER of main(), so the two compiles differ
+// only in this block and mode 0's expression tree is textually identical in both.
+//
+// Their luminance-only path, which is the same construction as ours: rescale the ORIGINAL to the
+// upgraded luminance, then lerp toward the full-colour answer. NOTE WHAT IS NOT HERE: mode 0's
+// chroma valve. Ours crossfades to the network's own colour once the original's luminance falls
+// below kNrMinChromaLuminance/scale; theirs has no floor at all and rescales the original's
+// chromaticity by an unbounded ratio however dark the pixel is. That is faithful to renodx, and
+// it is why the two modes agree on bright pixels at color_strength = 0 and diverge in SHADOWS -
+// measured in tools/hdr_codec_selftest.cpp section 5.
+float3 nrRdxGradeDisplay(float3 originalDisplay, float3 proxy, float3 neural,
+                         float transferStrength, float colorStrength)
+{
+	const float3 upgraded = nrRdxUpgradeToneMap(originalDisplay, proxy, neural, transferStrength);
+
+	const float originalY = nrRdxLuminance(originalDisplay);
+	const float upgradedY = nrRdxLuminance(upgraded);
+	const float ratioY    = originalY == 0.0f ? 1.0f : upgradedY / originalY;
+	const float3 luminanceOnlyRdx = originalDisplay * ratioY;
+
+	return lerp(luminanceOnlyRdx, upgraded, colorStrength);
+}
+
+#else   // NR_RDX_GRAFT == 0
+
+// =============================================================================================
+// THE SURVIVAL BUILD. Reached only when the compile WITH the reference graft failed on this
+// machine - which under Proton may be Wine's builtin d3dcompiler (vkd3d-shader's HLSL front end),
+// whose SM5 coverage varies by version and which is being handed this tree's first float3x3
+// literals, first mul(matrix, vector), first sign() and first length().
+//
+// The point is what does NOT happen: build() falls back to this source instead of returning
+// false, so the codec still comes up and hdr_graft = 0 - the mode that ships, that is bit-exact,
+// and that the user plays on every day - is unaffected. Losing the experiment is a cost; losing
+// the default and handing the user the darkened pre-codec frame back is a regression, and the
+// brief ranks that above any new feature.
+//
+// This body is never executed: hdr_codec::blobs::decode_has_graft comes back false and the CPU
+// pins g_hdrGraft to 0 for the run (and says so in the log and in the overlay). It exists so the
+// call in main() still resolves, so that main() is byte-identical between the two compiles.
+// =============================================================================================
+float3 nrRdxGradeDisplay(float3 originalDisplay, float3 proxy, float3 neural,
+                         float transferStrength, float colorStrength)
+{
+	return originalDisplay;
+}
+
+#endif  // NR_RDX_GRAFT
+
 [numthreads(16, 16, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
 {
@@ -571,20 +647,10 @@ void main(uint3 tid : SV_DispatchThreadID)
 		// residual is ~1e-7 relative and is measured in tools/hdr_codec_selftest.cpp.
 		const float3 originalDisplay = original * scale;
 
-		const float3 upgraded = nrRdxUpgradeToneMap(originalDisplay, proxy, neural, g_transferStrength);
-
-		// Their luminance-only path, which is the same construction as ours: rescale the ORIGINAL
-		// to the upgraded luminance, then lerp toward the full-colour answer. Because their
-		// upgraded luminance equals our transferred luminance, mode 1 at color_strength = 0 and
-		// mode 0 at color_strength = 0 are very nearly the same image - the two modes only
-		// genuinely diverge at color_strength = 1. Say so in the UI; do not pretend they are
-		// three independent looks.
-		const float originalY = nrRdxLuminance(originalDisplay);
-		const float upgradedY = nrRdxLuminance(upgraded);
-		const float ratioY    = originalY == 0.0f ? 1.0f : upgradedY / originalY;
-		const float3 luminanceOnlyRdx = originalDisplay * ratioY;
-
-		const float3 gradedDisplay = lerp(luminanceOnlyRdx, upgraded, g_colorStrength);
+		// Everything of theirs lives in nrRdxGradeDisplay above, behind #if NR_RDX_GRAFT, so this
+		// call site - and every line of mode 0 - is identical in both of the two decode compiles.
+		const float3 gradedDisplay = nrRdxGradeDisplay(originalDisplay, proxy, neural,
+		                                               g_transferStrength, g_colorStrength);
 
 		// scale is clamped to [1e-6, 1e6], so this cannot be a division by zero.
 		const float3 sceneLinear = gradedDisplay / scale;
@@ -696,6 +762,32 @@ inline std::string full_source(const char *entry_source)
 	return s;
 }
 
+// The decode has TWO source variants and they differ by ONE CHARACTER: the 1 in the literal's
+// `#define NR_RDX_GRAFT 1`. with_graft = true reproduces full_source(kDecodeSource) EXACTLY - so
+// the shipping decode's source text, its FNV-1a hash and therefore its cache filename are the
+// literal as written and as CI's fxc gate compiles it. with_graft = false is the survival build:
+// mode 1's functions become a stub, mode 0 is untouched, and it is compiled only if the first one
+// failed. Returns false in `changed` if the marker is missing, which would mean somebody edited
+// the literal and the fallback would be a pointless second attempt at the same text.
+inline std::string full_source_decode(bool with_graft, bool *changed = nullptr)
+{
+	std::string s = full_source(kDecodeSource);
+	if (changed != nullptr)
+		*changed = false;
+	if (with_graft)
+		return s;
+	static const char kOn[]  = "#define NR_RDX_GRAFT 1";
+	static const char kOff[] = "#define NR_RDX_GRAFT 0";
+	const size_t at = s.find(kOn);
+	if (at != std::string::npos)
+	{
+		s.replace(at, sizeof(kOn) - 1, kOff, sizeof(kOff) - 1);
+		if (changed != nullptr)
+			*changed = true;
+	}
+	return s;
+}
+
 // DELIBERATELY NOT -ld3dcompiler_47: a load-time import would make the whole add-on fail to load
 // when the DLL is absent, taking the working NGX path down with it. Under Proton this may be
 // Wine's builtin (vkd3d-shader's HLSL compiler), whose SM5 compute coverage varies by version -
@@ -778,6 +870,12 @@ inline std::wstring widen_hex(uint64_t v)
 //   3. D3DCompile(cs_5_0)                - and the result is written to (2) on success
 // Any failure returns false with a logged reason; the caller then leaves the feature off.
 //
+// 'used_override', when non-null, is set to true if and only if path (1) was taken. It exists
+// because a user-supplied blob predates every root constant this header has ever added and cannot
+// be assumed to read them: with an override in place, hdr_graft may be a control wired to nothing,
+// and the caller has to be able to SAY so rather than let the overlay and the log both report a
+// mode the shader is not running. The override message alone does not connect the two.
+//
 // 'feature' names the thing being built in every message ("HDR codec", "motion-vector decode").
 // It is the ONLY thing this factoring added: build_one below still calls it with "HDR codec" and
 // with full_source(entry_source), so the hash, the cache FILENAMES, the compiler input and every
@@ -785,8 +883,11 @@ inline std::wstring widen_hex(uint64_t v)
 // the regression test - check that stray_dlssnr_encode.<hash>.dxbc keeps its name.
 template <typename LogFn>
 inline bool build_blob(const std::wstring &dir, const wchar_t *wname, const char *name,
-                       const char *feature, const std::string &src, std::vector<uint8_t> &out, LogFn log)
+                       const char *feature, const std::string &src, std::vector<uint8_t> &out, LogFn log,
+                       bool *used_override = nullptr)
 {
+	if (used_override != nullptr)
+		*used_override = false;
 	const uint64_t     hash = source_hash(src);
 	const std::wstring override_path = dir + wname + L".dxbc";
 	const std::wstring cache_path    = dir + wname + L"." + widen_hex(hash) + L".dxbc";
@@ -801,6 +902,8 @@ inline bool build_blob(const std::wstring &dir, const wchar_t *wname, const char
 			"delete it to go back to the built-in shader.",
 			feature, name, wname, out.size(), (unsigned long long)hash);
 		log(log_warn, buf);
+		if (used_override != nullptr)
+			*used_override = true;
 		return true;
 	}
 
@@ -889,14 +992,84 @@ struct blobs
 	std::vector<uint8_t> encode;
 	std::vector<uint8_t> decode;
 	bool ok = false;
+
+	// False when the decode in hand was built from the SURVIVAL source (NR_RDX_GRAFT 0), i.e. the
+	// compile with the reference graft in it failed on this machine. The caller must then pin
+	// hdr_graft to 0: the stub would silently return the original at every colour strength.
+	bool decode_has_graft = true;
+
+	// True when the decode came from a user-supplied stray_dlssnr_decode.dxbc. Such a blob is
+	// whatever the user built; it may predate g_hdrGraft entirely, in which case the constant is
+	// read by nothing and the graft selector does nothing while every status line says otherwise.
+	// We cannot know, so we say we cannot know - see the overlay and the startup log.
+	bool decode_overridden = false;
 };
 
+// Builds both entry points. The decode is attempted TWICE: once with the reference graft compiled
+// in (the literal as written, which is what CI's fxc gate compiles and what the cache filename
+// hashes), and - only if that fails - once with it stubbed out.
+//
+// WHY THE RETRY EXISTS. Both grafts live in ONE shader and ONE compile, so without this a syntax
+// or coverage failure anywhere in mode 1's OkLab/AP1 matrices would return false here, latch
+// st->codec_failed, and take the DEFAULT graft down with it - handing the user the darkened
+// pre-codec frame they play without every day. That is a strictly worse outcome than not shipping
+// the experiment at all. Under Proton the compiler may be Wine's builtin, so this is not
+// hypothetical, and CI's fxc gate cannot de-risk it: fxc is the WINDOWS-side compiler, not the one
+// that runs on the play box.
 template <typename LogFn>
 inline bool build(const std::wstring &dir, blobs &out, LogFn log)
 {
-	out.ok = build_one(dir, L"stray_dlssnr_encode", "encode", kEncodeSource, out.encode, log)
-	      && build_one(dir, L"stray_dlssnr_decode", "decode", kDecodeSource, out.decode, log);
-	return out.ok;
+	out = blobs();
+	char buf[1024];
+
+	if (!build_one(dir, L"stray_dlssnr_encode", "encode", kEncodeSource, out.encode, log))
+		return false;
+
+	bool overridden = false;
+	if (build_blob(dir, L"stray_dlssnr_decode", "decode", "HDR codec",
+	               full_source_decode(true), out.decode, log, &overridden))
+	{
+		out.decode_has_graft = true;
+		out.decode_overridden = overridden;
+		out.ok = true;
+		return true;
+	}
+
+	bool changed = false;
+	const std::string fallback = full_source_decode(false, &changed);
+	if (!changed)
+	{
+		log(log_error,
+			"DLSS-NR: the HDR codec decode failed to compile and the NR_RDX_GRAFT marker is not in "
+			"the shader source, so there is no reduced build to fall back to. The codec stays OFF.");
+		return false;
+	}
+
+	std::snprintf(buf, sizeof(buf),
+		"DLSS-NR: the HDR codec decode did NOT compile with the reference graft (hdr_graft=1) in "
+		"it - the error blob is above. RETRYING with mode 1 removed, so that the DEFAULT additive "
+		"graft (hdr_graft=0), which is the one this add-on ships and plays on, is not lost to a "
+		"compiler that cannot build the experiment.");
+	log(log_warn, buf);
+
+	if (build_blob(dir, L"stray_dlssnr_decode", "decode", "HDR codec",
+	               fallback, out.decode, log, &overridden))
+	{
+		out.decode_has_graft = false;
+		out.decode_overridden = overridden;
+		out.ok = true;
+		std::snprintf(buf, sizeof(buf),
+			"DLSS-NR: the reduced decode compiled. hdr_graft=0 (ours, additive, bit-exact) runs "
+			"NORMALLY and the image is exactly what it always was; hdr_graft=1 is UNAVAILABLE for "
+			"this run and is pinned to 0 - the overlay says so and the combo is disabled.");
+		log(log_warn, buf);
+		return true;
+	}
+
+	log(log_error,
+		"DLSS-NR: the reduced decode did not compile either, so the failure is not in the "
+		"reference graft. The HDR codec stays OFF for this run.");
+	return false;
 }
 
 // =============================================================================================
