@@ -293,6 +293,50 @@ struct config
 	// snippet is loaded and initialised at all.
 	bool     dlss_nr = true;
 
+	// =======================================================================================
+	// CHAIN MODE - DLSS-NR *then* DLSS-SR, on ONE accepted TAA dispatch.
+	// =======================================================================================
+	//
+	// dlss_sr=1 and dlss_nr=1 do not chain: the SR pass TAKES the accepted dispatch and the NR
+	// evaluate never runs. That is an implementation choice, not a limitation - both snippets
+	// already load side by side through the trampoline's two slots, DLSS-NR already evaluates
+	// into its OWN texture rather than writing the frame, and DLSS-SR's colour input is a
+	// parameter. This key wires the one to the other:
+	//
+	//     game TAA dispatch (suppressed)
+	//       -> [codec encode]  render-res linear HDR -> display-referred proxy
+	//       -> DLSS-NR         proxy -> out_tex, at the RENDER extent
+	//       -> [codec decode]  the denoised answer grafted back onto the linear original
+	//       -> DLSS-SR         COLOUR = the denoised render-res image -> u0 at 4K
+	//
+	// Denoise first, THEN upscale. The other order - which is what dlss_sr=0/dlss_nr=1 does
+	// today - denoises at 1920x1080 and then lets a spatial filter magnify whatever noise is
+	// left into 3840x2160.
+	//
+	// WHAT IT COSTS WHEN IT IS 0, which is the default and the shipping configuration: one bool
+	// is parsed and stored, and it is read in a handful of `&&`/`||` chains that short-circuit
+	// false. Nothing is loaded, nothing is allocated, no GPU work changes, and the
+	// "dlss_sr=0 is BIT-IDENTICAL to the build before SR existed" contract above extends to it
+	// verbatim. With dlss_chain=0 the branch at the end of nr_try_run is exactly the one that
+	// ships today.
+	//
+	// REQUIREMENTS, and the add-on says so in the log rather than degrading silently:
+	//   * BOTH snippets must load and arm - nvngx_dlssnr.dll AND nvngx_dlss.dll. If either does
+	//     not, chain mode is refused once, by name, and the run falls back to whichever single
+	//     feature did arm. It never half-runs.
+	//   * UE4 must be in the MainUpsampling permutation (r.TemporalAA.Upsampling=1,
+	//     r.SecondaryScreenPercentage=100, r.ScreenPercentage=50), because otherwise the TAA
+	//     pass's output UAV is the same size as its colour input and there is nothing to upscale
+	//     into. That permutation has DIFFERENT DXBC, so sr_shader_hash must be re-pinned - the
+	//     want-hash selector below treats dlss_chain exactly like dlss_sr.
+	//   * hdr_codec=1 is effectively mandatory. With it off, DLSS-SR is handed the network's raw
+	//     DISPLAY-REFERRED answer as if it were linear HDR - README gap 1, magnified by the
+	//     upscaler. The add-on warns once and runs anyway.
+	//
+	// The DLSS-NR copy-back does not happen in chain mode and CANNOT: its result is at the render
+	// extent and u0 is at the output extent. DLSS-SR's write is the only write to u0.
+	bool     dlss_chain = false;
+
 	// ---- identification --------------------------------------------------------------------
 	// THE ONE-LINE HASH RE-PIN. Flipping r.TemporalAA.Upsampling changes TAA_PASS_CONFIG, and
 	// r.ScreenPercentage below 100 changes TAA_SCREEN_PERCENTAGE_RANGE; both are #defines, so the
@@ -599,6 +643,7 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "app_id")                   c.app_id = parse_u64(v, c.app_id);
 		else if (key == "dlss_sr")                  c.dlss_sr = parse_bool(v, c.dlss_sr);
 		else if (key == "dlss_nr")                  c.dlss_nr = parse_bool(v, c.dlss_nr);
+		else if (key == "dlss_chain")               c.dlss_chain = parse_bool(v, c.dlss_chain);
 		else if (key == "sr_shader_hash")           c.sr_shader_hash = parse_u64(v, c.sr_shader_hash);
 		else if (key == "sr_out_width")             c.sr_out_width = static_cast<uint32_t>(parse_u64(v, c.sr_out_width));
 		else if (key == "sr_out_height")            c.sr_out_height = static_cast<uint32_t>(parse_u64(v, c.sr_out_height));
