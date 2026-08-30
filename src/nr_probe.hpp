@@ -49,9 +49,8 @@ using namespace reshade::api;
 namespace nr_probe
 {
 
-// The accumulator is four uints in one buffer: sum(luma_in), sum(luma_out), sum(|luma_out -
-// luma_in|), sample_count. Fixed point because a typed r32_uint UAV is the only thing that gives
-// us InterlockedAdd without a structured-buffer view.
+// Fixed point because a typed r32_uint UAV is the only thing that gives us InterlockedAdd
+// without a structured-buffer view.
 // SLOT LAYOUT
 //   0 sum(luma_in)      1 sum(luma_out)     2 sum|luma_out - luma_in|   3 sample count
 //   4 max(luma_out)     5 ~min(luma_out)    6 count(luma_out < 0)       7 count(non-finite out)
@@ -74,11 +73,30 @@ static constexpr uint32_t kThreads     = 8;
 // flourish: clear() zeroes the buffer, and an InterlockedMin seeded at 0 can only ever answer 0.
 // Storing the complement lets both extremes start from the same zeroed slot.
 
-// Sample every 8th texel on both axes. At 1920x1080 that is 240x135 = 32400 samples, which is
-// plenty for a mean and keeps the fixed-point sum inside uint32: 32400 * 1024 = 33.2M, and the
-// three accumulators are each bounded by that. A full-res sum would overflow.
-static constexpr uint32_t kStride      = 8;
-static constexpr uint32_t kFixedScale  = 1024;
+// OVERFLOW BOUND - GOT THIS WRONG ONCE, SO THE ARITHMETIC IS WRITTEN OUT.
+//
+// The earlier note here reasoned about ONE FRAME at 1920x1080 (240x135 = 32400 samples) and
+// concluded 32400 * 1024 = 33.2M fits easily. That bound is irrelevant: clear() runs once per
+// STEP, not per frame, so the sums accumulate across every frame of the hold. The real figure
+// at 2560x1440, stride 8, 120 frames is
+//
+//     (2560/8) * (1440/8) * 120 = 320 * 180 * 120 = 6,912,000 samples
+//     6,912,000 * 1024                            = 7.08e9   >  UINT32_MAX (4.29e9)
+//
+// and 6,912,000 is exactly the sample count the probe reported. The sums WERE wrapping, which
+// is why mean_out read 0.00000 while the codec-off frame plainly had content and the graft
+// arithmetic said a genuinely zero neural would have produced a near-black image. The means
+// were not measuring anything.
+//
+// Stride 16 and a 256 scale put the worst case an order of magnitude clear:
+//
+//     (2560/16) * (1440/16) * 120 = 160 * 90 * 120 = 1,728,000 samples
+//     1,728,000 * 256                              = 4.42e8   <  4.29e9
+//
+// The extremes in slots 4-9 were never affected - InterlockedMax cannot overflow - which is why
+// they disagreed with the means, and that disagreement is what exposed this.
+static constexpr uint32_t kStride      = 16;
+static constexpr uint32_t kFixedScale  = 256;
 
 // Root constants, in 32-bit values.
 static constexpr uint32_t kConstantCount = 4;
