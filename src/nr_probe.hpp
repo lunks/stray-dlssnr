@@ -52,9 +52,27 @@ namespace nr_probe
 // The accumulator is four uints in one buffer: sum(luma_in), sum(luma_out), sum(|luma_out -
 // luma_in|), sample_count. Fixed point because a typed r32_uint UAV is the only thing that gives
 // us InterlockedAdd without a structured-buffer view.
-static constexpr uint32_t kSlots       = 4;
+// SLOT LAYOUT
+//   0 sum(luma_in)      1 sum(luma_out)     2 sum|luma_out - luma_in|   3 sample count
+//   4 max(luma_out)     5 ~min(luma_out)    6 count(luma_out < 0)       7 count(non-finite out)
+//   8 max(luma_in)      9 ~min(luma_in)
+//
+// Slots 4-9 exist because the first run of this probe reported mean_out = 0.00000 on every step,
+// and the mean ALONE cannot tell "NGX wrote nothing" from "NGX wrote negative values" - slots 0-2
+// saturate() before the fixed-point cast, so anything <= 0 accumulates as 0 either way. That
+// ambiguity is the whole question, so the signed extremes are carried separately and unsaturated.
+static constexpr uint32_t kSlots       = 10;
 static constexpr uint32_t kSlotBytes   = kSlots * sizeof(uint32_t);
 static constexpr uint32_t kThreads     = 8;
+
+// Order-preserving float->uint key, so InterlockedMax works on signed values.
+//   non-negative f: sign bit 0 -> key = u | 0x80000000, landing in [0x80000000, 0xFFFFFFFF]
+//   negative     f: sign bit 1 -> key = ~u,             landing in [0, 0x7FFFFFFF]
+// Monotonic across the whole range, so a plain integer max IS the float max.
+//
+// The MIN slots store ~key and are also accumulated with InterlockedMax. That is not a
+// flourish: clear() zeroes the buffer, and an InterlockedMin seeded at 0 can only ever answer 0.
+// Storing the complement lets both extremes start from the same zeroed slot.
 
 // Sample every 8th texel on both axes. At 1920x1080 that is 240x135 = 32400 samples, which is
 // plenty for a mean and keeps the fixed-point sum inside uint32: 32400 * 1024 = 33.2M, and the
@@ -100,6 +118,13 @@ cbuffer Args : register(b0)
 
 float luma(float3 c) { return dot(c, float3(0.2126f, 0.7152f, 0.0722f)); }
 
+// Order-preserving float -> uint. See the note beside kSlots.
+uint order_key(float f)
+{
+    uint u = asuint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
@@ -125,6 +150,19 @@ void main(uint3 id : SV_DispatchThreadID)
     InterlockedAdd(stats[1], ub,  prev);
     InterlockedAdd(stats[2], ud,  prev);
     InterlockedAdd(stats[3], 1u,  prev);
+
+    // UNSATURATED extremes. These are the slots that distinguish "NGX wrote nothing" (exactly 0)
+    // from "NGX wrote negatives" (min < 0) from "we are decoding the wrong thing" (non-finite).
+    uint kb = order_key(lb);
+    InterlockedMax(stats[4], kb,  prev);
+    InterlockedMax(stats[5], ~kb, prev);
+    if (lb < 0.0f)              InterlockedAdd(stats[6], 1u, prev);
+    // isfinite() is false for NaN and both infinities.
+    if (!isfinite(lb))          InterlockedAdd(stats[7], 1u, prev);
+
+    uint ka = order_key(la);
+    InterlockedMax(stats[8], ka,  prev);
+    InterlockedMax(stats[9], ~ka, prev);
 }
 )HLSL";
 
@@ -163,7 +201,23 @@ struct step_result
 	double mean_diff = 0.0;
 	uint64_t samples = 0;
 	bool   valid     = false;
+	// Unsaturated extremes - the slots that answer "empty or negative?".
+	float  min_out   = 0.0f;
+	float  max_out   = 0.0f;
+	float  min_in    = 0.0f;
+	float  max_in    = 0.0f;
+	uint32_t neg_out = 0;
+	uint32_t nan_out = 0;
 };
+
+// Inverse of the shader's order_key.
+inline float key_to_float(uint32_t k)
+{
+	const uint32_t u = (k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k;
+	float f;
+	std::memcpy(&f, &u, sizeof(f));
+	return f;
+}
 
 // GPU objects. Owned by the caller's per-device state; built once and destroyed on teardown.
 struct pipeline_set
@@ -307,7 +361,7 @@ inline bool read(device *dev, pipeline_set &p, step_result &out)
 	if (!dev->map_buffer_region(p.readback, 0, kSlotBytes, map_access::read_only, &data) || data == nullptr)
 		return false;
 
-	uint32_t v[kSlots] = { 0, 0, 0, 0 };
+	uint32_t v[kSlots] = {};
 	std::memcpy(v, data, sizeof(v));
 	dev->unmap_buffer_region(p.readback);
 
@@ -320,6 +374,13 @@ inline bool read(device *dev, pipeline_set &p, step_result &out)
 	out.mean_in   = static_cast<double>(v[0]) / n / s;
 	out.mean_out  = static_cast<double>(v[1]) / n / s;
 	out.mean_diff = static_cast<double>(v[2]) / n / s;
+	// The min slots hold ~key (see kSlots); undo the complement before decoding.
+	out.max_out   = key_to_float(v[4]);
+	out.min_out   = key_to_float(~v[5]);
+	out.neg_out   = v[6];
+	out.nan_out   = v[7];
+	out.max_in    = key_to_float(v[8]);
+	out.min_in    = key_to_float(~v[9]);
 	out.valid     = true;
 	return true;
 }
@@ -361,6 +422,21 @@ inline void frame(device *dev, command_list *cmd, pipeline_set &p, run_state &r,
 				    r.step + 1u, kSweepCount, kSweep[r.step].label,
 				    res.mean_in, res.mean_out, res.mean_diff,
 				    (unsigned long long)res.samples);
+				// UNSATURATED. The means above clamp at 0, so they cannot tell an empty output
+				// from a negative one - these can, and that distinction is the open question.
+				log("DLSS-NR probe:   raw luma  IN [%.6f .. %.6f]   OUT [%.6f .. %.6f]   "
+				    "out<0: %u   non-finite out: %u",
+				    res.min_in, res.max_in, res.min_out, res.max_out,
+				    res.neg_out, res.nan_out);
+				if (res.min_out == 0.0f && res.max_out == 0.0f)
+					log("DLSS-NR probe:   OUT IS EXACTLY ZERO EVERYWHERE - NGX returned Success but "
+					    "wrote nothing to the texture bound as DLSSNR.Output, or we are reading a "
+					    "different resource than the one it wrote.");
+				else if (res.neg_out > 0)
+					log("DLSS-NR probe:   OUT CARRIES NEGATIVES (%u of %llu sampled) - the network "
+					    "did write, and the graft is subtracting light. This is a decode/contract "
+					    "problem, NOT an empty output.",
+					    res.neg_out, (unsigned long long)res.samples);
 			}
 			else
 			{
@@ -400,6 +476,25 @@ inline void frame(device *dev, command_list *cmd, pipeline_set &p, run_state &r,
 					}
 					log("DLSS-NR probe: LARGEST effect vs baseline = %.6f at step %u [%s].",
 					    best, best_i + 1u, kSweep[best_i].label);
+					// GUARD ADDED AFTER THE FIRST RUN REPORTED A FALSE VERDICT. That run said
+					// "structure strength is INERT" while every step read mean_out = 0.00000:
+					// the sweep was comparing a parameter against an output that did not exist.
+					// A no-change result only means "the parameter did nothing" if the output was
+					// a real image in the first place, so that is now a precondition, not an
+					// assumption.
+					const bool out_degenerate =
+						(a.min_out == 0.0f && a.max_out == 0.0f) ||
+						(z.min_out == 0.0f && z.max_out == 0.0f) ||
+						a.nan_out > 0 || z.nan_out > 0;
+					if (out_degenerate)
+					{
+						log("DLSS-NR probe: NO VERDICT ON STRUCTURE STRENGTH - the network's output "
+						    "is degenerate (empty or non-finite), so a no-change result says "
+						    "nothing about the parameter. FIX THE OUTPUT FIRST; the sweep cannot "
+						    "measure a control against an image that is not there.");
+						log("DLSS-NR probe: PROBE COMPLETE");
+						return;
+					}
 					log("DLSS-NR probe: VERDICT - structure strength %s on this model. %s",
 					    (best > floor_diff * 2.0) ? "IS LIVE" : "is INERT",
 					    (best > floor_diff * 2.0)
