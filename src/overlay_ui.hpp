@@ -303,7 +303,6 @@ struct status_block
 	std::atomic<float>        auto_scale_x{ 0.0f }, auto_scale_y{ 0.0f };
 	std::atomic<uint64_t>     hist_applied{ 0 }, hist_dropped{ 0 };
 
-	std::atomic<bool>         bypass_active{ false };
 	// A TIMESTAMP, not a latch. As a latch, a feature that never came back would leave the status
 	// reading "REBUILDING" indefinitely - which is exactly the kind of stale-positive this panel
 	// exists to avoid, and the same defect the reference add-on's "ACTIVE" has.
@@ -548,9 +547,7 @@ inline bool begin_pass(cfg::config &c,
 	// ---- the master bypass -------------------------------------------------------------------
 	// AFTER the snapshot, so g_cfg is coherent whether or not we run, and after the flush, so
 	// both edges of the toggle drop any pending pristine copy.
-	const bool bypass = l.bypass.load(std::memory_order_relaxed);
-	s.bypass_active.store(bypass, std::memory_order_relaxed);
-	if (bypass)
+	if (l.bypass.load(std::memory_order_relaxed))
 	{
 		pending_res = 0;
 		return false;
@@ -1174,7 +1171,11 @@ inline void draw_status(reshade::api::effect_runtime *rt, const host_facts &f)
 		return;
 	}
 
-	if (s.bypass_active.load(std::memory_order_relaxed))
+	// Read from the LIVE block, not from a mirror the render thread publishes. The overlay owns
+	// this value, so it is authoritative here - and a mirror would report the wrong thing whenever
+	// the pass is not being reached at all (nothing to echo it), which is precisely the case where
+	// the user most needs to know the switch is off.
+	if (live().bypass.load(std::memory_order_relaxed))
 	{
 		overlay_imgui::textf_colored(col::amber, "BYPASSED - \"Enable DLSS Neural Rendering\" is off in this panel");
 		ImGui::TextWrapped("The TAA pass is still being identified and the game's own dispatch is "
