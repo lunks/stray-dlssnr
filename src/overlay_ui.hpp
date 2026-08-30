@@ -739,8 +739,7 @@ inline bool save_ini(std::string &err)
 			if (eq == std::string::npos)
 				continue;
 
-			std::string key = body.substr(0, eq);
-			std::string key_trim = key; cfg::trim(key_trim);
+			std::string key_trim = body.substr(0, eq); cfg::trim(key_trim);
 			if (key_trim.empty() || key_trim[0] == '[')
 				continue;
 
@@ -749,10 +748,16 @@ inline bool save_ini(std::string &err)
 			if (!owned_value(kl, l, value))
 				continue;   // not ours: left exactly as it was
 
-			// Preserve the leading whitespace and the user's own spelling of the key, and keep any
-			// trailing comment. Only the value changes.
-			const size_t lead = key.find_first_not_of(" \t");
-			const std::string indent = (lead == std::string::npos) ? std::string() : key.substr(0, lead);
+			// ONLY THE VALUE CHANGES. Everything up to and including the '=' is re-emitted byte for
+			// byte, and so is the whitespace that followed it, so the shipped ini's column alignment
+			// survives - lines like "local_structure_strength = 1.0" are padded to line up with their
+			// neighbours, and a writer that normalised them to one space would reflow a file the user
+			// reads as documentation.
+			const std::string head = body.substr(0, eq + 1);
+			const std::string vpart = body.substr(eq + 1);
+			const size_t vs = vpart.find_first_not_of(" \t");
+			const std::string vpad = (vs == std::string::npos) ? std::string(" ") : vpart.substr(0, vs);
+
 			// A trailing comment is re-emitted verbatim, which also carries this file's '\r' if it
 			// has CRLF endings; when there is no comment the '\r' is at the end of 'body' instead.
 			std::string tail;
@@ -761,7 +766,7 @@ inline bool save_ini(std::string &err)
 			else if (!body.empty() && body.back() == '\r')
 				tail = "\r";
 
-			line = indent + key_trim + " = " + value + tail;
+			line = head + vpad + value + tail;
 
 			for (size_t i = 0; i < n_keys; ++i)
 			{

@@ -375,6 +375,38 @@ jobs:
               abi/overlay_ui_probe.cpp -o overlay_ui_mingw.dll
 
       # -----------------------------------------------------------------------------------------
+      # The ini writer, RUN for real on both toolchains.
+      #
+      # It is the only part of the overlay that touches the user's own data, its failure mode is
+      # silent and permanent (a truncated ini makes every key after the cut take its built-in
+      # default), and it is Win32 - _wfopen plus MoveFileExW for the temp-file swap - so it has to
+      # be exercised here rather than argued about. Checks that comments, ordering, column
+      # alignment, CRLF endings, trailing comments, the colour/color alias and every key the
+      # overlay does NOT own all survive a rewrite, that the result re-parses to exactly what was
+      # set, that a missing file is created, and that an unwritable target reports failure instead
+      # of claiming success.
+      # -----------------------------------------------------------------------------------------
+      - name: ini writer round-trip (MSVC)
+        shell: cmd
+        run: |
+          cl /nologo /std:c++17 /EHsc /O2 /MT /W3 ^
+             /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DNDEBUG ^
+             /I include abi\ini_rewrite_test.cpp /Fe:ini_test_msvc.exe
+          if errorlevel 1 exit /b 1
+          ini_test_msvc.exe
+          if errorlevel 1 exit /b 1
+
+      - name: ini writer round-trip (mingw-w64)
+        shell: bash
+        run: |
+          export PATH="/c/mingw64/bin:$PATH"
+          g++ -std=gnu++17 -O2 -static -static-libgcc -static-libstdc++ \
+              -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -DNOMINMAX -DNDEBUG \
+              -Wall -Wextra -Wno-attributes -Wno-unknown-pragmas -Wno-unused-parameter \
+              -I include abi/ini_rewrite_test.cpp -o ini_test_mingw.exe
+          ./ini_test_mingw.exe
+
+      # -----------------------------------------------------------------------------------------
       # The overlay runs on the PRESENT thread. nr_try_run takes st->mutex and then g.mutex
       # (stray_dlssnr.cpp:2193, :2198), and on_present already reads the DLSS-NR counters as
       # atomics rather than locking, specifically to avoid inverting that order - the AB/BA
