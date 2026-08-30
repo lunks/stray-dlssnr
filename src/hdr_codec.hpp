@@ -125,7 +125,10 @@
 //   * RWTexture1D<float> exposureTexture / enableAutoExposure. Remix folds its own auto-exposure
 //     into s. STRAY exposes no equivalent to us, so s is a plain ini constant. neuralRenderingProxyScale
 //     collapses to the clamp, which is kept - the decode divides by this value and derives its
-//     chroma floor from it.
+//     chroma floor from it. That constant is the one number here that had to be DERIVED rather
+//     than transcribed: see "THE SCALE, s - WHERE THE DEFAULT COMES FROM" further down, which
+//     carries the arithmetic, the hardware measurement that pins its direction, and the list of
+//     things it does NOT verify.
 //   * calcUserEVBias / userBrightness. No equivalent.
 //   Nothing else. Every constant, every threshold, every guard is the Remix value.
 //
@@ -678,6 +681,144 @@ void main(uint3 tid : SV_DispatchThreadID)
 )HLSL";
 
 // =============================================================================================
+// THE SCALE, s - WHERE THE DEFAULT COMES FROM
+//
+// This is the ONE number in this codec that is not a transcription of the Remix deployment.
+// Remix folds its own auto-exposure and the user's EV bias into s (rtx_neural_rendering.cpp:473);
+// STRAY exposes neither to a ReShade add-on, so it is an ini constant, cfg::paper_white_scale.
+// It used to be 1.0 with nothing at all behind it. What follows is the derivation that replaced
+// that guess. IT IS STILL NOT A HARDWARE MEASUREMENT - see WHAT IS NOT VERIFIED at the bottom,
+// and do not quote any line above it as if it were.
+//
+// WHAT s IS, EXACTLY. The encode computes displayReferred = sceneLinear * s and hands
+// SrgbEncode(SoftClip(displayReferred)) to the network, and SrgbEncode saturates at 1.0. So
+// displayReferred == 1.0 IS display white, and
+//
+//     paper_white_scale = 1 / s = THE SCENE-LINEAR VALUE THIS CODEC CALLS DISPLAY WHITE.
+//
+// Everything below is one question: which UE4 SceneColor value should that be?
+//
+// THE INPUT. The tap is STRAY's TAA output - UE 4.27 SceneColor: linear, pre-bloom, pre-tonemap.
+// UE 4.25+ multiplies SceneColor by View.PreExposure as it is written, whose whole purpose is to
+// fold the previous frame's eye-adaptation exposure in so the FP16 surface stays near [0,1]; the
+// tonemapper divides it back out. The convention that follows is UE's own: DIFFUSE WHITE sits at
+// about 1.0, mid grey at about 0.18, and emissives and speculars run above 1. THIS IS THE ONE
+// EXTERNAL ASSUMPTION IN THE DERIVATION AND NOTHING HERE MEASURES IT.
+//
+// THE CONSTRAINT, AND IT IS MEASURED RATHER THAN ASSUMED. This codec has almost no headroom
+// above display white. tools/hdr_codec_selftest.cpp section 8, in units of paper white:
+//
+//     v >= 1.8088   fp16(SrgbEncode(SoftClip(v))) is EXACTLY 1.0. The network cannot signal an
+//                   increase at all, so (neural - proxy) <= 0 and the transfer can ONLY DARKEN.
+//     v <= 0.79     >= 95% of a requested display-referred change survives the round trip.
+//     v  = 1.15     ~50% survives.
+//     v  = 1.86     ~5% survives.
+//
+// So the transfer is at full strength only below ~0.8x paper white and is DEAD above 1.81x -
+// 1.81:1 is 0.86 stops. Choosing s is therefore NOT choosing how much of SceneColor's range to
+// cover; no value covers a scene-referred buffer's range through a 0.86-stop window. It is
+// choosing WHICH part of the scene gets the full-strength transfer and which part is thrown at
+// the shoulder.
+//
+// TWO INDEPENDENT CRITERIA, AND THEY AGREE TO 5%.
+//
+//   (1) THE KNEE. Put UE4's diffuse white exactly on the soft-clip knee, so the entire diffuse
+//       range [0, 1] is transferred through the LINEAR segment of SoftClip and the whole
+//       0.75 -> 1.0 shoulder is spent on what is genuinely above diffuse white, which is what a
+//       shoulder is for:
+//                 paper_white_scale = 1 / kNrSoftClipKnee = 1 / 0.75 = 1.33333
+//
+//   (2) THE MEASURED FULL-GAIN POINT. Put diffuse white where >= 95% of the network's requested
+//       change still survives the FP16 round trip:
+//                 paper_white_scale = 1 / 0.79 = 1.26582
+//
+// The gap between them is far inside the precision of either input. Take 4/3, and take it in
+// that exact form: float(4.0f/3.0f) is 1.33333337, and 1.0f/1.33333337 rounds to EXACTLY 0.75f
+// (the true quotient is 0.74999998, two ulp under 0.75 and inside the half-ulp of 2.98e-8), so
+// the s handed to both dispatches is a clean binary constant and not a repeating fraction.
+//
+// WHAT THAT DOES, ARITHMETICALLY. SrgbEncode(x) = 1.055*x^(1/2.4) - 0.055 above 0.0031308:
+//
+//     SceneColor 1.00 (diffuse white) -> 0.750 -> encoded 0.8808  (225/255)   was 1.0000 (clipped)
+//     SceneColor 0.18 (mid grey)      -> 0.135 -> encoded 0.4030  (103/255)   was 0.4614 (118/255)
+//     the one-directional FP16 clip    1.8088 * 4/3 = 2.412 scene-linear      was 1.809
+//     the >= 95% full-gain region      0.790  * 4/3 = 1.053 scene-linear      was 0.790
+//
+// The third line is the point. At 1.0 the transfer went one-directional - able to darken a pixel
+// and structurally unable to brighten it - at SceneColor 1.81, i.e. barely above diffuse white,
+// which in a UE4 buffer is every lit surface facing a light and every neon sign in the slums. At
+// 4/3 that does not happen until 2.41. The fourth line is the other half: the whole diffuse range
+// now receives >= 95% of what the network asked for, where at 1.0 it began losing strength at
+// 0.79 and was down to half by 1.15.
+//
+// THE COST, STATED HONESTLY. The proxy is about 12% darker in code values below the knee
+// (0.75^(1/2.4) = 0.887), and mid grey lands 15 code values under a textbook sRGB mid grey. That
+// is the SANITY BOUND on how far this can be pushed, not an anchor: the proxy has to stay a
+// normally-exposed sRGB image, because that is the distribution the network was trained on. 4/3
+// keeps it there. 2.0 - which would be attractive because it is a power of two, making even
+// hdr_graft=1's (o*s)/s round trip exact - puts mid grey at 85/255 and diffuse white at 188/255,
+// and that is a visibly under-exposed photograph. It was rejected for that.
+//
+// THE SECOND COST, MEASURED RATHER THAN ASSERTED. 4/3 is not a power of two, so hdr_graft=1's
+// display-referred round trip (o * s) / s stops being exact at the DEFAULT, where at 1.0 it was.
+// tools/hdr_codec_selftest.cpp section 6 now carries 4/3 in its sweep precisely so that this is a
+// line in the CI log: mode 1 is non-exact on 7586 of 20000 pixels, worst 8.94e-08 relative, and
+// MODE 0 - the shipping graft - is 0 of 20000, bit for bit, exactly as it is at every other scale.
+// Run the transfer_strength=0 identity check on hdr_graft=0; it was always the mode that owned
+// that guarantee, and the new default does not touch it.
+//
+// WHY THE DIRECTION IS RIGHT, GIVEN THE ONE HARDWARE MEASUREMENT WE HAVE. Eight cold launches,
+// sampling a 160x90 luma grid of 4K captures of the same scene: transfer_strength=0 (a bit-exact
+// bypass) gives mean luma 46.9, transfer_strength=1 gives 41.0, with a within-group spread of
+// +/-0.15 against a between-group gap of 5.9. Grafting the network's answer in DARKENS the frame
+// by ~12%, reliably. (The camera was not perfectly reproducible between launches, so the exact
+// percentage is indicative; the direction and the grouping are not.) A systematic ONE-DIRECTIONAL
+// loss is the fingerprint of the 1.81 clip, because that clip is the only term in this codec with
+// a built-in sign. Note what does NOT explain it and therefore does not argue against raising s:
+//   * a multiplicative bias in the network is scale-INVARIANT here. Below the knee the residual
+//     is (SrgbDecode(neural) - v*s)/s, so a network that returns (1-e)x contributes -e*v whatever
+//     s is. Raising s cannot make that worse and cannot make it better.
+//   * the chroma valve is inert at color_strength = 1, which is where those runs were: mode 0's
+//     `graded = lerp(luminanceOnly, transferred, 1.0)` is exactly `transferred`.
+// The clip asymmetry is the only mechanism in the list that s touches at all.
+//
+// WHAT IS NOT VERIFIED, AND MUST NOT BE READ AS IF IT WERE:
+//   * that STRAY leaves r.UsePreExposure at its default, i.e. that SceneColor at THIS tap really
+//     is exposure-normalised with diffuse white near 1.0. Nothing in this add-on measures it. If
+//     STRAY writes raw radiance instead, the right value is not near 4/3 at all, and then this
+//     derivation has only fixed the SHAPE of the answer (diffuse white belongs on the knee) and
+//     not its magnitude.
+//   * that 4/3 removes the measured 12%. It removes ONE of the two candidate mechanisms - the
+//     clip - and NO value of s can remove the other: a denoiser that eats positively-skewed
+//     Monte-Carlo noise lowers the mean by construction. Expect an improvement, not a null.
+//   * anything at all about this number on hardware. It is a derivation. The overlay's Scene
+//     Paper-White Scale slider is LIVE, so the honest way to settle it is a sweep with the camera
+//     parked - the procedure, and what to look at, are in docs/GAP1-CALIBRATION.md.
+//
+// WHY THIS IS A CONSTANT AND NOT MEASURED FROM THE FRAME. It should be measured, eventually: the
+// missing quantity is a statistic of the encode's own input, and that input is right there. It is
+// not done here because every cheap way to get it changes something this toolchain cannot
+// re-verify. An average-luminance reduction needs a second UAV on the encode, which is a new root
+// signature, new shader text, a new FNV-1a source hash, every on-disk stray_dlssnr_*.dxbc cache
+// orphaned, and a mandatory fresh compile under whatever d3dcompiler_47.dll Proton hands us - and
+// a decode that does not compile latches the WHOLE codec off and gives the user back the
+// pre-codec darkened frame. That is the exact trade this tree already refused once, for
+// hdr_graft, and the survival build below exists because of it. A constant that is wrong is one
+// live slider away from right; a codec that will not compile is not.
+//
+// NOTE THE DUPLICATION. cfg::paper_white_scale's default in addon_config.hpp and the overlay's
+// pre-seed atomic in overlay_ui.hpp both carry this same literal, spelled `4.0f / 3.0f` so a grep
+// finds all three, because those two headers deliberately do not include this one. Change one and
+// change the others.
+// =============================================================================================
+constexpr float kCodecSoftClipKnee = 0.75f;          // == kNrSoftClipKnee in the HLSL above
+constexpr float kDerivedPaperWhiteScale = 4.0f / 3.0f;
+static_assert(kDerivedPaperWhiteScale * kCodecSoftClipKnee > 0.9999f &&
+              kDerivedPaperWhiteScale * kCodecSoftClipKnee < 1.0001f,
+              "the derived paper-white scale must put UE4's diffuse white (SceneColor 1.0) on the "
+              "soft-clip knee - if the knee moves, this value moves with it");
+
+// =============================================================================================
 // Root-constant blocks. Laid out so the HLSL cbuffer packing is a straight dword-for-dword copy;
 // SetComputeRoot32BitConstants writes them linearly.
 // =============================================================================================
@@ -1087,7 +1228,14 @@ inline bool build(const std::wstring &dir, blobs &out, LogFn log)
 //
 // constant_range::binding MUST stay 0: create_pipeline_layout returns false outright otherwise.
 // =============================================================================================
-inline bool make_layout(device *dev, uint32_t srv_count, uint32_t constant_count, pipeline_layout &out)
+//
+// uav_count IS LAST AND DEFAULTED, which is the only reason this signature could grow at all: the
+// codec's two calls and mvec_decode's one are unchanged CHARACTER FOR CHARACTER and still build a
+// one-UAV table, so the root signatures they produce cannot have moved. depth_convert.hpp asks for
+// two (its r32_float target at u0 and its statistics buffer at u1, which must share one table
+// because a single push_descriptors call fills exactly one root parameter).
+inline bool make_layout(device *dev, uint32_t srv_count, uint32_t constant_count, pipeline_layout &out,
+                        uint32_t uav_count = 1)
 {
 	descriptor_range srvs = {};
 	srvs.binding           = 0;
@@ -1100,9 +1248,9 @@ inline bool make_layout(device *dev, uint32_t srv_count, uint32_t constant_count
 
 	descriptor_range uavs = {};
 	uavs.binding           = 0;
-	uavs.dx_register_index = 0;      // register(u0)
+	uavs.dx_register_index = 0;      // register(u0), and u1.. when uav_count > 1
 	uavs.dx_register_space = 0;
-	uavs.count             = 1;
+	uavs.count             = uav_count;
 	uavs.array_size        = 1;
 	uavs.visibility        = shader_stage::compute;
 	uavs.type              = descriptor_type::unordered_access_view;

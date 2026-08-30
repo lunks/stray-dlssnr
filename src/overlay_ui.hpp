@@ -332,7 +332,11 @@ struct live_block
 	std::atomic<bool>     history_restore{ true };
 	std::atomic<bool>     restore_graphics_root{ true };
 
-	std::atomic<float>    paper_white_scale{ 1.0f };
+	// The literal is the DERIVED default - see cfg::paper_white_scale and hdr_codec.hpp's
+	// "THE SCALE, s" section. It is only a pre-seed: seed_from_config overwrites it from the
+	// parsed ini before any dispatch or any draw. Kept in step anyway, so a grep for
+	// `4.0f / 3.0f` finds all three copies of this number.
+	std::atomic<float>    paper_white_scale{ 4.0f / 3.0f };
 	std::atomic<float>    transfer_strength{ 1.0f };
 	std::atomic<float>    color_strength{ 1.0f };
 	// cfg::hdr_graft. Live at tier 0: it is a root constant in the decode's own constant block,
@@ -2916,8 +2920,13 @@ inline void draw_controls(const host_facts &f)
 		ImGui::BeginDisabled(!live_hdr_codec() || s.codec_failed.load(std::memory_order_relaxed));
 
 		slider_f("Scene Paper-White Scale", l.paper_white_scale, 0.05f, 16.0f, "%.3f", k_plain,
-			"Live. THIS VALUE IS UNCALIBRATED - Remix folds its own auto-exposure and EV bias into it "
-			"and STRAY exposes no equivalent, so it is a plain constant that needs tuning on hardware. "
+			"Live. The 1.333 default is DERIVED, NOT MEASURED ON HARDWARE: it puts UE4's diffuse white "
+			"(SceneColor 1.0) exactly on the soft-clip knee, which is also 1/0.79 - the measured point "
+			"out to which at least 95 per cent of the network's requested change survives the FP16 round "
+			"trip - and it moves the clip above which the transfer can only DARKEN from SceneColor 1.81 "
+			"to 2.41. Remix "
+			"folds its own auto-exposure and EV bias into this and STRAY exposes no equivalent, so it is "
+			"still a constant and still worth a sweep here. "
 			"It is a DIVISOR: s = 1 / max(value, 0.01), so RAISING it DARKENS the proxy the network is "
 			"shown. Raise it if the proxy looks blown out, lower it if it looks black. One value feeds "
 			"BOTH the encode and the decode; the snapshot taken at the top of each pass is what "

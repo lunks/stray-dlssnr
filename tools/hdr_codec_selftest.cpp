@@ -792,11 +792,17 @@ int main()
     // 6. Mode 1's transfer_strength = 0 is NOT exact, and it is exact only for a power-of-two
     //    paper_white_scale. Asserted so the README's claim stays true, and so the default never
     //    quietly moves to the mode that lacks the identity.
+    //
+    //    4/3 IS THE SHIPPING DEFAULT (cfg::paper_white_scale, derived in hdr_codec.hpp's "THE
+    //    SCALE, s" section). It is in this list so that the bit-exact mode 0 identity is asserted
+    //    AT THE VALUE THE USER ACTUALLY PLAYS ON rather than only at values nobody ships - and so
+    //    that the cost of the new default, mode 1 losing its exact round trip because 4/3 is not a
+    //    power of two, is a measured line in the CI log instead of a claim in a comment.
     // ---------------------------------------------------------------------------------------
     std::printf("\n6. mode 1 at transfer_strength = 0: near-identity, not identity\n");
     {
-        static const float pws[6] = { 1.0f, 2.0f, 0.5f, 1.5f, 2.2f, 0.75f };
-        for (int i = 0; i < 6; ++i)
+        static const float pws[7] = { 1.0f, 2.0f, 0.5f, 1.5f, 2.2f, 0.75f, 4.0f / 3.0f };
+        for (int i = 0; i < 7; ++i)
         {
             const float pw = pws[i];
             const float s = 1.0f / (pw > 0.01f ? pw : 0.01f);

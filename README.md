@@ -9,7 +9,18 @@ game — and extended with UAV resolution, a D3D12 state save/restore, and the N
 
 ## What changed in this revision
 
-**Newest: chain mode** (`dlss_chain`, default `0`) — DLSS-NR **and** DLSS-SR on one accepted TAA
+**Newest: the depth pass** (`depth_convert` / `depth_detect`, both default `1`) — one compute pass
+that closes **§6 gap 3** and **§6 gap 4** together. It converts STRAY's `r32_g8_typeless` planar
+depth-stencil into a dedicated `R32_FLOAT` texture the add-on owns and binds *that* as
+`DLSSNR.Depth`, because on D3D12 NGX reads the format straight off the `D3D12_RESOURCE_DESC` and
+there is no view-format channel in the ABI to tell it otherwise. And while it is reading every
+depth texel anyway it **measures** whether depth is reversed-Z from the distribution itself, which
+replaces the inference `depth_inverted` has always been. Both keys land on exactly the previous
+behaviour when off or when anything fails, and a human — the ini or the overlay — always beats the
+measurement. `depth_inverted` is now **commented out** in the shipped ini so the measurement is
+what decides; see §6 gap 4 for why it is the key's *presence* that pins it.
+
+**Chain mode** (`dlss_chain`, default `0`) — DLSS-NR **and** DLSS-SR on one accepted TAA
 dispatch, denoise first and upscale second, instead of the two features being mutually exclusive.
 See **§6c**. With the key at `0` the build behaves exactly as it did before it existed.
 
@@ -166,7 +177,9 @@ silently taking a default.
 | `restore_graphics_root` | `1` | replay graphics root state too |
 | `require_trampoline` | `1` | refuse to run without `remix_nvngx.dll` |
 | `populate_parameters` | `0` | call the snippet's `PopulateParameters_Impl` |
-| `depth_inverted` | `1` | UE4 reversed-Z — **inferred, not measured**, see §6 |
+| `depth_convert` | `1` | convert the game's typeless planar depth into a dedicated `R32_FLOAT` texture and bind **that** as `DLSSNR.Depth`; `0` = bind the game's own `r32_g8_typeless` resource (the old behaviour, §6 gap 3). DLSS-NR path only — chain mode still binds the game's |
+| `depth_detect` | `1` | **measure** whether depth is reversed-Z from the buffer itself, through the same pass, and use the answer for `DLSSNR.DepthInverted` (§6 gap 4). Latched once per run; declines to decide rather than guess. Does not need `depth_convert=1` |
+| `depth_inverted` | `1` | UE4 reversed-Z. **Now measured when `depth_detect=1`** — this value is what is sent when the measurement declines, gives up, or is overridden. **Commented out in the shipped ini on purpose:** it is the key's *presence* that pins it over the measurement, see §6 gap 4 |
 | `mvec_decode` | `1` | decode UE4's velocity encoding and reconstruct camera motion into absolute colour-grid pixels; `0` = the old raw encoded buffer (§6, gap 2) |
 | `mvec_reconstruct` | `1` | reconstruct camera motion from depth where the velocity texel is invalid. `0` = decode only, invalid texels **exactly zero** — a bring-up A/B, **worse than `mvec_decode=0`** for play |
 | `mvec_dilate` | `0` | UE's `AA_CROSS` nearest-depth velocity dilation; off because DLSS does its own neighbourhood work |
@@ -1171,20 +1184,149 @@ test 7 leaves X inverted, so under a fully inverted guide *both* come out "worse
 printed expectation while the shipped binding is still wrong on both axes. Test 8 is the only row
 that reaches the doubly-negated configuration.
 
-### Gap 3 — the depth buffer is typeless and planar
+### Gap 3 — ~~the depth buffer is typeless and planar~~ **FIXED** (`depth_convert = 1`)
 
-STRAY's `t0` is `r32_g8_typeless`, sampled through an `r32_float_x8_uint` SRV. On D3D12, NGX reads
-the format straight off the `D3D12_RESOURCE_DESC` and there is **no channel through which to tell
-it the view format** (unlike Vulkan, where the working deployment passes the view format
-explicitly). NGX may reject the evaluate with `FAIL_UnsupportedInputFormat` /
-`FAIL_UnsupportedFormat`. The add-on warns about this before the first evaluate so the failure is
-not a mystery. The fix is a depth conversion pass into a dedicated `R32_FLOAT` texture.
+STRAY's `t0` is `r32_g8_typeless`, sampled through an `r32_float_x8_uint` SRV. That SRV is correct
+and fully typed — `.x` is `DeviceZ`, which is what `TAAStandalone.usf:1315` reads, and it is what
+the motion-vector decode already consumes. The problem is one level below it.
 
-### Gap 4 — `depth_inverted` is inferred, not measured
+On D3D12, NGX is handed a bare `ID3D12Resource*` **and nothing else**. `ngx_interop.hpp`'s
+`set_res()` has no view-format channel because the ABI has none, so the snippet reads the format
+straight off `D3D12_RESOURCE_DESC::Format` and what it sees for `DLSSNR.Depth` is
+`DXGI_FORMAT_R32G8X24_TYPELESS` — a typeless, two-plane format, not a depth value. On Vulkan the
+problem does not arise: there the image **view** carries the format, which is why the working
+deployment can pass it explicitly.
 
-Defaults to `1` because UE 4.27 renders with reversed-Z. This is the **opposite** of the working
-Remix deployment's value, whose renderer writes non-inverted NDC depth. It has not been confirmed
-against STRAY. If the denoise ghosts or smears in exactly the wrong direction, flip it first.
+**DLSS-SR is not a counter-example, and it is worth saying why**, because "DLSS-SR takes STRAY's
+depth resource happily" reads like evidence and is not. The SR snippet has a separate *create-time*
+parameter, `DLSS.Use.HW.Depth` (`sr_hw_depth`), through which it can be **told** the input is a
+hardware depth-stencil. The DLSS-NR snippet exposes no such key. That asymmetry *is* gap 3.
+
+The one known-working independent DLSS-NR deployment (DLSS5-Feeder + the renodx DLSS 5 add-on)
+never hands NGX a game-owned typeless resource either: it renders depth into its **own** `R32F`
+target and hard-rejects any frame whose depth is not exactly `r32_float`. On the same machine and
+the same game its log reports `depth R32_FLOAT (reversed)` and the feature initialises.
+
+**The fix (`depth_convert = 1`).** One compute pass — `src/depth_convert.hpp`, modelled on
+`mvec_decode.hpp` line for line — reads the game's depth **through the game's own typed SRV**,
+borrowed inside the dispatch event and never cached, and writes `DeviceZ` **verbatim** into a
+private `r32_float` texture at the colour extent. That texture is what is bound.
+
+* **Nothing is linearised and nothing is flipped.** `DLSSNR.DepthInverted` is the NGX parameter
+  that carries the reversed-Z convention and it stays the only thing that does; flipping in the
+  shader would double-apply with it. The mvec pass's own reprojection reads the same raw `DeviceZ`,
+  so linearising here would silently break that too.
+* **The extent is the colour grid**, not the game's depth extent — the same choice `mvec_tex`
+  makes, and for the same reason: it puts colour, motion guide and depth on one grid, which is the
+  only configuration in which the three rects NGX validates against each other cannot disagree. In
+  STRAY all three are 1920×1080 today, so the remap inside the shader is the identity.
+* **Stencil is not read and not forwarded.** Plane 1 is not a DLSS-NR input.
+* **The only value that is touched at all** is one that cannot legitimately occur: a non-finite
+  texel becomes `0`, and the write is `saturate`d. `DeviceZ` is `[0,1]` by construction, so this
+  never fires on a real texel — and if it fires often, `depth_detect` says so loudly (below).
+
+Every failure path lands on **exactly** today's behaviour and none of them is fatal: shader or
+pipeline build failure (run-latched), texture allocation failure (per-resolution), the game's depth
+SRV not recovered at this dispatch, and — the rung that matters — `EvaluateFeature` failing eight
+frames running with our depth bound, which reverts the binding for the run. That last rung takes
+the motion guide back **first** and the depth **second**, never both at once: reverting both
+together would recover the denoise while telling you nothing about which input NGX would not take.
+
+**What this is and is not evidence for.** The evaluate returns `Success` today, so NGX is not
+*rejecting* the typeless resource outright. What was measured instead is that the tuning parameters
+have no effect on the output while a getter trace proves the values reach the network
+(`DLSSNR.Intensity -> HIT, returned 0.0200`; only 4 of 44 `Get`s miss, all four optional `void**`
+binds), and intensity `0.02` vs `1.00` vs `3.00` produced frames indistinguishable from
+run-to-run noise. A misread depth channel gives the denoiser a degenerate confidence/edge signal,
+which fits — but that is a **hypothesis**, and only `depth_convert=0` vs `1` on hardware settles it.
+
+**Scope.** This covers the DLSS-NR path. Chain mode (`dlss_chain=1`) still binds the game's own
+depth resource to `DLSSNR.Depth`, and DLSS-SR always does (see `sr_hw_depth` above). Extending it
+would need a second target at the render extent inside `dlss_sr`'s resource set and its own place
+in that path's barrier bookkeeping; it has not been done, and the add-on's start-up warning names
+both paths so the omission is visible rather than assumed away.
+
+### Gap 4 — ~~`depth_inverted` is inferred, not measured~~ **MEASURED** (`depth_detect = 1`)
+
+`depth_inverted` defaulted to `1` because UE 4.27 renders with reversed-Z. That is an **inference
+about the engine**, not a measurement of this game, and it is the **opposite** of the working Remix
+deployment's value, whose renderer writes non-inverted NDC depth. Getting it wrong produces no
+diagnostic anywhere: the evaluate still succeeds and the image is merely wrong.
+
+The depth conversion pass already reads every depth texel, so the answer is derived there rather
+than in a second dispatch. The two conventions are separable from the **distribution itself**,
+because both are hyperbolic in view depth and the projection puts the mass at opposite ends:
+
+| | near | far | shape |
+|---|---|---|---|
+| reversed-Z (UE 4.27) | `1` | `0` | `DeviceZ ≈ Near/Z` for an infinite far plane |
+| standard-Z | `0` | `1` | `DeviceZ ≈ 1 − Near/Z` |
+
+So under reversed-Z, `DeviceZ > 0.75` requires `Z < 1.33 × Near` — about 13 cm at UE's default near
+plane, which essentially nothing in a frame satisfies — while `DeviceZ < 0.25` (`Z > 4 × Near`) is
+essentially the whole frame. Under standard-Z the two are exactly swapped. The test is therefore a
+**count** of texels below `0.25` against a count above `0.75`, and it is symmetric: neither
+convention is privileged and the same code decides both.
+
+Every 8th texel on each axis is sampled — 240×135 = 32400 at 1920×1080 — accumulated with
+`InterlockedAdd`/`InterlockedMax` into an eight-slot `r32_uint` buffer, copied to a readback and
+mapped **four dispatches later**. There is no fence wait: a stall on the render thread for a
+diagnostic is something the shipping path never pays, which is the same discipline `nr_probe.hpp`
+uses. Once the verdict is settled the shader issues **no atomics at all**.
+
+**What it refuses to decide from** — this is the half that matters:
+
+* **a frame with no depth range.** A cleared, sky-only or loading frame is a *constant*, and a
+  constant is consistent with both conventions: a reversed-Z clear is all `0.0` and a standard-Z
+  clear is all `1.0`, so the counts alone would confidently return the clear value's convention
+  having seen no geometry at all. The window is rejected unless `max − min ≥ 0.05`.
+* **a frame whose depth is not a normalised depth value.** If more than 1% of the samples fall
+  outside `[0,1]` or are non-finite, the SRV being read is not scene depth, the whole gap-3 premise
+  is wrong, and it says so instead of deciding.
+* **a distribution that is not one-sided.** The winning side must be at least a quarter of the
+  valid samples **and** beat the other side 16:1.
+* **too few samples** — under 1024.
+
+**It is latched, not per-frame.** One window is 60 frames; the first verdict wins for the run. A
+verdict that flipped mid-run would change the meaning of every frame already in NGX's temporal
+history, which is strictly worse than a wrong constant. If a window declines, another is tried, up
+to 8, after which the pass says so once and the configured value stands. The verdict survives a
+resolution change and is deliberately **not** re-taken: UE builds the same reversed-Z projection at
+every resolution.
+
+**A human always wins.** The order is: the ini, then the overlay, then the measurement, then the
+default.
+
+* If `depth_inverted` **appears** in `stray_dlssnr.ini` the measurement is **reported and not
+  applied**. A line saying `depth_inverted = 1` is a *choice*; the same value arrived at by default
+  is not, and the only thing that can tell those apart is whether the key was in the file. This is
+  why the shipped ini now has that line **commented out** — and why a `Save to stray_dlssnr.ini`
+  press writes it back and pins it from the next launch (the ini comment says so, and so does the
+  log, every run thereafter).
+* If the user moves the overlay's **DepthInverted** control after the measurement latched, the
+  measurement **stands down for the rest of the run**. A live control the measurement quietly
+  overrode would be a control wired to nothing, which is a defect this tree has caught in itself
+  twice already.
+
+Either way the log prints both numbers, so a wrong pin is **visible** rather than silently obeyed:
+
+```
+DLSS-NR: depth_detect window 1/8 over 32400 sampled texels - below 0.25: 31877, above 0.75: 12,
+         not-a-depth: 0, mean 0.03114, range [0.00000, 0.98431].
+DLSS-NR: depth_detect MEASURED REVERSED-Z (near = 1, far = 0) - ...
+DLSS-NR: GAP 4 ADDRESSED. DLSSNR.DepthInverted=1 comes from the MEASUREMENT above, ...
+```
+
+**What is still assumed.** Two things, and neither is measured by this:
+
+* that `DLSSNR.DepthInverted = 1` is what NGX wants *for* a reversed-Z buffer — the mapping from
+  the convention to the parameter is the snippet's, not ours, and it is `[WEB]`;
+* that the SRV at `srv_depth` is scene depth at all. The `not-a-depth` counter is a filter against
+  that being false, not a proof that it is true.
+
+`sr_depth_inverted` is a separate key and is **not** driven by this measurement. It is recorded as
+`[HW]`-measured for STRAY already, it belongs to a different feature, and keeping the two
+independent is what lets them be A/B'd against each other.
 
 ### Gap 5 — ~~the denoise feeds back into the game's own TAA history~~ **FIXED**
 

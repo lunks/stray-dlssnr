@@ -62,6 +62,15 @@
 #include "d3d12_state.hpp"
 #include "hdr_codec.hpp"
 #include "mvec_decode.hpp"
+// README gap 3 (the typeless, planar depth resource NGX cannot read the format of) and README
+// gap 4 (depth_inverted was inferred, never measured), in one compute pass. Included after
+// hdr_codec.hpp for the same reason mvec_decode.hpp is: it reuses that header's compile cache and
+// its pipeline-layout helpers rather than duplicating them.
+#include "depth_convert.hpp"
+// Diagnostic only, and off unless nr_probe=1: measures the network's own input against its own
+// output in the same frame, and sweeps structure strength inside a single run. Included after
+// hdr_codec.hpp because it reuses that header's compile cache and pipeline helpers.
+#include "nr_probe.hpp"
 // VENDORED VERBATIM from ../stray-sr-design/ue4_jitter.hpp - see README §8. It is copied rather
 // than reached for with -I because build.sh must keep working for a tree shipped WITHOUT the
 // sibling design directory, and because an edit outside src/ would change the shipped binary with
@@ -1687,6 +1696,66 @@ struct nr_state
 	bool logged_mvec_clip_row    = false;
 	bool logged_mvec_decode_only = false;
 	bool logged_mvec_pinned_row  = false;
+	bool logged_depth_tex_fail   = false;
+	bool logged_depth_active     = false;
+	bool logged_depth_off        = false;
+	bool logged_depth_det_result = false;
+	bool logged_depth_det_stand  = false;
+
+	// ---- the depth conversion pass (depth_convert.hpp) ----------------------------------------
+	// Our own DLSSNR.Depth: DeviceZ VERBATIM in a TYPED r32_float texture, at the colour extent.
+	// The point is the FORMAT, not the values - NGX reads the format off the D3D12_RESOURCE_DESC
+	// and the game's depth resource is r32_g8_typeless, which is not a depth value to anything
+	// reading it that way (README gap 3).
+	//
+	// THE EXTENT IS THE COLOUR GRID, not the game's depth extent, for the same reason mvec_tex is:
+	// it puts colour, motion guide and depth on one grid, which is the only configuration in which
+	// the three rects NGX validates against each other cannot disagree. In STRAY all three are
+	// 1920x1080 today, so the remap inside the shader is the identity and this costs nothing.
+	//
+	// No SRV is ever created on it: NGX consumes it as a raw ID3D12Resource*, exactly like out_tex
+	// and mvec_tex. shader_resource is nonetheless in its usage set because create_resource asserts
+	// that usage is a superset of every state the resource is transitioned to, and this one is
+	// handed to NGX in SHADER_RESOURCE_NON_PIXEL.
+	resource      depth_tex = { 0 };
+	resource_view depth_uav = { 0 };
+
+	depth_convert::pipelines depth_conv;
+	depth_convert::detector  depth_det;
+	bool depth_ok         = false;   // depth_tex + its UAV exist at (out_w, out_h)
+	// Latched for the WHOLE RUN, exactly like codec_failed and mvec_failed: the DXBC could not be
+	// produced, or the root signature / PSO / statistics buffers could not be created. A resolution
+	// change cannot undo that.
+	bool depth_failed     = false;
+	// Latched per (out_w, out_h) only, exactly like mvec_tex_failed.
+	bool depth_tex_failed = false;
+	// NGX REJECTED OUR DEPTH. The mirror of mvec_eval_rejected, and it exists for the same reason:
+	// without a rung for it a persistent EvaluateFeature failure would leave `evaluated` false
+	// every frame, so the copy-back never runs and the user gets stock TAA - no denoise at all -
+	// for the whole session, recoverable only by editing the ini and restarting. This latch drops
+	// DLSSNR.Depth back to exactly the pre-conversion binding. Run-latched: a resolution change
+	// cannot make a rejected format acceptable.
+	//
+	// It is a REAL possibility in BOTH directions and that is worth stating plainly. r32_float is
+	// what the one known-working DLSS-NR deployment insists on, so this should be strictly more
+	// acceptable than what we bind today - but "should" is not "measured", and this add-on has
+	// already been surprised once by a format the snippet would not take.
+	bool depth_eval_rejected = false;
+	uint32_t depth_eval_fail_streak = 0;
+	// Set once the live DepthInverted control has been seen to differ from what the ini (or the
+	// built-in default) seeded. The control MUST win from that moment on - a live control that
+	// silently does nothing is the exact defect this tree has caught in itself twice - so the
+	// measurement stands down for the rest of the run. Zero-cost: two comparisons per accepted
+	// dispatch, against a value captured at config load (g_depth_inverted_at_load).
+	bool depth_det_stood_down  = false;
+
+	// Census, read from on_present WITHOUT this mutex - same reason as hist_restored: on_present
+	// holds g.mutex there, and nr_try_run takes st->mutex and then g.mutex, so a lock in the other
+	// order would be a textbook AB/BA deadlock between the two threads.
+	std::atomic<uint64_t> depth_frames{ 0 };            // frames the conversion pass actually ran
+	std::atomic<bool>     census_depth_bound{ false };  // ... of which it was also BOUND as DLSSNR.Depth
+	std::atomic<uint32_t> census_depth_verdict{ 0 };    // depth_convert::verdict, as its underlying value
+	std::atomic<bool>     census_depth_inverted{ true };// what nr_depth_inverted_value last resolved to
 
 	// ---- the motion-vector decode (mvec_decode.hpp) -------------------------------------------
 	// Our own DLSSNR.MVec: absolute pixels on the COLOUR grid, y-down. r16g16_float, at the colour
@@ -1700,6 +1769,10 @@ struct nr_state
 	resource_view mvec_uav = { 0 };
 
 	mvec_decode::pipelines mvec;
+	// Diagnostic, built only when nr_probe=1. Failure to build disables the probe and is never
+	// fatal: the render path must not care whether an instrument exists.
+	nr_probe::pipeline_set probe;
+	nr_probe::run_state    probe_run;
 	bool mvec_ok         = false;   // mvec_tex + its UAV exist at (out_w, out_h)
 	// Latched for the WHOLE RUN, exactly like codec_failed: the DXBC could not be produced, or the
 	// root signature / PSO could not be created. A resolution change cannot undo that.
@@ -1984,6 +2057,19 @@ static hdr_codec::blobs     g_codec_blobs;
 static bool                 g_codec_blobs_tried = false;
 static std::vector<uint8_t> g_mvec_dxbc;
 static bool                 g_mvec_dxbc_tried = false;
+static std::vector<uint8_t> g_depth_dxbc;
+static bool                 g_depth_dxbc_tried = false;
+
+// What depth_inverted was the instant cfg::load returned - i.e. what the ini said, or the built-in
+// default if it said nothing. WRITTEN ONCE, from nr_init_device, before any overlay control or any
+// begin_pass snapshot can have touched g_cfg; read from the render thread thereafter.
+//
+// It exists because the DepthInverted control is LIVE and the gap-4 measurement must never fight
+// it. A latch-time snapshot of g_cfg.depth_inverted cannot do this job: a user who moves the
+// control BEFORE the verdict lands would have their choice recorded as the baseline and then
+// silently overridden by the measurement a second later. Comparing against the load-time value has
+// no such window - any deviation at all is a human, whenever it happened.
+static bool                 g_depth_inverted_at_load = true;
 
 static void nr_pipeline_log(int lvl, const char *msg)
 {
@@ -2120,6 +2206,98 @@ static bool nr_build_mvec_pipeline(device *dev, nr_state &st, const std::wstring
 	LOGI("DLSS-NR: motion-vector decode pipeline created (cs_5_0 DXBC, [numthreads(16,16,1)]). "
 	     "UE 4.27 velocity decode + camera-motion reconstruction from depth through "
 	     "View.ClipToPrevClip, writing absolute colour-grid pixels.");
+	return true;
+}
+
+/// The same shape again for the depth conversion pass (README gap 3) and the depth-convention
+/// measurement it carries (README gap 4). Every failure here is SOFT: depth_failed latches for the
+/// run, DLSSNR.Depth stays on the game's own r32_g8_typeless resource - bit-for-bit the behaviour
+/// before this feature existed - and DLSSNR.DepthInverted keeps whatever depth_inverted says.
+static bool nr_build_depth_pipeline(device *dev, nr_state &st, const std::wstring &dir)
+{
+	if (dev == nullptr || st.depth_failed)
+		return false;
+	if (st.depth_conv.ok)
+		return true;
+
+	bool dxbc_ok = false;
+	{
+		std::lock_guard<std::mutex> blob_lock(g_blob_mutex);
+		if (!g_depth_dxbc_tried)
+		{
+			g_depth_dxbc_tried = true;
+			depth_convert::build(dir, g_depth_dxbc, &nr_pipeline_log);
+		}
+		dxbc_ok = !g_depth_dxbc.empty();
+	}
+
+	depth_convert::pipelines fresh;
+	if (!dxbc_ok || !depth_convert::create(dev, g_depth_dxbc, fresh, &nr_pipeline_log))
+	{
+		st.depth_failed = true;
+		LOGW("DLSS-NR: the depth conversion pass could not be built (see the error above). "
+		     "DLSSNR.Depth falls back to the GAME'S OWN r32_g8_typeless depth resource - README "
+		     "gap 3 stands unmitigated - and depth_detect measures nothing, so DLSSNR.DepthInverted "
+		     "keeps the configured value (README gap 4). Nothing else changes. This is a REAL build "
+		     "failure and it is latched for the run.");
+		return false;
+	}
+
+	depth_convert::destroy(dev, st.depth_conv);
+	st.depth_conv = fresh;
+	// The detector is armed from the ini here and only here, so a run that turns depth_detect off
+	// never allocates a window and never issues a single atomic.
+	st.depth_det = depth_convert::detector();
+	st.depth_det.armed = g_cfg.depth_detect;
+	LOGI("DLSS-NR: depth conversion pipeline created (cs_5_0 DXBC, [numthreads(16,16,1)]). "
+	     "The game's depth is read through ITS OWN typed r32_float_x8_uint SRV and DeviceZ is "
+	     "written VERBATIM into a private r32_float texture - nothing is linearised and nothing is "
+	     "flipped. depth_detect=%d.", (int)g_cfg.depth_detect);
+	return true;
+}
+
+/// The NR probe's statistics pass. Diagnostic, so EVERY failure here is soft: the probe turns
+/// itself off and the render path is untouched. It is never built unless nr_probe=1.
+static std::vector<uint8_t> g_probe_dxbc;
+static bool                 g_probe_dxbc_tried = false;
+
+static bool nr_build_probe_pipeline(device *dev, nr_state &st, const std::wstring &dir)
+{
+	if (dev == nullptr || g_cfg.nr_probe == 0 || st.probe.failed)
+		return false;
+	if (st.probe.ready)
+		return true;
+
+	bool dxbc_ok = false;
+	{
+		std::lock_guard<std::mutex> blob_lock(g_blob_mutex);
+		if (!g_probe_dxbc_tried)
+		{
+			g_probe_dxbc_tried = true;
+			nr_probe::build_shader(dir, g_probe_dxbc, &nr_pipeline_log);
+		}
+		dxbc_ok = !g_probe_dxbc.empty();
+	}
+
+	nr_probe::pipeline_set fresh;
+	if (!dxbc_ok || !nr_probe::build(dev, g_probe_dxbc, fresh))
+	{
+		st.probe.failed = true;
+		LOGW("DLSS-NR: the nr_probe statistics pass could not be built. The PROBE is off for this "
+		     "run; the denoise, the codec and the write-back are all completely unaffected - this "
+		     "is an instrument, not a render stage.");
+		return false;
+	}
+
+	nr_probe::destroy(dev, st.probe);
+	st.probe = fresh;
+	st.probe_run = nr_probe::run_state();
+	st.probe_run.active = true;
+	LOGI("DLSS-NR: nr_probe ARMED - %u steps x %u frames, sweeping use_auto_mask and "
+	     "local/skin structure strength. THE INI VALUES FOR THOSE THREE KEYS ARE IGNORED while "
+	     "the probe runs. Park the camera and do not move: every step must see the same content "
+	     "or the comparison is measuring the scene instead of the parameter.",
+	     nr_probe::kSweepCount, g_cfg.nr_probe_frames);
 	return true;
 }
 
@@ -2262,12 +2440,14 @@ static void nr_release_feature_and_output(device *dev, nr_state &st, const char 
 		if (st.orig_srv.handle   != 0) { dev->destroy_resource_view(st.orig_srv);   st.orig_srv   = { 0 }; }
 		if (st.result_uav.handle != 0) { dev->destroy_resource_view(st.result_uav); st.result_uav = { 0 }; }
 		if (st.mvec_uav.handle   != 0) { dev->destroy_resource_view(st.mvec_uav);   st.mvec_uav   = { 0 }; }
+		if (st.depth_uav.handle  != 0) { dev->destroy_resource_view(st.depth_uav);  st.depth_uav  = { 0 }; }
 
 		if (st.out_tex.handle    != 0) { dev->destroy_resource(st.out_tex);    st.out_tex    = { 0 }; }
 		if (st.proxy_tex.handle  != 0) { dev->destroy_resource(st.proxy_tex);  st.proxy_tex  = { 0 }; }
 		if (st.orig_tex.handle   != 0) { dev->destroy_resource(st.orig_tex);   st.orig_tex   = { 0 }; }
 		if (st.result_tex.handle != 0) { dev->destroy_resource(st.result_tex); st.result_tex = { 0 }; }
 		if (st.mvec_tex.handle   != 0) { dev->destroy_resource(st.mvec_tex);   st.mvec_tex   = { 0 }; }
+		if (st.depth_tex.handle  != 0) { dev->destroy_resource(st.depth_tex);  st.depth_tex  = { 0 }; }
 	}
 
 	// The pristine copy is gone, so nothing may be restored from it. Dropping this is what makes a
@@ -2290,6 +2470,7 @@ static void nr_release_feature_and_output(device *dev, nr_state &st, const char 
 	st.mvec_ok = false;
 	st.mvec_tex_failed = false;
 	st.mvec_eval_fail_streak = 0;
+	st.depth_eval_fail_streak = 0;
 	st.view_layout = ue4jitter::layout{};
 	st.view_layout_ok = false;
 	st.view_layout_failed = false;
@@ -2301,6 +2482,22 @@ static void nr_release_feature_and_output(device *dev, nr_state &st, const char 
 	// The guide is about to be a different resource; the reset latch must not compare against a
 	// handle from the old resolution, whose address UE's pool can hand back for something else.
 	st.mvec_bound_res = 0;
+
+	// The depth pass's per-resolution state. depth_failed is NOT cleared, for exactly the same
+	// reason mvec_failed is not: it records that the SHADER could not be built, which a resolution
+	// change cannot undo.
+	st.depth_ok = false;
+	st.depth_tex_failed = false;
+
+	// THE MEASURED CONVENTION IS DELIBERATELY *NOT* CLEARED. It is a property of the renderer's
+	// projection - UE builds the same reversed-Z matrices at every resolution - so a verdict taken
+	// at 1920x1080 is exactly as true at 2560x1440, and re-measuring would only give the run a
+	// second chance to disagree with itself. What IS cleared is the IN-FLIGHT window: its copy was
+	// recorded on a command list against a texture this function has just destroyed, and half a
+	// window's texels must never be allowed to settle the verdict (depth_convert.hpp says why).
+	st.depth_det.frames_in_window = 0;
+	st.depth_det.awaiting_copy    = false;
+	st.depth_det.copy_age         = 0;
 
 	// Chain mode's per-geometry state. chain_nr_off is RUN-latched and deliberately NOT cleared,
 	// exactly like sr_latched_off: it records that NGX refused the evaluate, which a resolution
@@ -2423,6 +2620,62 @@ static void nr_ensure_aux(device *dev, nr_state &st)
 			LOGI("DLSS-NR: motion-vector target ready, %ux%u r16g16_float (UAV, "
 			     "ID3D12Resource=0x%llx). It rests in UNORDERED_ACCESS and is handed to NGX in "
 			     "SHADER_RESOURCE_NON_PIXEL.", w, h, (unsigned long long)t.handle);
+		}
+	}
+
+	// ---- the CONVERTED DEPTH TARGET -----------------------------------------------------------
+	//
+	// SECOND, and for the same reason the motion-vector target is first: everything below this
+	// point has early `return`s at the "want_codec" test and at !orig_ok, and a block placed after
+	// them would be silently skipped whenever the codec is off - which is exactly a configuration
+	// in which the depth conversion still has to work.
+	//
+	// A failure here is NOT fatal and is NOT an error for the pass: DLSSNR.Depth falls back to the
+	// game's own r32_g8_typeless resource, i.e. bit-for-bit what the add-on did before this feature
+	// existed (README gap 3).
+	//
+	// THE PASS IS ALLOCATED WHENEVER EITHER KEY WANTS IT. depth_convert=0 with depth_detect=1 still
+	// runs it until the convention is settled and then stops - the measurement is the more valuable
+	// of the two and must not be hostage to the binding A/B. Once the detector is done and
+	// depth_convert is off, nothing here allocates and nothing dispatches.
+	//
+	// NOT IN CHAIN MODE. Chain mode binds the game's own depth to DLSSNR.Depth and this pass does
+	// not cover it - see the SCOPE note in addon_config.hpp - so a texture nothing would ever read
+	// is pure waste there.
+	if (!st.chain_active &&
+	    (g_cfg.depth_convert || (g_cfg.depth_detect && !st.depth_det.done)) &&
+	    st.depth_conv.ok && !st.depth_failed && !st.depth_ok && !st.depth_tex_failed)
+	{
+		const resource_desc d(w, h, 1, 1, format::r32_float, 1, memory_heap::default_,
+			resource_usage::unordered_access | resource_usage::shader_resource);
+		const resource_view_desc v(resource_view_type::texture_2d, format::r32_float, 0, 1, 0, 1);
+
+		resource t = { 0 };
+		// EXACTLY resource_usage::unordered_access on the view: create_resource_view switches on
+		// the whole value (see the note beside the codec's views below).
+		if (!dev->create_resource(d, nullptr, resource_usage::unordered_access, &t) || t.handle == 0 ||
+		    !dev->create_resource_view(t, resource_usage::unordered_access, v, &st.depth_uav))
+		{
+			if (t.handle != 0) { dev->destroy_resource(t); }
+			if (st.depth_uav.handle != 0) { dev->destroy_resource_view(st.depth_uav); st.depth_uav = { 0 }; }
+			st.depth_tex_failed = true;
+			if (!st.logged_depth_tex_fail)
+			{
+				st.logged_depth_tex_fail = true;
+				LOGE("DLSS-NR: could not create the %ux%u r32_float depth target. The conversion is "
+				     "OFF for this resolution and DLSSNR.Depth falls back to the GAME'S OWN "
+				     "r32_g8_typeless resource - i.e. EXACTLY the pre-conversion behaviour, README "
+				     "gap 3 - and depth_detect measures nothing this resolution. Nothing else "
+				     "changes.", w, h);
+			}
+		}
+		else
+		{
+			st.depth_tex = t;
+			st.depth_ok  = true;
+			LOGI("DLSS-NR: depth target ready, %ux%u r32_float (UAV, ID3D12Resource=0x%llx). It "
+			     "rests in UNORDERED_ACCESS and is handed to NGX in SHADER_RESOURCE_NON_PIXEL.",
+			     w, h, (unsigned long long)t.handle);
 		}
 	}
 
@@ -3566,6 +3819,38 @@ static void nr_codec_decode(command_list *cmd, nr_state &st, resource_view origi
 // callers get it - and so the first chained frame, where the guide changes from st.mvec_tex (or
 // the game's raw velocity) to the shared st.sr_res.mvec_tex, correctly pulses one DLSSNR.Reset.
 // --------------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------------
+// README GAP 4: WHICH VALUE DLSSNR.DepthInverted ACTUALLY GETS.
+//
+// THE ORDER IS: A HUMAN, THEN THE MEASUREMENT, THEN THE DEFAULT. In one place, because a
+// divergence between the value SENT and the value REPORTED is exactly the silent failure this
+// add-on's own log lines exist to prevent - the evaluate line and the census line below both call
+// this rather than reading g_cfg, so what is printed is what was written.
+//
+//   1. depth_inverted appeared in stray_dlssnr.ini    -> the ini value, whatever was measured.
+//      A line that says depth_inverted=1 is a CHOICE, and the same value arrived at by default is
+//      not; cfg::depth_inverted_pinned is the only thing that can tell those apart, which is the
+//      whole reason it exists.
+//   2. the user moved the DepthInverted control after the measurement latched -> the control.
+//      A live control that silently does nothing is a defect this tree has already caught in
+//      itself twice, and it is not going to ship a third.
+//   3. the measurement latched a convention -> the measurement.
+//   4. nothing measured (depth_detect=0, the pass could not be built, every window declined,
+//      chain mode, or it simply has not finished yet) -> depth_inverted, i.e. today's behaviour.
+//
+// PURE, and it touches nothing but g_cfg and two latched bools - which is what lets the periodic
+// census on the PRESENT thread call it beside its other unlocked g_cfg reads without inverting any
+// lock order. The two bools it reads are written once each, on the render thread, and a census line
+// that raced one of them would print the value from either side of a single transition. Reporting
+// the old value for one census interval is the entire failure mode.
+static bool nr_depth_inverted_value(const nr_state &st)
+{
+	if (st.depth_det.latched == depth_convert::verdict::undecided ||
+	    g_cfg.depth_inverted_pinned || st.depth_det_stood_down)
+		return g_cfg.depth_inverted;
+	return (st.depth_det.latched == depth_convert::verdict::reversed);
+}
+
 struct nr_eval_args
 {
 	ID3D12Resource *color  = nullptr;  uint32_t color_w = 0, color_h = 0;
@@ -3622,7 +3907,10 @@ static ngx::Result nr_evaluate(nr_state &st, ID3D12GraphicsCommandList *cl, cons
 
 	ngx::set_u32(p, ngx::kParamEnabled,       1u);
 	ngx::set_u32(p, ngx::kParamReset,         st.need_reset ? 1u : 0u);
-	ngx::set_u32(p, ngx::kParamDepthInverted, g_cfg.depth_inverted ? 1u : 0u);
+	// NOT g_cfg.depth_inverted directly - README gap 4. See nr_depth_inverted_value above for the
+	// precedence, and note that with depth_detect=0 or nothing measured it IS g_cfg.depth_inverted,
+	// bit for bit.
+	ngx::set_u32(p, ngx::kParamDepthInverted, nr_depth_inverted_value(st) ? 1u : 0u);
 	ngx::set_f32(p, ngx::kParamMVecScaleX,    a.scale_x);
 	ngx::set_f32(p, ngx::kParamMVecScaleY,    a.scale_y);
 	// SELECTS what BOTH structure strengths become, and does not by itself make them live.
@@ -3637,13 +3925,24 @@ static ngx::Result nr_evaluate(nr_state &st, ID3D12GraphicsCommandList *cl, cons
 	// Binding a ControlMask would ALSO force it to 0 [BIN 0x18001aa4b cmp / 0x18001aa52]; this
 	// add-on binds none. See nr_clear_resource for why writing the mask as an explicit null does
 	// not count as bound.
-	ngx::set_u32(p, ngx::kParamUseAutoMask,   g_cfg.use_auto_mask ? 1u : 0u);
+	// THE PROBE OWNS THESE THREE KEYS WHILE IT RUNS. It is sweeping them to find out whether the
+	// snippet's two dynamic_cast gates pass on this model, so the ini values are deliberately
+	// ignored - taking them here instead would make every step identical and the sweep would
+	// report "inert" no matter what the network does.
+	const bool  probe_drives = st.probe_run.active && !st.probe_run.complete && st.probe.ready;
+	const auto &sw           = nr_probe::kSweep[st.probe_run.step < nr_probe::kSweepCount
+	                                            ? st.probe_run.step : 0u];
+
+	ngx::set_u32(p, ngx::kParamUseAutoMask,
+	             probe_drives ? sw.use_auto_mask : (g_cfg.use_auto_mask ? 1u : 0u));
 
 	ngx::set_f32(p, ngx::kParamIntensity,              g_cfg.intensity);
 	ngx::set_f32(p, ngx::kParamLocalToneStrength,      g_cfg.local_tone_strength);
-	ngx::set_f32(p, ngx::kParamLocalStructureStrength, g_cfg.local_structure_strength);
+	ngx::set_f32(p, ngx::kParamLocalStructureStrength,
+	             probe_drives ? sw.local_structure : g_cfg.local_structure_strength);
 	// Negative means "inherit LocalStructureStrength". 0.0 is NOT neutral.
-	ngx::set_f32(p, ngx::kParamSkinStructureStrength,  g_cfg.skin_structure_strength);
+	ngx::set_f32(p, ngx::kParamSkinStructureStrength,
+	             probe_drives ? sw.skin_structure : g_cfg.skin_structure_strength);
 	ngx::set_u32(p, ngx::kParamStyle,                  g_cfg.style);
 	// ---- BEGIN overlay_ui hook ----
 	// The overlay's "NR UI Correction" checkbox. Per-evaluate, exactly like Style, and NOT
@@ -5211,15 +5510,29 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	// STRAY's is r32_g8_typeless sampled through an r32_float_x8_uint SRV. D3D12 NGX has no
 	// channel through which to be told the view format, so a typeless planar resource may well be
 	// rejected. Say so once, up front, so a later FAIL_UnsupportedInputFormat is not a mystery.
+	//
+	// THIS FIRES ON THE SHARED PATH, above the DLSS-SR branch, so it deliberately does NOT claim
+	// the conversion is running - only the per-dispatch GAP 3 line below can say that, and only
+	// for the DLSS-NR path. What it names instead is WHICH paths still bind the game's resource
+	// under the current configuration, which is true in every one of them.
 	if (!st->logged_depth_format &&
 	    (depth.fmt == format::r32_g8_typeless || depth.fmt == format::r24_g8_typeless))
 	{
 		st->logged_depth_format = true;
-		LOGW("DLSS-NR: DLSSNR.Depth is being bound to a TYPELESS PLANAR resource (%s). NGX reads "
-		     "the format from the D3D12_RESOURCE_DESC and cannot be told the view format on "
-		     "D3D12, so it may reject the evaluate with FAIL_UnsupportedInputFormat / "
-		     "FAIL_UnsupportedFormat. If that happens, a depth conversion pass into a dedicated "
-		     "R32_FLOAT texture is required - see README \"Known gaps\".", probe::format_name(depth.fmt));
+		LOGW("DLSS-NR: the game's depth is a TYPELESS PLANAR resource (%s). NGX reads the format "
+		     "from the D3D12_RESOURCE_DESC and cannot be told the view format on D3D12, so binding "
+		     "it directly may be rejected with FAIL_UnsupportedInputFormat / FAIL_UnsupportedFormat "
+		     "- and, short of that, hands the network something that is not a depth value at all. "
+		     "%s CHAIN MODE AND DLSS-SR BIND IT DIRECTLY EITHER WAY: DLSS-SR has DLSS.Use.HW.Depth "
+		     "(sr_hw_depth), a create-time channel through which the SR snippet CAN be told its "
+		     "input is a hardware depth-stencil, and the DLSS-NR snippet has no equivalent - which "
+		     "is the whole of README gap 3.", probe::format_name(depth.fmt),
+		     g_cfg.depth_convert
+		        ? "The DLSS-NR path is configured to CONVERT it into an r32_float texture of ours; "
+		          "the GAP 3 line on the first accepted dispatch reports whether that actually "
+		          "happened, and depth_convert=0 is the A/B against this binding."
+		        : "depth_convert=0, so the DLSS-NR path binds it directly too - that is the "
+		          "pre-conversion behaviour and README gap 3 stands unmitigated.");
 	}
 
 	// ---------------------------------------------------------------- DLSS SUPER RESOLUTION
@@ -5381,6 +5694,142 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 			     "back to the raw encoded velocity, i.e. today's behaviour. This message is "
 			     "printed once.");
 		}
+	}
+
+	// ---------------------------------------------------------------- THE DEPTH CONVERSION
+	//
+	// CPU-SIDE DECISION ONLY, exactly like the motion-vector ladder above and in the same window:
+	// nothing has been issued yet, so every rung here is free.
+	//
+	// THE LADDER. Every rung lands on TODAY'S BEHAVIOUR - the game's own r32_g8_typeless depth
+	// resource bound as DLSSNR.Depth - and none of them is fatal:
+	//   depth_convert=0                    -> the game's depth   (bit-for-bit today, gap-3 warning and all)
+	//   DXBC/PSO/stats could not be built  -> the game's depth   (depth_failed, run-latched)
+	//   depth_tex could not be allocated   -> the game's depth   (depth_tex_failed, per-resolution)
+	//   the game's depth SRV was not
+	//     recovered at this dispatch       -> the game's depth   (nothing to read)
+	//   EvaluateFeature fails 8 frames
+	//     running with OUR depth bound     -> the game's depth, RUN-LATCHED (depth_eval_rejected)
+	//
+	// THE MEASUREMENT IS POLLED FIRST AND UNCONDITIONALLY, because its readback is keyed on a copy
+	// that was recorded several dispatches ago and nothing else advances it. Leaving it inside the
+	// run predicate would deadlock the configuration depth_convert=0/depth_detect=1: measuring()
+	// is false while a readback is outstanding, so the pass would stop running, so the poll would
+	// never be reached, so the readback would stay outstanding for ever.
+	if (st->depth_conv.ok && st->depth_det.armed && !st->depth_det.done &&
+	    depth_convert::poll(dev, st->depth_conv, st->depth_det, &nr_pipeline_log) &&
+	    !st->logged_depth_det_result)
+	{
+		st->logged_depth_det_result = true;
+		// The verdict itself was already logged by poll(). THIS line is the consequence: which
+		// value DLSSNR.DepthInverted is actually going to carry, and why. Saying only one of the
+		// two would leave a log that reports a measurement and a behaviour that ignores it.
+		if (st->depth_det.latched != depth_convert::verdict::undecided)
+		{
+			const bool measured = (st->depth_det.latched == depth_convert::verdict::reversed);
+			if (g_cfg.depth_inverted_pinned)
+			{
+				logf(measured == g_cfg.depth_inverted ? reshade::log::level::info
+				                                      : reshade::log::level::warning,
+				     "DLSS-NR: depth_inverted=%d is PINNED in stray_dlssnr.ini, so the measurement "
+				     "is REPORTED and NOT applied. The measurement says %d. %s",
+				     (int)g_cfg.depth_inverted, (int)measured,
+				     measured == g_cfg.depth_inverted
+				         ? "They agree - README gap 4 is now a measurement rather than an inference."
+				         : "THEY DISAGREE. One of the two is wrong and the image cannot tell you "
+				           "which without an A/B: remove the depth_inverted line from the ini to "
+				           "let the measurement win, or leave it to keep the pin.");
+			}
+			else
+			{
+				LOGI("DLSS-NR: GAP 4 ADDRESSED. DLSSNR.DepthInverted=%d comes from the MEASUREMENT "
+				     "above, not from the inference that UE 4.27 renders reversed-Z. The built-in "
+				     "default would have sent %d. Put depth_inverted in stray_dlssnr.ini, or move "
+				     "the DepthInverted control in the overlay, to override it for the run.",
+				     (int)measured, (int)g_cfg.depth_inverted);
+			}
+		}
+	}
+
+	// THE STAND-DOWN. A live control that silently does nothing is the exact defect this tree has
+	// already caught in itself twice, and depth_inverted IS live (overlay R1). If the user moves it
+	// at ANY point - before the verdict lands or after - the control wins for the rest of the run.
+	//
+	// The comparison is against the LOAD-TIME value and not against a latch-time snapshot, which is
+	// what makes "before the verdict lands" work: see g_depth_inverted_at_load. It is checked on
+	// every accepted dispatch rather than on an edge, because the overlay's snapshot is what puts
+	// the new value in g_cfg and this function has no other notification that it moved.
+	if (!st->depth_det_stood_down && st->depth_det.armed && !g_cfg.depth_inverted_pinned &&
+	    g_cfg.depth_inverted != g_depth_inverted_at_load)
+	{
+		st->depth_det_stood_down = true;
+		if (!st->logged_depth_det_stand)
+		{
+			st->logged_depth_det_stand = true;
+			LOGW("DLSS-NR: DepthInverted was changed to %d, so depth_detect STANDS DOWN for the "
+			     "rest of the run and the control wins (%s). That is deliberate: a live control "
+			     "the measurement quietly overrode would be a control wired to nothing. Restart to "
+			     "hand the decision back to the measurement.",
+			     (int)g_cfg.depth_inverted,
+			     st->depth_det.latched == depth_convert::verdict::undecided
+			         ? "nothing had been measured yet"
+			         : (st->depth_det.latched == depth_convert::verdict::reversed
+			              ? "the measurement had said reversed-Z"
+			              : "the measurement had said standard-Z"));
+		}
+	}
+
+	// WANTED FOR THE BINDING and WANTED FOR THE MEASUREMENT are separate questions with separate
+	// answers, and the pass runs if EITHER says so. depth_convert=0 with depth_detect=1 still
+	// measures - it just does not bind - and once the verdict is settled it stops dispatching
+	// altogether. That decoupling is deliberate: the measurement is the more valuable of the two
+	// and must not be hostage to the binding A/B.
+	const bool depth_bind_wanted    = g_cfg.depth_convert && !st->depth_eval_rejected;
+	const bool depth_measure_wanted = depth_convert::measuring(st->depth_conv, st->depth_det);
+	const bool run_depth = st->depth_conv.ok && !st->depth_failed && st->depth_ok &&
+	                       mvec_depth_view.handle != 0 &&
+	                       (depth_bind_wanted || depth_measure_wanted);
+
+	if (g_cfg.depth_convert && !depth_bind_wanted && !st->logged_depth_off)
+	{
+		st->logged_depth_off = true;
+		LOGW("DLSS-NR: depth_convert=1 but NGX REJECTED our r32_float depth, so the binding was "
+		     "REVERTED to the game's own r32_g8_typeless resource - see the error above. README "
+		     "gap 3 stands unmitigated for this run. This message is printed once.");
+	}
+	else if (g_cfg.depth_convert && !run_depth && !st->logged_depth_off)
+	{
+		st->logged_depth_off = true;
+		LOGW("DLSS-NR: depth_convert=1 but the conversion pass is NOT running (%s). DLSSNR.Depth "
+		     "falls back to the game's own r32_g8_typeless depth resource, which is EXACTLY the "
+		     "pre-conversion behaviour - README gap 3 stands unmitigated for this run. Everything "
+		     "else is unaffected. This message is printed once.",
+		     st->depth_failed             ? "its shader could not be compiled, or its pipeline or "
+		                                    "statistics buffers could not be created"
+		     : !st->depth_ok              ? "its r32_float target could not be allocated"
+		                                  : "the game's own depth SRV handle was not recovered for "
+		                                    "this dispatch, so there is nothing to read");
+	}
+
+	// Published for the periodic census, which cannot take this state's mutex (see hist_restored).
+	// All three are written HERE, before the fenced window, so an exception inside it cannot leave
+	// the census reporting a binding that never happened.
+	st->census_depth_bound.store(run_depth && depth_bind_wanted, std::memory_order_relaxed);
+	st->census_depth_verdict.store(static_cast<uint32_t>(st->depth_det.latched), std::memory_order_relaxed);
+	st->census_depth_inverted.store(nr_depth_inverted_value(*st), std::memory_order_relaxed);
+
+	// GAP 3, restated against the MEASURED resource and only once it is actually being converted.
+	// The arm-time banner in on_present can say the pipeline exists; only here is it known that the
+	// pass ran against a real depth SRV and that its output is what NGX will be handed.
+	if (run_depth && depth_bind_wanted && !st->logged_depth_active)
+	{
+		st->logged_depth_active = true;
+		LOGI("DLSS-NR: GAP 3 ADDRESSED. DLSSNR.Depth is no longer the game's %s resource: a compute "
+		     "pass reads it through the game's OWN typed r32_float_x8_uint SRV and writes DeviceZ "
+		     "VERBATIM into our r32_float texture at %ux%u, which is what NGX is handed. Nothing is "
+		     "linearised and nothing is flipped - DLSSNR.DepthInverted still carries the reversed-Z "
+		     "convention and nothing else does. Set depth_convert=0 to A/B against the old binding.",
+		     probe::format_name(depth.fmt), st->out_w, st->out_h);
 	}
 
 	// ---------------------------------------------------------------- BREAK THE TEMPORAL FEEDBACK
@@ -5588,9 +6037,15 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	// are put back unconditionally after the fence, so an escape cannot leave D3D12's view of a
 	// resource disagreeing with ours and poison the next frame's barriers.
 	bool orig_in_srv = false, proxy_in_srv = false, out_in_srv = false, mvec_in_srv = false;
+	bool depth_in_srv = false;
 	// True once mvec_tex actually holds THIS frame's decoded guide. Only then may it be bound as
 	// DLSSNR.MVec; the intent to run the pass is not enough, because a throw could land between.
 	bool mvec_used = false;
+	// The same rule for depth_tex and DLSSNR.Depth: the intent to convert is not the conversion.
+	// It is ALSO false whenever the pass ran purely to feed the gap-4 measurement, because in that
+	// configuration (depth_convert=0, depth_detect=1) the texture is written and deliberately not
+	// bound - so this must not be derived from "did the dispatch happen".
+	bool depth_used = false;
 	// True once orig_tex actually holds THIS frame's pre-denoise TAA output. The feedback fix may
 	// only arm on that, never on the intent to take the copy.
 	bool orig_saved = false;
@@ -5693,6 +6148,46 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 		st->mvec_frames.fetch_add(1, std::memory_order_relaxed);
 	}
 
+	// ---- stage 0b of 4: THE DEPTH CONVERSION ---------------------------------------------------
+	//
+	// Immediately after the motion-vector decode and under every one of its rules, because it is
+	// the same kind of pass reading the same kind of borrowed descriptor:
+	//   * it MUST be after the game's Dispatch, for the reason stage 0 states - a compute dispatch
+	//     of ours issued before the game's would execute the game's TAA against OUR root signature,
+	//     PSO and heaps, which is a device removal and not an artefact;
+	//   * the game's depth SRV is read through ITS OWN descriptor and is NOT transitioned. It was
+	//     bound as an SRV to the compute shader that just executed, so it already carries
+	//     NON_PIXEL_SHADER_RESOURCE, and this dispatch is a second READER of the same state at the
+	//     same point in the list. mvec_decode read the very same view three lines above.
+	//
+	// THE CACHE SYNC IS ISSUED HERE TOO AND IT IS NOT REDUNDANT. ReShade's command_list_impl caches
+	// _current_descriptor_heaps and _current_root_signature and skips a redundant SetDescriptorHeaps
+	// or SetComputeRootSignature; NGX writes the RAW list, which ReShade never sees, so the cache
+	// goes stale across an evaluate. count == 0 is ReShade's own escape hatch and FORCES both. With
+	// mvec_decode=0 THIS is the frame's first push_descriptors and the duty is entirely ours; with
+	// it on, the call is idempotent and costs one redundant SetDescriptorHeaps.
+	if (run_depth)
+	{
+		cmd->bind_descriptor_tables(shader_stage::all_compute, st->depth_conv.layout, 0, 0, nullptr);
+
+		// The window sequencing (clear / accumulate / copy to readback) lives inside dispatch()
+		// because getting its ORDER wrong would let half a window settle the depth convention for
+		// the run - see depth_convert.hpp. The barrier below and the cache sync above are the
+		// caller's, and are the only two things it does not do.
+		depth_convert::dispatch(cmd, st->depth_conv, st->depth_det,
+		                        mvec_depth_view, st->depth_uav,
+		                        st->out_w, st->out_h, depth.w, depth.h);
+
+		// The write-completion barrier AND the state NGX reads depth in, in one transition - the
+		// same shape as the guide's above. It is issued even when the result is not going to be
+		// bound (depth_convert=0, measuring only): the texture was still written as a UAV, and the
+		// restore below unconditionally names SHADER_RESOURCE_NON_PIXEL as its StateBefore.
+		cmd->barrier(st->depth_tex, resource_usage::unordered_access, resource_usage::shader_resource_non_pixel);
+		depth_in_srv = true;
+		depth_used   = depth_bind_wanted;
+		st->depth_frames.fetch_add(1, std::memory_order_relaxed);
+	}
+
 	// ---- stage 1 of 4: the PRE-DENOISE ORIGINAL ------------------------------------------------
 	// Taken before anything of ours writes anywhere. This is O_N: the decode's `original`, and the
 	// pristine image the next frame's history restore puts back. taa_out is momentarily returned to
@@ -5733,7 +6228,20 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 		// colour extent, so the Color/Output rect equality the snippet enforces still holds.
 		auto *const colour_res  = reinterpret_cast<ID3D12Resource *>(
 			codec_encoded ? st->proxy_tex.handle : taa_out.res.handle);
-		auto *const depth_res   = reinterpret_cast<ID3D12Resource *>(depth.res.handle);
+		// THE DEPTH INPUT. When the conversion pass ran AND its result is being bound, this is OUR
+		// r32_float texture holding DeviceZ verbatim at the colour extent; otherwise it is the
+		// game's own r32_g8_typeless resource, exactly as before this feature existed. depth_used -
+		// not run_depth - is the condition, for the two reasons stated at its declaration: a throw
+		// could have landed between the decision and the dispatch, and the pass also runs in a
+		// configuration where it deliberately does not bind (depth_convert=0, depth_detect=1).
+		//
+		// THE EXTENT GOES WITH THE RESOURCE. Our texture is at the COLOUR extent, which is not
+		// necessarily depth.w/h - in STRAY they are equal today (both 1920x1080), so this is a
+		// provable no-op here, and it is not one the moment either grid moves.
+		auto *const depth_res   = reinterpret_cast<ID3D12Resource *>(
+			depth_used ? st->depth_tex.handle : depth.res.handle);
+		const uint32_t depth_w  = depth_used ? st->out_w : depth.w;
+		const uint32_t depth_h  = depth_used ? st->out_h : depth.h;
 		// THE MOTION GUIDE. When the decode pass ran this frame it is OUR r16g16_float texture on
 		// the COLOUR grid, already in absolute pixels; otherwise it is the game's raw encoded
 		// velocity on the velocity grid, exactly as before this feature existed. mvec_used - not
@@ -5776,7 +6284,7 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 
 		nr_eval_args ea_nr;
 		ea_nr.color  = colour_res;  ea_nr.color_w = st->out_w;  ea_nr.color_h = st->out_h;
-		ea_nr.depth  = depth_res;   ea_nr.depth_w = depth.w;    ea_nr.depth_h = depth.h;
+		ea_nr.depth  = depth_res;   ea_nr.depth_w = depth_w;    ea_nr.depth_h = depth_h;
 		ea_nr.mvec   = mvec_res;    ea_nr.mvec_w  = mvec_w;     ea_nr.mvec_h  = mvec_h;
 		ea_nr.output = output_res;  ea_nr.out_w   = st->out_w;  ea_nr.out_h   = st->out_h;
 		ea_nr.scale_x = scale_x;    ea_nr.scale_y = scale_y;
@@ -5882,6 +6390,14 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 			//
 			// If the evaluate still fails on the raw guide, nothing has been lost - it was already
 			// failing - and the log now says which binding it reverted to.
+			//
+			// THERE ARE NOW TWO CHANGED INPUTS AND THE LADDER TAKES THEM ONE AT A TIME. The guide
+			// goes back first and the depth second, never together: reverting both at once would
+			// recover the denoise while telling us NOTHING about which of the two NGX would not
+			// take, which is the whole point of having the rung. mvec_rung_pending is captured
+			// BEFORE the guide's own counter is touched, so the frame on which the guide is
+			// reverted does not also count against the depth.
+			const bool mvec_rung_pending = mvec_used && !st->mvec_eval_rejected;
 			if (mvec_used && !st->mvec_eval_rejected && ++st->mvec_eval_fail_streak >= 8)
 			{
 				st->mvec_eval_rejected = true;
@@ -5899,11 +6415,33 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 				     "motion guide was never the cause - look at the depth resource (README gap 3, "
 				     "FAIL_UnsupportedInputFormat on the typeless r32_g8 depth).");
 			}
+
+			// THE SECOND RUNG, and it only starts counting once the guide's is settled. Same eight
+			// frames, same reasoning, same landing place: the binding that was verified on this
+			// hardware. Note that "verified" here means only "the evaluate accepted it" - the
+			// typeless resource is exactly what README gap 3 says NGX cannot read the format of,
+			// so falling back to it recovers the denoise and not the depth signal.
+			if (!mvec_rung_pending && depth_used && !st->depth_eval_rejected &&
+			    ++st->depth_eval_fail_streak >= 8)
+			{
+				st->depth_eval_rejected = true;
+				st->logged_depth_off    = false;   // let the ladder say why, once, for this rung
+				st->logged_depth_active = false;   // and re-state the GAP 3 verdict for the raw resource
+				LOGE("DLSS-NR: EvaluateFeature has FAILED 8 frames running with our converted "
+				     "r32_float depth bound as DLSSNR.Depth. The conversion is being TURNED OFF "
+				     "FOR THIS RUN and DLSSNR.Depth REVERTED to the game's own r32_g8_typeless "
+				     "resource - exactly the pre-conversion binding. If the denoise comes back, "
+				     "NGX would not take a plain r32_float depth on this snippet build, which "
+				     "would be a genuinely surprising result worth reporting: report it, and run "
+				     "with depth_convert=0 meanwhile. Note that the depth-convention measurement "
+				     "(depth_detect) is unaffected - it reads the same texels either way.");
+			}
 		}
 		else
 		{
 			evaluated = true;
-			st->mvec_eval_fail_streak = 0;   // consecutive, so any success clears it
+			st->mvec_eval_fail_streak  = 0;   // consecutive, so any success clears it
+			st->depth_eval_fail_streak = 0;
 			st->need_reset = false;
 			st->evaluate_count++;
 
@@ -5916,7 +6454,11 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 				     "Intensity=%.3f LocalTone=%.3f LocalStructure=%.3f SkinStructure=%.3f "
 				     "Style=%u, copy_back=%d, hdr_codec=%d, history_restore=%d.",
 				     (unsigned long long)st->evaluate_count, taa_out.w, taa_out.h,
-				     depth.w, depth.h, probe::format_name(depth.fmt),
+				     // THE RESOURCE ACTUALLY HANDED TO NGX, for the same reason the guide below
+				     // names its own: naming the game's depth here while the conversion is running
+				     // would directly contradict the GAP 3 line and misdirect the hardware A/B.
+				     depth_w, depth_h,
+				     depth_used ? "r32_float, CONVERTED" : probe::format_name(depth.fmt),
 				     // THE RESOURCE ACTUALLY HANDED TO NGX, not the game's velocity buffer. In
 				     // STRAY both are 1920x1080, so the format and the tag are the only fields
 				     // that discriminate - and naming the raw buffer here directly contradicted
@@ -5925,7 +6467,11 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 				     probe::format_name(mvec_used ? format::r16g16_float : velocity.fmt),
 				     mvec_used ? "decoded, absolute colour-grid pixels"
 				               : "the game's RAW encoded velocity",
-				     scale_x, scale_y, (int)g_cfg.depth_inverted, (int)g_cfg.use_auto_mask,
+				     // NOT g_cfg.depth_inverted: with depth_detect=1 the value SENT can be the
+				     // measured one, and a log line that printed the ini's value instead would be
+				     // the precise kind of silent divergence nr_depth_inverted_value exists to
+				     // prevent. See README gap 4.
+				     scale_x, scale_y, (int)nr_depth_inverted_value(*st), (int)g_cfg.use_auto_mask,
 				     g_cfg.intensity, g_cfg.local_tone_strength, g_cfg.local_structure_strength,
 				     g_cfg.skin_structure_strength, g_cfg.style, (int)g_cfg.copy_back,
 				     (int)codec_encoded, (int)(g_cfg.history_restore && g_cfg.copy_back));
@@ -6129,6 +6675,13 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	// silently wrong transition under vkd3d. Exactly the hazard the comment above describes.
 	if (mvec_in_srv)
 		cmd->barrier(st->mvec_tex, resource_usage::shader_resource_non_pixel, resource_usage::unordered_access);
+	// depth_tex rests in UNORDERED_ACCESS for exactly the reason mvec_tex does, and the hazard of
+	// leaving it out is identical: every subsequent frame's opening barrier would declare a
+	// StateBefore that D3D12 disagrees with. Note this is keyed on depth_in_srv and NOT on
+	// depth_used - the pass also runs to feed the gap-4 measurement without binding its output,
+	// and that run transitions the texture just the same.
+	if (depth_in_srv)
+		cmd->barrier(st->depth_tex, resource_usage::shader_resource_non_pixel, resource_usage::unordered_access);
 
 	// 2c. THE LAST CACHE SYNC, and only when we actually used push_descriptors. It forces
 	//     SetDescriptorHeaps and SetComputeRootSignature onto the real list one more time, and -
@@ -6147,10 +6700,19 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	//     would end this window naming ReShade's transient heap while the raw list holds UE's, and
 	//     the next push_descriptors on this list would skip a SetDescriptorHeaps it needed. Either
 	//     layout serves - the call exists for its side effect on the cache, not for the binding.
+	//
+	//     depth_in_srv joins the condition on exactly the same argument, and it is the one that
+	//     covers hdr_codec=0 + mvec_decode=0 + depth_convert=1 - a configuration reachable from the
+	//     ini alone, in which the depth pass would be the ONLY push_descriptors of the frame and,
+	//     keyed on the other two, would dirty the cache and never clean it. It is depth_in_srv and
+	//     not depth_used for the reason the barrier above gives: a measurement-only run pushes
+	//     descriptors just the same.
 	if (codec_encoded)
 		cmd->bind_descriptor_tables(shader_stage::all_compute, st->codec.decode_layout, 0, 0, nullptr);
 	else if (mvec_used)
 		cmd->bind_descriptor_tables(shader_stage::all_compute, st->mvec.layout, 0, 0, nullptr);
+	else if (depth_in_srv)
+		cmd->bind_descriptor_tables(shader_stage::all_compute, st->depth_conv.layout, 0, 0, nullptr);
 
 	// 3. Put the command list back the way NGX found it. Unconditional: CreateFeature clobbers
 	//    state too, so this has to run even when the evaluate itself was skipped - or threw.
@@ -6292,6 +6854,9 @@ static void nr_init_device(device *dev)
 		s_config_loaded = true;
 		LOGI("DLSS-NR: reading configuration from %sstray_dlssnr.ini", ngx::narrow(dir).c_str());
 		cfg::load(g_cfg, dir, [](const char *line) { LOGI("%s", line); });
+		// IMMEDIATELY after the load and nowhere else - see g_depth_inverted_at_load. Anything
+		// later than this line has had the chance to be an overlay edit rather than the ini.
+		g_depth_inverted_at_load = g_cfg.depth_inverted;
 
 		// Armed HERE, above the `enabled` check below, and deliberately so: the RT census is
 		// read-only instrumentation with no render-path effect, and measuring what ray tracing
@@ -6620,6 +7185,18 @@ static bool nr_lazy_ngx_init(device *dev)
 	     overlay_ui::live_sr_mvec_decode()))
 		nr_build_mvec_pipeline(dev, *st, dir);
 
+	// ---- the depth conversion --------------------------------------------------------------
+	// Built HERE for exactly the same reasons: render thread, once, never on a recording thread.
+	// It is NOT a live control - unlike mvec_decode it has no overlay checkbox and no a_reconcile
+	// arm - so g_cfg is the right thing to read and there is no live/g_cfg divergence to reason
+	// about. It is built when EITHER key wants it, because depth_detect measures through the same
+	// shader and must not be hostage to depth_convert's binding A/B (addon_config.hpp says why).
+	if (g_cfg.depth_convert || g_cfg.depth_detect)
+		nr_build_depth_pipeline(dev, *st, dir);
+
+	// Diagnostic; returns immediately unless nr_probe=1.
+	nr_build_probe_pipeline(dev, *st, dir);
+
 	// st->params CAN BE NULL HERE NOW, which it never could before DLSS-SR: with dlss_nr=0 the
 	// DLSS-NR parameter block is deliberately never allocated, and PopulateParameters_Impl takes
 	// the block as its only argument. The test is not defensive tidiness - without it a pure-SR
@@ -6881,8 +7458,27 @@ static bool nr_lazy_ngx_init(device *dev)
 		     "SkinStructure=%.3f Style=%u UseAutoMask=%d",
 		     g_cfg.intensity, g_cfg.local_tone_strength, g_cfg.local_structure_strength,
 		     g_cfg.skin_structure_strength, g_cfg.style, (int)g_cfg.use_auto_mask);
-		LOGI("  behaviour       copy_back=%d depth_inverted=%d restore_graphics_root=%d",
-		     (int)g_cfg.copy_back, (int)g_cfg.depth_inverted, (int)g_cfg.restore_graphics_root);
+		LOGI("  behaviour       copy_back=%d depth_inverted=%d (%s) restore_graphics_root=%d",
+		     (int)g_cfg.copy_back, (int)nr_depth_inverted_value(*st),
+		     st->depth_det.latched == depth_convert::verdict::undecided
+		         ? (g_cfg.depth_detect ? "not measured yet - inferred from UE 4.27 reversed-Z"
+		                               : "depth_detect=0, inferred from UE 4.27 reversed-Z")
+		     : (g_cfg.depth_inverted_pinned || st->depth_det_stood_down)
+		         ? "MEASURED, but overridden by the ini or the overlay"
+		         : "MEASURED from the depth buffer",
+		     (int)g_cfg.restore_graphics_root);
+		LOGI("  depth convert   depth_convert=%d depth_detect=%d (%s)",
+		     (int)(g_cfg.depth_convert && !st->depth_failed && !st->depth_eval_rejected),
+		     (int)g_cfg.depth_detect,
+		     st->depth_failed
+		        ? "FAILED: the shader or its pipeline could not be built, so DLSSNR.Depth stays on "
+		          "the game's typeless resource - README gap 3"
+		        : (st->depth_eval_rejected
+		             ? "REVERTED: NGX refused our r32_float depth, see the error above"
+		             : (g_cfg.depth_convert
+		                  ? "DLSSNR.Depth will be our own r32_float texture holding DeviceZ verbatim"
+		                  : "OFF: the game's own r32_g8_typeless depth resource is bound, which is "
+		                    "the binding README gap 3 is about")));
 		LOGI("  hdr codec       hdr_codec=%d paper_white_scale=%.4f (UNCALIBRATED) "
 		     "transfer_strength=%.3f color_strength=%.3f hdr_graft=%u (%s)",
 		     (int)(overlay_ui::live_hdr_codec() && !st->codec_failed), g_cfg.paper_white_scale,
@@ -6968,6 +7564,48 @@ static bool nr_lazy_ngx_init(device *dev)
 			     "\"Known gaps\", gap 2.",
 			     !overlay_ui::live_mvec_decode() ? "mvec_decode=0, so it is disabled by configuration"
 			                                     : "its shader or pipeline could not be built - see above");
+		// GAP 3, on the same terms as gap 2: this is an ARM-TIME statement about the PIPELINE. The
+		// per-dispatch "GAP 3 ADDRESSED" line in nr_try_run is the one that reports the outcome,
+		// because only there is the game's depth SRV known to have been recovered.
+		if (g_cfg.depth_convert && !st->depth_failed && st->depth_conv.ok)
+			LOGI("DLSS-NR: GAP 3 ADDRESSED - the depth conversion is ARMED. DLSSNR.Depth will be OUR "
+			     "r32_float texture and not the game's r32_g8_typeless depth-stencil. On D3D12 the "
+			     "snippet is handed a bare ID3D12Resource* and reads the format straight off the "
+			     "D3D12_RESOURCE_DESC - there is no view-format channel in the ABI - so what it sees "
+			     "today is a TYPELESS PLANAR format rather than a depth value. The pass reads the "
+			     "game's depth through the game's OWN typed r32_float_x8_uint SRV and writes DeviceZ "
+			     "VERBATIM. Confirmation that it actually ran follows on the first accepted dispatch.");
+		else
+			LOGW("DLSS-NR: KNOWN GAP - THE DEPTH RESOURCE IS TYPELESS AND PLANAR (%s). NGX reads the "
+			     "format off the D3D12_RESOURCE_DESC and cannot be told the view format on D3D12, so "
+			     "DLSSNR.Depth is being handed something that is not a depth value to anything reading "
+			     "it that way. The one known-working DLSS-NR deployment renders its own R32F target and "
+			     "hard-rejects any other format. The fix is the conversion pass this build ships - see "
+			     "README \"Known gaps\", gap 3.",
+			     !g_cfg.depth_convert ? "depth_convert=0, so it is disabled by configuration"
+			                          : "its shader or pipeline could not be built - see above");
+		// GAP 4. Arm-time only says whether the MEASUREMENT will be attempted; the verdict needs
+		// real frames and is printed from nr_try_run when it lands.
+		if (g_cfg.depth_detect && !st->depth_failed && st->depth_conv.ok)
+			LOGI("DLSS-NR: GAP 4 - depth_detect is ARMED. DLSSNR.DepthInverted currently sends %d, "
+			     "which is the INFERENCE that UE 4.27 renders reversed-Z; the conversion pass is "
+			     "accumulating a distribution statistic over the depth it already reads and will "
+			     "replace that inference with a MEASUREMENT, or say why it declines to. %s",
+			     (int)g_cfg.depth_inverted,
+			     g_cfg.depth_inverted_pinned
+			        ? "depth_inverted is PINNED in stray_dlssnr.ini, so the measurement will be "
+			          "REPORTED and NOT applied - a wrong pin will be visible rather than obeyed."
+			        : "It has NOT been confirmed against STRAY before this build.");
+		else
+			LOGW("DLSS-NR: KNOWN GAP - depth_inverted=%d IS INFERRED, NOT MEASURED (%s). UE 4.27 "
+			     "renders reversed-Z, which is the OPPOSITE of the working Remix deployment's value, "
+			     "and getting it wrong produces no diagnostic anywhere - the evaluate still succeeds "
+			     "and the image is merely wrong. If the denoise ghosts or smears in exactly the wrong "
+			     "direction, flip it first. See README \"Known gaps\", gap 4.",
+			     (int)g_cfg.depth_inverted,
+			     !g_cfg.depth_detect ? "depth_detect=0, so it is disabled by configuration"
+			                         : "the depth conversion pass it measures through could not be "
+			                           "built - see above");
 		LOGI("==================================================================");
 	}   // if (nr_ok)
 
@@ -7035,6 +7673,15 @@ static void nr_destroy_device(device *dev)
 		// by pd_destroy<nr_state> below with no Release, and each of them holds a reference on the
 		// ID3D12Device, so the device itself was never destroyed either.
 		mvec_decode::destroy(dev, st->mvec);
+		// Same lifetime, same rule, same place again. depth_convert::destroy guards a null device
+		// and zero handles and resets the struct, so it is correct to call unconditionally -
+		// including when depth_convert=0 and depth_detect=0 and every handle is already 0. It owns
+		// a root signature, a PSO, TWO BUFFERS and a view, and every one of them holds a reference
+		// on the ID3D12Device; dropping them here is what lets the device itself be destroyed.
+		depth_convert::destroy(dev, st->depth_conv);
+		// Same rule, same reason: the probe owns a root signature, a PSO and two buffers, and
+		// each holds a reference on the device.
+		nr_probe::destroy(dev, st->probe);
 
 		if (g_snippet.shutdown1 != nullptr && st->d3d12 != nullptr)
 		{
@@ -7571,6 +8218,18 @@ static void nr_service_reconfigure(device *dev)
 		st->logged_mvec_clip_bad    = false;
 		st->logged_mvec_clip_row    = false;
 		st->logged_mvec_decode_only = false;
+		// The depth pass's per-resolution one-shots, re-armed on exactly the same argument as the
+		// mvec ones above: an r32_float target that allocates at one extent and not at the next
+		// would otherwise re-latch in SILENCE, leaving the log's last word on the subject a stale
+		// "GAP 3 ADDRESSED" from the old configuration.
+		//
+		// logged_depth_det_result and logged_depth_det_stand are deliberately NOT in this list.
+		// They are statements about a MEASUREMENT that survives a resolution change - see the
+		// note in nr_release_feature_and_output on why the verdict is not re-taken - and re-arming
+		// them would promise a second announcement that can never come.
+		st->logged_depth_tex_fail = false;
+		st->logged_depth_active   = false;
+		st->logged_depth_off      = false;
 		// logged_mvec_pinned_row is deliberately NOT reset by a teardown: it is a statement about
 		// the ini file, not about the resolution. It IS reset by a_clear_clip below, because there
 		// the ini value is precisely what changed.
@@ -7835,6 +8494,11 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 		const uint64_t nr_mvec_frames  = (nst != nullptr) ? nst->mvec_frames.load(std::memory_order_relaxed) : 0;
 		const uint64_t nr_mvec_reuse   = (nst != nullptr) ? nst->mvec_cb_reuse.load(std::memory_order_relaxed) : 0;
 		const uint32_t nr_mvec_mode    = (nst != nullptr) ? nst->census_mvec_mode.load(std::memory_order_relaxed) : 0;
+		const uint64_t nr_depth_frames = (nst != nullptr) ? nst->depth_frames.load(std::memory_order_relaxed) : 0;
+		const bool     nr_depth_bound  = (nst != nullptr) && nst->census_depth_bound.load(std::memory_order_relaxed);
+		const uint32_t nr_depth_verdict= (nst != nullptr) ? nst->census_depth_verdict.load(std::memory_order_relaxed) : 0;
+		const bool     nr_depth_inv    = (nst != nullptr) ? nst->census_depth_inverted.load(std::memory_order_relaxed)
+		                                                  : g_cfg.depth_inverted;
 		const uint64_t sr_evals        = (nst != nullptr) ? nst->sr_evaluates.load(std::memory_order_relaxed) : 0;
 		const uint64_t chain_evals     = (nst != nullptr) ? nst->chain_evaluates.load(std::memory_order_relaxed) : 0;
 		const uint64_t sr_suppressed   = (nst != nullptr) ? nst->sr_suppressed.load(std::memory_order_relaxed) : 0;
@@ -7905,6 +8569,29 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 			                       : "RAW (the game's encoded velocity - pre-decode behaviour)",
 			     (int)overlay_ui::live_mvec_decode(), (int)overlay_ui::live_mvec_reconstruct());
 		// ---- END overlay_ui hook ----
+
+		// The depth conversion's own accounting, and the depth-convention verdict beside it.
+		// 'converted' climbing at one per accepted dispatch with bound=yes is the gap-3 success
+		// signature; converted climbing with bound=no is the measurement-only configuration
+		// (depth_convert=0, depth_detect=1) and is not a fault. A flat counter with
+		// depth_convert=1 means the pass is not running and a one-shot line above says which rung
+		// it fell to.
+		//
+		// NEITHER KEY IS LIVE - neither has an overlay control and neither is in
+		// OVERLAY_OWNED_FIELDS - so g_cfg is read directly here. That is the same main-thread read
+		// of a main-thread-written value the mvec line above USED to be, and it is only correct
+		// because these two keys are ini-only. If either ever becomes a live control it joins the
+		// overlay atomics IN THIS LINE, exactly as sr_direct_output eventually had to.
+		if (nst != nullptr && (nr_depth_frames != 0 || g_cfg.depth_convert || g_cfg.depth_detect))
+			LOGI("--- DLSS-NR depth @ frame %llu: converted=%llu bound=%s DepthInverted=%d (%s) "
+			     "(depth_convert=%d depth_detect=%d)",
+			     (unsigned long long)g.frame, (unsigned long long)nr_depth_frames,
+			     nr_depth_bound ? "yes, our r32_float" : "no, the game's typeless resource",
+			     (int)nr_depth_inv,
+			     nr_depth_verdict == 0 ? "not measured"
+			   : nr_depth_verdict == 1 ? "MEASURED reversed-Z"
+			                           : "MEASURED standard-Z",
+			     (int)g_cfg.depth_convert, (int)g_cfg.depth_detect);
 
 		// THE DLSS-SR PROOF-OF-LIFE LINE. evaluates= is incremented on the branch immediately
 		// after EvaluateFeature returned Success and nowhere else, so a non-zero value here is

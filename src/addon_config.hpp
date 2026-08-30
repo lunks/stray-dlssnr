@@ -133,15 +133,41 @@ struct config
 
 	// The scene-linear -> display-referred scale, s, in  proxy = SrgbEncode(SoftClip(colour * s)).
 	//
-	// THIS VALUE IS UNCALIBRATED. Remix folds its own auto-exposure and user EV bias into s;
-	// STRAY exposes no equivalent to us, so this is a plain constant and it NEEDS TUNING ON
-	// HARDWARE. The default of 1.0 is a starting point, not a measurement.
+	// SEMANTICS ARE REMIX'S, which means this is a DIVISOR: s = 1.0 / max(paper_white_scale, 0.01),
+	// and the encode computes original * s. So this value IS the scene-linear magnitude the codec
+	// calls DISPLAY WHITE, and RAISING it DARKENS the proxy the network is shown.
 	//
-	// SEMANTICS ARE REMIX'S, which means this is a DIVISOR: s = 1.0 / max(paper_white_scale, 0.01).
-	// So RAISING this value DARKENS the proxy. Raise it if the proxy looks blown out (highlights
-	// crushed into the soft-clip shoulder); lower it if the proxy looks black. At the default of
-	// 1.0 the divisor and multiplier conventions coincide exactly.
-	float    paper_white_scale = 1.0f;
+	// THE DEFAULT IS DERIVED, NOT MEASURED ON HARDWARE. It was 1.0, which had nothing behind it.
+	// 4/3 puts UE4's diffuse white (SceneColor 1.0) exactly on the soft-clip knee (0.75), so the
+	// whole diffuse range is transferred through the LINEAR part of the clip and the shoulder is
+	// spent on genuine highlights; independently it is also 1/0.79, the measured point out to which
+	// >= 95% of the network's requested change survives the FP16 round trip. The two criteria agree
+	// to 5%. What it buys: the one-directional FP16 clip - above which the transfer can only DARKEN,
+	// because (neural - proxy) <= 0 there - moves from SceneColor 1.81 up to 2.41, and that
+	// asymmetry is the mechanism behind the ~12% darkening measured on hardware at the old default.
+	// What it costs: the proxy is ~12% darker in code values, mid grey landing at 103/255 against a
+	// textbook sRGB 118/255.
+	//
+	// THE FULL DERIVATION, ITS ARITHMETIC, THE HARDWARE MEASUREMENT AND THE LIST OF THINGS IT DOES
+	// NOT VERIFY are in src/hdr_codec.hpp, "THE SCALE, s - WHERE THE DEFAULT COMES FROM". That
+	// header carries the same literal as hdr_codec::kDerivedPaperWhiteScale, with a static_assert
+	// pinning it to the knee. The two headers deliberately do not include each other, so this value
+	// is spelled `4.0f / 3.0f` in three places - here, there, and overlay_ui.hpp's pre-seed atomic.
+	// Change one, grep for the others.
+	//
+	// STILL WORTH A SWEEP ON HARDWARE, and the overlay slider is LIVE so the camera need not move
+	// between values: raise it if highlights are crushed into the soft-clip shoulder, lower it if
+	// the image looks black. Useful range is roughly 0.01 .. 64. docs/GAP1-CALIBRATION.md has the
+	// procedure.
+	//
+	// ONE CONSEQUENCE OF THE NEW DEFAULT: it is not a power of two, so hdr_graft=1's
+	// transfer_strength=0 round trip - (o * s) / s, display-referred at both ends - is no longer
+	// exact at the default, where at 1.0 it was. Measured, not asserted: this scale is now in
+	// tools/hdr_codec_selftest.cpp section 6's sweep, which reports mode 1 non-exact on 7586 of
+	// 20000 pixels at worst 8.94e-08 relative, and hdr_graft=0 - the shipping graft - exact on
+	// 20000 of 20000, bit for bit, exactly as at every other scale. The transfer_strength=0
+	// identity check belongs on hdr_graft=0 and is completely unaffected by this change.
+	float    paper_white_scale = 4.0f / 3.0f;
 
 	// Global lerp back toward the untouched original, applied by the decode.
 	//
@@ -293,12 +319,69 @@ struct config
 	// why this exists rather than a self-test.
 	bool     mvec_clip_transpose = false;
 
+	// ---- the depth conversion pass (README gap 3) ------------------------------------------
+	// STRAY's t0 is an r32_g8_typeless PLANAR depth-stencil, read through an r32_float_x8_uint
+	// SRV. That SRV is correct; the RESOURCE is not something NGX can interpret. On D3D12 the
+	// snippet is handed a bare ID3D12Resource* and reads the format straight off
+	// D3D12_RESOURCE_DESC - ngx_interop.hpp's set_res has no view-format channel because the ABI
+	// has none - so what it sees for DLSSNR.Depth today is DXGI_FORMAT_R32G8X24_TYPELESS.
+	//
+	// With this on, one compute pass of ours reads the game's depth THROUGH ITS OWN TYPED SRV and
+	// writes DeviceZ VERBATIM into a private r32_float texture at the colour extent, and THAT is
+	// what is bound. Nothing is linearised and nothing is flipped: DLSSNR.DepthInverted is still
+	// the only thing that carries the reversed-Z convention.
+	//
+	// 0 restores the previous behaviour EXACTLY: the game's own depth resource is bound and the
+	// gap-3 warning fires as it always did. That is the A/B.
+	//
+	// This defaults ON for the same reason mvec_decode does, and the argument is the same one: the
+	// binding it replaces is documented-defective rather than merely imperfect, so there is no good
+	// baseline being protected. Every failure rung - shader, pipeline, texture - lands on exactly
+	// today's behaviour. A reviewer who wants the first hardware launch to be a pure control should
+	// set this to 0 in the ini rather than change the default.
+	//
+	// SCOPE: this covers the DLSS-NR path. CHAIN MODE (dlss_chain=1) still binds the game's own
+	// depth resource to DLSSNR.Depth, and DLSS-SR always does - see sr_hw_depth, which is the
+	// create-time channel through which the SR snippet CAN be told its input is a hardware
+	// depth-stencil. The NR snippet has no such key, which is the whole of gap 3.
+	bool     depth_convert = true;
+
+	// ---- the depth convention measurement (README gap 4) -----------------------------------
+	// depth_inverted below has always been an INFERENCE, never a measurement against STRAY. With
+	// this on, the depth conversion pass also accumulates a cheap distribution statistic over the
+	// depth it is already reading and DERIVES the convention: reversed-Z puts the depth mass at
+	// the low end, standard-Z at the high end, and the two are separated by a count. The verdict is
+	// LATCHED once and never flips mid-run. See depth_convert.hpp for the rule and for every case
+	// in which it refuses to decide.
+	//
+	// THE INI STILL WINS. If depth_inverted appears in stray_dlssnr.ini the measurement is reported
+	// and NOT applied - so a wrong pin is visible in the log rather than silently obeyed - and
+	// moving the DepthInverted control in the overlay stands the measurement down for the run.
+	//
+	// INERT WITHOUT THE PASS. The statistic is written by the depth conversion shader, so a run in
+	// which that shader could not be built measures nothing. It does NOT need depth_convert=1: with
+	// depth_convert=0 the pass still runs until the verdict is settled, it just does not bind its
+	// output. That is deliberate - the measurement is the more valuable of the two and must not be
+	// hostage to the binding A/B.
+	bool     depth_detect = true;
+
 	// ---- NGX evaluate parameters ---------------------------------------------------------
 	// UE 4.27 renders with a REVERSED-Z depth buffer (near plane at 1.0), so this defaults to 1 -
 	// which is the opposite of the working Remix deployment, whose renderer writes post-divide
-	// NDC depth without inverting. If DLSS-NR ghosts or smears in exactly the wrong direction,
-	// this is the first thing to flip.
+	// NDC depth without inverting. It is now MEASURED at runtime when depth_detect=1, and this
+	// value is what is used when the measurement declines, gives up, or is overridden.
+	// If the denoise ghosts or smears in exactly the wrong direction, this is still the first
+	// thing to flip - and flipping it takes the measurement out of the loop for the run.
 	bool     depth_inverted = true;
+
+	// NOT AN INI KEY - it has no line of its own and cannot be written. It records whether
+	// depth_inverted was PRESENT in stray_dlssnr.ini, which is the one thing a bool cannot say
+	// about itself: "the user chose 1" and "nobody said anything, so it is the default 1" are the
+	// same value. depth_detect needs that distinction to honour an explicit pin without also
+	// overriding a default nobody chose. Deliberately outside OVERLAY_OWNED_FIELDS: it is a
+	// statement about the FILE, not a control, and begin_pass's snapshot copies it through
+	// untouched with the rest of the non-owned config.
+	bool     depth_inverted_pinned = false;
 	// 0 == derive it. With mvec_decode=0 that is the extent ratio (colour grid / mvec grid), which
 	// is what the working deployment computes and which can only ever correct the GRID, never
 	// UE4's velocity encoding. With mvec_decode=1 the derived value is FORCED to exactly 1.0,
@@ -608,6 +691,21 @@ struct config
 	// neither does anything. Binding an explicit ControlMask also forces it to 0 inside the
 	// snippet; this add-on binds no ControlMask, so the two never conflict here.
 	bool     use_auto_mask = true;
+
+	// ---- THE IN-RUN NR PROBE (nr_probe.hpp) --------------------------------------------------
+	// Off by default and strictly diagnostic: it adds one small compute dispatch per evaluate and
+	// DRIVES use_auto_mask / local_structure_strength / skin_structure_strength itself, so it must
+	// never be on during normal play - the values in this file are ignored while it runs.
+	//
+	// It exists because the question "does structure strength do anything?" cannot be answered
+	// from the parameter block (the getter trace already proves the value ARRIVES) and could not
+	// be answered from screenshots either: a cold relaunch per value moves the cat, and that
+	// scene difference measured LARGER than the effect being looked for. The probe holds one
+	// setting for nr_probe_frames frames with the camera parked, measures the network's own input
+	// against its own output in the same frame, and repeats the baseline at the end so the run
+	// carries its own noise floor.
+	uint32_t nr_probe        = 0;
+	uint32_t nr_probe_frames = 120;
 
 	// =======================================================================================
 	// DLSS SUPER RESOLUTION (NGX feature 1, nvngx_dlss.dll). See STAGING-sr.md.
@@ -977,7 +1075,13 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "mvec_dilate")              c.mvec_dilate = parse_bool(v, c.mvec_dilate);
 		else if (key == "mvec_clip_row")            c.mvec_clip_row = static_cast<uint32_t>(parse_u64(v, c.mvec_clip_row));
 		else if (key == "mvec_clip_transpose")      c.mvec_clip_transpose = parse_bool(v, c.mvec_clip_transpose);
-		else if (key == "depth_inverted")           c.depth_inverted = parse_bool(v, c.depth_inverted);
+		else if (key == "depth_convert")            c.depth_convert = parse_bool(v, c.depth_convert);
+		else if (key == "depth_detect")             c.depth_detect = parse_bool(v, c.depth_detect);
+		// The pin is raised by the key being PRESENT, not by its value - see depth_inverted_pinned.
+		// A line that says depth_inverted=1 is still a choice, and the measurement must not quietly
+		// overrule it.
+		else if (key == "depth_inverted")         { c.depth_inverted = parse_bool(v, c.depth_inverted);
+		                                            c.depth_inverted_pinned = true; }
 		else if (key == "mvec_scale_x")             c.mvec_scale_x = parse_float(v, c.mvec_scale_x);
 		else if (key == "mvec_scale_y")             c.mvec_scale_y = parse_float(v, c.mvec_scale_y);
 		else if (key == "intensity")                c.intensity = parse_float(v, c.intensity);
@@ -989,6 +1093,8 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "ui_correction")            c.ui_correction = static_cast<uint32_t>(parse_u64(v, c.ui_correction));
 		// ---- END overlay_ui hook ----
 		else if (key == "use_auto_mask")            c.use_auto_mask = parse_bool(v, c.use_auto_mask);
+		else if (key == "nr_probe")                 c.nr_probe = static_cast<uint32_t>(parse_u64(v, c.nr_probe));
+		else if (key == "nr_probe_frames")          c.nr_probe_frames = static_cast<uint32_t>(parse_u64(v, c.nr_probe_frames));
 		else if (key == "app_id")                   c.app_id = parse_u64(v, c.app_id);
 		else if (key == "dlss_sr")                  c.dlss_sr = parse_bool(v, c.dlss_sr);
 		else if (key == "dlss_nr")                  c.dlss_nr = parse_bool(v, c.dlss_nr);

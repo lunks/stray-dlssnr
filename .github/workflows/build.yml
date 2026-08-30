@@ -121,6 +121,50 @@ jobs:
             if ($sz -lt 256) { throw "the $e blob is implausibly small ($sz bytes)" }
           }
 
+      # -----------------------------------------------------------------------------------------
+      # THE DEPTH PASS'S SHADER MUST ACTUALLY COMPILE, for exactly the reason the codec's must.
+      #
+      # src/depth_convert.hpp carries ONE compute shader as a C++ string literal and hands it to
+      # D3DCompile at load, so the C++ build above cannot see inside it. A typo there is not a
+      # crash: depth_convert::create returns false, depth_failed latches for the run, and
+      # DLSSNR.Depth silently goes back to the game's typeless resource - README gap 3 - while
+      # depth_detect measures nothing at all and DLSSNR.DepthInverted quietly reverts to the
+      # inference README gap 4 is about. TWO features degrade in silence, which is precisely the
+      # failure mode this project refuses to ship.
+      #
+      # Same compiler and the same three flags the runtime uses (/O3 = OPTIMIZATION_LEVEL3,
+      # /Ges = ENABLE_STRICTNESS, /Gis = IEEE_STRICTNESS). depth_convert::build has no prelude, so
+      # the literal is compiled exactly as written - byte for byte what ships.
+      #
+      # $fxcPath is resolved by the step above and does not survive into this one, so it is found
+      # again here rather than assumed.
+      # -----------------------------------------------------------------------------------------
+      - name: The depth pass's HLSL must compile with fxc (cs_5_0), the way it will at runtime
+        shell: pwsh
+        run: |
+          $src = Get-Content -Raw src/depth_convert.hpp
+          $m = [regex]::Matches($src, '(?s)R"HLSL\((.*?)\)HLSL"')
+          if ($m.Count -ne 1) {
+            throw "expected exactly 1 R`"HLSL(...)HLSL`" literal in src/depth_convert.hpp; found $($m.Count). This gate has stopped testing what it thinks it is testing."
+          }
+          Set-Content -NoNewline -Path depth_full.hlsl -Value $m[0].Groups[1].Value
+
+          $fxcPath = $null
+          $found = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" -ErrorAction SilentlyContinue |
+                   Sort-Object FullName | Select-Object -Last 1
+          if ($found) { $fxcPath = $found.FullName }
+          if (-not $fxcPath) {
+            $cmd = Get-Command fxc.exe -ErrorAction SilentlyContinue
+            if ($cmd) { $fxcPath = $cmd.Source }
+          }
+          if (-not $fxcPath) { throw "fxc.exe was not found. This gate is the only thing that compiles the depth pass's HLSL; do not skip it." }
+
+          & $fxcPath /nologo /T cs_5_0 /E main /O3 /Ges /Gis /Fo depth.dxbc depth_full.hlsl 2>&1 | Out-String | Write-Host
+          if ($LASTEXITCODE -ne 0) { throw "fxc FAILED on the depth conversion shader. At runtime this is a silent latch-off of BOTH the gap-3 depth conversion and the gap-4 depth-convention measurement." }
+          $sz = (Get-Item depth.dxbc).Length
+          Write-Host "  OK  depth -> $sz bytes of cs_5_0 DXBC"
+          if ($sz -lt 256) { throw "the depth blob is implausibly small ($sz bytes)" }
+
       # ReShade identifies an add-on by three exported data symbols. If they are missing the
       # add-on either does not appear or appears unnamed, which is indistinguishable from the
       # DisabledAddons failure mode and has cost this project real debugging time.
