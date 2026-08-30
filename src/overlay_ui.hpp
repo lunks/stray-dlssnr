@@ -1779,12 +1779,29 @@ inline void draw_status(reshade::api::effect_runtime *rt, const host_facts &f)
 
 	if (!live_enabled())
 	{
-		overlay_imgui::textf_colored(col::red, "DISABLED - enabled=0 in stray_dlssnr.ini");
-		ImGui::TextWrapped("The add-on is a strict no-op this session: no snippet was loaded and no "
-		                   "resource was created. Tick \"Load the snippet and arm NGX\" below to load "
-		                   "it now, without restarting - that runs exactly the startup path a normal "
-		                   "launch runs, on the present thread. It will stall one frame while a "
-		                   "166 MB module is loaded.");
+		// TWO DIFFERENT SITUATIONS WEAR THIS RUNG, and telling the user the wrong one wastes their
+		// time. Before `enabled` was live there was only the first, so the old text described only
+		// that; with the checkbox real, the second is now the common case and its remedy is
+		// different (nothing to load - it is already loaded and merely switched off).
+		if (f.snippet_loaded)
+		{
+			overlay_imgui::textf_colored(col::amber, "OFF - \"Load the snippet and arm NGX\" is unticked in this panel");
+			ImGui::TextWrapped("The NGX feature and every texture this add-on owns have been released, "
+			                   "so the VRAM is back, and the game's dispatches are issued untouched. "
+			                   "The snippet itself is still loaded and NGX is still initialised - "
+			                   "deliberately, so that turning this back on does not have to call "
+			                   "Init_Ext a second time. Re-tick it below and everything is rebuilt on "
+			                   "the next dispatch.");
+		}
+		else
+		{
+			overlay_imgui::textf_colored(col::red, "DISABLED - enabled=0 in stray_dlssnr.ini");
+			ImGui::TextWrapped("The add-on is a strict no-op: no snippet was loaded and no resource "
+			                   "was created. This is NO LONGER a restart-only state - tick \"Load the "
+			                   "snippet and arm NGX\" below to load it now. That runs exactly the "
+			                   "startup path a normal launch runs, on the present thread, so expect "
+			                   "one stalled frame while a 166 MB module is loaded.");
+		}
 		return;
 	}
 	if (!f.snippet_loaded)
