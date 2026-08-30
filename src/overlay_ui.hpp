@@ -82,8 +82,11 @@
 //                         Enabled/RenderPreset/ScalingRatio/node-masks/FreeMemOnRelease
 //                         (:1899-1918). Not one tuning knob is baked at create time, so these
 //                         sliders are honest with no extra machinery.
-//   LIVE + SNAPSHOT       paper_white_scale, transfer_strength, color_strength,
-//                         restore_graphics_root (see rule 3).
+//   LIVE + SNAPSHOT       paper_white_scale, transfer_strength, color_strength, hdr_graft,
+//                         restore_graphics_root (see rule 3). hdr_graft is a ROOT CONSTANT in the
+//                         decode's own constant block - it replaced a pad word, so the constant
+//                         count, the root signature, the pipeline layout and both PSOs are
+//                         unchanged and there is nothing to rebuild when it moves.
 //   LIVE + ONE RESET      depth_inverted, mvec_scale_x, mvec_scale_y. Changing the depth
 //                         convention or the motion-vector grid invalidates the accumulated
 //                         temporal history; :2794-2800 already forces a reset frame when the
@@ -253,6 +256,9 @@ struct live_block
 	std::atomic<float>    paper_white_scale{ 1.0f };
 	std::atomic<float>    transfer_strength{ 1.0f };
 	std::atomic<float>    color_strength{ 1.0f };
+	// cfg::hdr_graft. Live at tier 0: it is a root constant in the decode's own constant block,
+	// snapshotted with the rest of the pass, so nothing is rebuilt when it changes.
+	std::atomic<uint32_t> hdr_graft{ 0 };
 
 	std::atomic<bool>     depth_inverted{ true };
 	std::atomic<float>    mvec_scale_x{ 0.0f };
@@ -419,6 +425,7 @@ inline void seed_from_config(const cfg::config &c, const std::wstring &directory
 	l.paper_white_scale.store(c.paper_white_scale, std::memory_order_relaxed);
 	l.transfer_strength.store(c.transfer_strength, std::memory_order_relaxed);
 	l.color_strength.store(c.color_strength, std::memory_order_relaxed);
+	l.hdr_graft.store(c.hdr_graft, std::memory_order_relaxed);
 	l.depth_inverted.store(c.depth_inverted, std::memory_order_relaxed);
 	l.mvec_scale_x.store(c.mvec_scale_x, std::memory_order_relaxed);
 	l.mvec_scale_y.store(c.mvec_scale_y, std::memory_order_relaxed);
@@ -532,6 +539,7 @@ inline bool begin_pass(cfg::config &c,
 	c.paper_white_scale        = l.paper_white_scale.load(std::memory_order_relaxed);
 	c.transfer_strength        = l.transfer_strength.load(std::memory_order_relaxed);
 	c.color_strength           = l.color_strength.load(std::memory_order_relaxed);
+	c.hdr_graft                = l.hdr_graft.load(std::memory_order_relaxed);
 	c.depth_inverted           = l.depth_inverted.load(std::memory_order_relaxed);
 	c.mvec_scale_x             = l.mvec_scale_x.load(std::memory_order_relaxed);
 	c.mvec_scale_y             = l.mvec_scale_y.load(std::memory_order_relaxed);
@@ -661,7 +669,7 @@ inline void fmt_float(char *buf, size_t n, float v)
 	std::snprintf(buf, n, "%.9g", static_cast<double>(v));
 }
 
-/// The 16 keys the overlay owns. Returns nullptr for anything else.
+/// The 17 keys the overlay owns. Returns nullptr for anything else.
 inline bool owned_value(const std::string &key_lower, const live_block &l, std::string &out)
 {
 	char buf[64];
@@ -680,6 +688,7 @@ inline bool owned_value(const std::string &key_lower, const live_block &l, std::
 	if (key_lower == "local_tone_strength")      { fmt_float(buf, sizeof(buf), l.local_tone_strength.load(std::memory_order_relaxed)); out = buf; return true; }
 	if (key_lower == "local_structure_strength") { fmt_float(buf, sizeof(buf), l.local_structure_strength.load(std::memory_order_relaxed)); out = buf; return true; }
 	if (key_lower == "skin_structure_strength")  { fmt_float(buf, sizeof(buf), l.skin_structure_strength.load(std::memory_order_relaxed)); out = buf; return true; }
+	if (key_lower == "hdr_graft")                { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.hdr_graft.load(std::memory_order_relaxed)); out = buf; return true; }
 	if (key_lower == "style")                    { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.style.load(std::memory_order_relaxed)); out = buf; return true; }
 	if (key_lower == "ui_correction")            { std::snprintf(buf, sizeof(buf), "%u", (unsigned)l.ui_correction.load(std::memory_order_relaxed)); out = buf; return true; }
 	return false;
@@ -690,7 +699,7 @@ inline const char *const *owned_keys(size_t &n)
 {
 	static const char *const keys[] = {
 		"copy_back", "history_restore", "restore_graphics_root",
-		"paper_white_scale", "transfer_strength", "color_strength",
+		"paper_white_scale", "transfer_strength", "color_strength", "hdr_graft",
 		"depth_inverted", "mvec_scale_x", "mvec_scale_y",
 		"intensity", "local_tone_strength", "local_structure_strength",
 		"skin_structure_strength", "style", "use_auto_mask", "ui_correction",
@@ -908,6 +917,7 @@ inline bool save_ini(std::string &err)
 	b.paper_white_scale        = l.paper_white_scale.load(std::memory_order_relaxed);
 	b.transfer_strength        = l.transfer_strength.load(std::memory_order_relaxed);
 	b.color_strength           = l.color_strength.load(std::memory_order_relaxed);
+	b.hdr_graft                = l.hdr_graft.load(std::memory_order_relaxed);
 	b.depth_inverted           = l.depth_inverted.load(std::memory_order_relaxed);
 	b.mvec_scale_x             = l.mvec_scale_x.load(std::memory_order_relaxed);
 	b.mvec_scale_y             = l.mvec_scale_y.load(std::memory_order_relaxed);
@@ -934,6 +944,7 @@ inline bool dirty()
 	    || l.paper_white_scale.load(std::memory_order_relaxed)        != b.paper_white_scale
 	    || l.transfer_strength.load(std::memory_order_relaxed)        != b.transfer_strength
 	    || l.color_strength.load(std::memory_order_relaxed)           != b.color_strength
+	    || l.hdr_graft.load(std::memory_order_relaxed)                != b.hdr_graft
 	    || l.depth_inverted.load(std::memory_order_relaxed)           != b.depth_inverted
 	    || l.mvec_scale_x.load(std::memory_order_relaxed)             != b.mvec_scale_x
 	    || l.mvec_scale_y.load(std::memory_order_relaxed)             != b.mvec_scale_y
@@ -1183,6 +1194,7 @@ inline void revert_to_baseline()
 	l.paper_white_scale.store(b.paper_white_scale, std::memory_order_relaxed);
 	l.transfer_strength.store(b.transfer_strength, std::memory_order_relaxed);
 	l.color_strength.store(b.color_strength, std::memory_order_relaxed);
+	l.hdr_graft.store(b.hdr_graft, std::memory_order_relaxed);
 	l.depth_inverted.store(b.depth_inverted, std::memory_order_relaxed);
 	l.mvec_scale_x.store(b.mvec_scale_x, std::memory_order_relaxed);
 	l.mvec_scale_y.store(b.mvec_scale_y, std::memory_order_relaxed);
@@ -1562,7 +1574,52 @@ inline void draw_controls(const host_facts &f)
 		slider_f("Color Strength", l.color_strength, 0.0f, 1.0f, "%.2f", k_plain,
 			"Live. 0.0 keeps the original's chromaticity exactly and transfers only the network's "
 			"luminance change; 1.0 takes the network's colour too. Lower it if the image picks up a "
-			"colour cast.");
+			"colour cast.\n\n"
+			"NOT ORTHOGONAL TO THE GRAFT BELOW. At 0.0 both grafts reduce to \"rescale the original "
+			"to the new luminance\", and their new luminances are the same number, so the two modes "
+			"are very nearly the SAME IMAGE there. The graft only genuinely changes anything as this "
+			"approaches 1.0. A/B the grafts at 1.0.");
+
+		{
+			// The graft-back selector. Both items are REAL and both are exercised by the same
+			// dispatch - this is a root constant the decode reads, not a second code path that
+			// could be left uncalled.
+			static const char *const graft_items[] = {
+				"0 - Additive residual (ours, default)",
+				"1 - renodx UpgradeToneMap (OkLab hue lock)",
+			};
+			combo_u32("HDR Graft", l.hdr_graft, graft_items, 2, k_plain,
+				"Live, and free: it is one root constant in the decode's constant block, so the very "
+				"next frame uses the other graft. Nothing is recreated.\n\n"
+				"THE ENCODE IS THE SAME EITHER WAY. Same exact piecewise sRGB, same soft-clip knee "
+				"0.75 and shoulder 5.770780, so the network is shown the same proxy and returns the "
+				"same answer. Only the graft-back differs.\n\n"
+				"0 - ADDITIVE. result = original + (neural - proxy) / s. A scene-linear residual, "
+				"exactly +0.0 when the network asked for nothing - which is what makes "
+				"transfer_strength=0 a BIT-EXACT no-op at every paper_white_scale. RGB is scaled "
+				"uniformly, so the original's hue cannot drift.\n\n"
+				"1 - RENODX. Rebuilds the pixel from the network's answer: ratio = (neural_y + "
+				"max(0, original_y - proxy_y)) / neural_y, then HueOkLab(neural * ratio, neural) "
+				"with an AP1 negative clamp. Recovered verbatim from renodx-reference.addon64's own "
+				"embedded HLSL.\n\n"
+				"WHAT THE TRADE ACTUALLY IS - measured, not assumed. Luminance is linear, so their "
+				"headroom term max(0, original_y - proxy_y) is ALGEBRAICALLY our additive residual: "
+				"both modes deliver the SAME luminance gain at every source magnitude. The entire "
+				"difference is CHROMA. Where the soft clip has crushed the proxy to white the "
+				"network's answer is neutral, so mode 1 hue-locks to that neutral and drags a "
+				"clipped highlight toward the white point; mode 0 leaves its chromaticity exactly "
+				"alone. On a bright neon sign that is the difference between keeping its colour and "
+				"washing it out.\n\n"
+				"SO THIS IS A COLOUR EXPERIMENT, NOT A HIGHLIGHT FIX. Neither mode can recover a "
+				"highlight above about 3.5x paper white: the soft clip saturates the proxy to "
+				"exactly 1.0 there, so the network has no way to signal a change and (neural - "
+				"proxy) is zero for both. If highlights are being lost, the knee is in the wrong "
+				"place - that is what Scene Paper-White Scale above is for.\n\n"
+				"Mode 1 is also NOT an exact bypass at transfer_strength=0: it works display-"
+				"referred throughout, so the result is (original * s) / s, exact only when s is a "
+				"power of two. Mode 0 is exact at every value, which is why it is the default and "
+				"why the identity A/B should be run on it.");
+		}
 
 		ImGui::EndDisabled();
 	}

@@ -34,6 +34,16 @@ and the decode all still run — so that run must be pixel-identical to `copy_ba
 identical to `hdr_codec = 0`, which is a different image entirely (see §6 gap 1). That comparison
 is the cheapest on-hardware check that the whole path is wired up correctly.
 
+**1b. The graft-back is now selectable** (`hdr_graft`, default **`0` — unchanged behaviour**). The
+reference add-on carries the answer back a different way, and both now ship so they can be A/B'd
+live: `0` is the additive residual above, `1` is its `UpgradeToneMap` — rebuild the pixel from the
+network's answer, hue-locked in OkLab with an AP1 clamp. It is one root constant, so the overlay
+flips it mid-frame with nothing to rebuild. **The difference is chroma, not brightness**: their
+"headroom" term is algebraically our additive residual, both modes deliver the same luminance gain
+at every magnitude, and what actually changes is that mode 1 pulls a clipped highlight toward the
+white point. Mode 0 remains the default and remains bit-exact — 1,080,000 replayed cases say so.
+See §6 gap 1.
+
 **2. The temporal-feedback fix** (`history_restore`, default `1`) — this was §6 gap 5. UE 4.27's
 `AddTemporalAAPass` uses **one** texture as both the pass output and the next frame's history
 (`TemporalAA.cpp:696`), so the denoised image was re-entering the game's own accumulator at a
@@ -147,6 +157,7 @@ silently taking a default.
 | `paper_white_scale` | `1.0` | the codec's scale `s = 1/max(v, 0.01)`. **UNCALIBRATED — see below** |
 | `transfer_strength` | `1.0` | global lerp back to the original; `0.0` is an **exact bypass of the denoise** — identical to `copy_back = 0`, *not* to `hdr_codec = 0` |
 | `color_strength` | `1.0` | `0.0` keeps the original's chromaticity and transfers only luminance |
+| `hdr_graft` | **`0`** | which graft-back the decode uses. `0` = our additive residual (**default, unchanged behaviour, bit-exact identity**), `1` = the reference add-on's `UpgradeToneMap`. Live — a root constant, nothing is rebuilt. See §6 gap 1 |
 | `history_restore` | `1` | break the TAA feedback loop; `0` = the old behaviour. Inert with `copy_back=0` |
 | `restore_graphics_root` | `1` | replay graphics root state too |
 | `require_trampoline` | `1` | refuse to run without `remix_nvngx.dll` |
@@ -451,6 +462,201 @@ needs a pass on hardware.
 The shaders are compiled at load with `D3DCompile` to `cs_5_0` DXBC (see §8). If that is not
 possible on a given Proton build, the codec latches **off** with the compiler's error blob printed
 verbatim, and the add-on falls back to exactly the pre-codec behaviour.
+
+#### The graft-back is now selectable: `hdr_graft`
+
+The reference add-on (`renodx-dlss5-v2.5`) grafts the network's answer back **differently**, and
+both are now shipped so they can be A/B'd live on hardware. `hdr_graft = 0` is ours and is the
+default; nothing about the shipping image changes unless you move it.
+
+**The encode is the same either way.** Its HLSL is embedded as plaintext in
+`renodx-reference.addon64` (`.rdata` RVA `0x42f90..0x440bd`), and its curve matches
+`src/hdr_codec.hpp` constant for constant: the exact piecewise sRGB (`0.0031308` / `12.92` /
+`1.055` / `1/2.4` / `0.04045`), the soft-clip knee `0.75`, the shoulder `5.770780` and the
+`0.75 + 0.25·(1 − exp(−5.770780·(v − 0.75)))` form. Two shader-level differences remain and neither
+changes the curve: they *divide* by paper white where we multiply by its reciprocal (identical when
+the reciprocal is exact — it is at the `1.0` default — and within 1 ULP otherwise), and they write
+`source.a` into the proxy where we deliberately write `1.0`. So **the network is shown the same
+proxy and returns the same answer in both modes.** Only the graft-back differs. Do not describe the
+two encoders as "byte-identical": the curve is, the shader is not.
+
+| | `hdr_graft = 0` — additive (ours, default) | `hdr_graft = 1` — renodx `UpgradeToneMap` |
+|---|---|---|
+| the transfer | `result = original + (neural − proxy) / s` | `ratio` from the asymmetric branch below, then `HueOkLab(neural · ratio, neural)` |
+| where it works | scene-linear | display-referred, normalised in and out by `s` |
+| what it scales | the **original**, uniformly across RGB | the **network's answer** |
+| hue | cannot drift — RGB is scaled by one number | can drift, so it is locked to the *neural's* hue in OkLab, then AP1-clamped for negatives |
+| `transfer_strength = 0` | **bit-exact no-op at every `paper_white_scale`** | `(original · s) / s` — exact only when `s` is a power of two; otherwise ~`1e-7` relative on 22–36 % of pixels |
+| NaN firewall, FP16 clamp, alpha from the original | yes | yes — **ours, kept**; theirs has none of the three |
+
+Their branch, reproduced verbatim including its asymmetry:
+
+```hlsl
+if (original_y < proxy_y)  ratio = original_y / proxy_y;
+else { float new_y = neural_y + max(0.0, original_y - proxy_y);
+       ratio = neural_y > 0.0 ? new_y / neural_y : 0.0; }
+```
+
+The `original_y < proxy_y` side is **not** a rare edge — it is the FP16-rounding side of the knee
+and it fires on ~25 % of pixels (49,778 of 200,000 measured). It is continuous at `oy == py`.
+
+##### What the trade actually is — and it is *not* what it looks like
+
+The obvious reading of `max(0, original_y − proxy_y)` is "this recovers luminance the soft clip
+discarded, and the additive residual cannot". **That reading is wrong, and the arithmetic says so.**
+Luminance is linear, so
+
+```
+theirs:  new_y = neural_y + max(0, original_y − proxy_y)   =  Y(orig) + Y(neural) − Y(proxy)
+ours:    Y(original + (neural − proxy))                    =  Y(orig) + Y(neural) − Y(proxy)
+```
+
+Measured over 200,000 pixels through real FP16 surfaces with the same luma weights on both sides:
+**worst relative difference `4.55e-07`**, a few ULP. The magnitude sweep agrees to four decimals at
+every source level:
+
+| source magnitude | source `Y` | proxy `Y` | gain, mode 0 | gain, mode 1 | chroma distance between them |
+|---|---|---|---|---|---|
+| 0.10 | 0.0758 | 0.0757 | 1.3000 | 1.3000 | 0.0001 |
+| 0.90 | 0.6821 | 0.6811 | 1.2484 | 1.2484 | 0.0017 |
+| 1.60 | 1.2126 | 0.9585 | 1.0267 | 1.0267 | **0.0943** |
+| 3.00 | 2.2736 | 0.9990 | 1.0004 | 1.0004 | **0.1330** |
+| 8.00 | 6.0631 | 1.0000 | 1.0000 | 1.0000 | **0.1340** |
+
+`0.1340` is the *full* rg-chromaticity distance to the white point. So:
+
+* **Both modes deliver the same luminance.** Neither one corrects a bright highlight, and for the
+  same reason: above about **3.5× paper white** the soft clip saturates the proxy to exactly `1.0`
+  in FP32 (`0.25·exp(−5.77·(v − 0.75))` drops below `2⁻²⁵` at `v > 3.51`), so the network cannot
+  signal a change at all and `neural − proxy` is zero. If highlights are being lost, **the knee is
+  in the wrong place, and `paper_white_scale` is the knob** — at `paper_white_scale = 4.0` the same
+  sweep holds full gain out to ~2.3× paper white in *both* modes.
+* **The entire difference is chroma, and it runs the other way.** Mode 1 rebuilds the pixel from the
+  network's answer and locks the hue to *that*; where the proxy clipped, the network's answer is
+  neutral white, so a saturated highlight is pulled toward the white point. `[6.0, 5.2, 3.0]` comes
+  back as `[6.0, 5.2, 3.0]` in mode 0 and as roughly `[5.21, 5.21, 5.21]` in mode 1. Over 60,000
+  random pixels at `color_strength = 1` the two differ by up to **84 % of the pixel's magnitude**.
+
+**So `hdr_graft = 1` is a colour experiment, not a highlight-recovery fix.** It is a defensible,
+different aesthetic — *trust the network's colour* — and STRAY's neon signage is exactly where you
+will see it. Just do not run it expecting recovered highlights.
+
+##### `color_strength` is the third point of comparison, and it is not orthogonal
+
+`color_strength` already **is** a genuine luminance-ratio mode, not a partial one:
+`luminanceOnly = lerp(transferred, original · luminanceRatio, chromaWeight)` with
+`chromaWeight = saturate(originalLuminance / (0.001/s))`, and that weight measures `1.0000` for
+every realistic pixel — the chroma floor only engages below `Y = 0.001·(1/s)`, i.e. essentially
+black. At `color_strength = 0` the output is `original · (Y_transferred / Y_original)`: an
+RGB-uniform, hue-exact rescale.
+
+Their decode has the *same* construction (`luminance_only = original · ratio`, then
+`lerp(luminance_only, upgraded, ColorStrength)`), and their upgraded luminance equals our
+transferred luminance — so **at `color_strength = 0` the two graft modes are very nearly the same
+image** (worst 4.7 % of a channel over 60,000 pixels, versus 84 % at `color_strength = 1`). There is
+no fourth mode worth adding; there are two real graft behaviours and one crossfade between
+*luminance-only* and *full colour* that applies to both. **A/B the grafts at
+`color_strength = 1`.**
+
+##### Verified on the build host
+
+`tools/hdr_codec_selftest.cpp` replays the decode's arithmetic natively. It carries **two separate
+transcriptions of mode 0** — the decode as it shipped before `hdr_graft` existed, and the decode as
+it is now — so "mode 0 is unchanged" is 1,080,000 bit-pattern comparisons rather than an argument
+about where a brace went.
+
+```sh
+c++ -std=c++17 -O2 -Wall -o /tmp/hdr_codec_selftest tools/hdr_codec_selftest.cpp \
+  && /tmp/hdr_codec_selftest
+```
+
+**31 assertions, all passing:**
+
+| check | result |
+|---|---|
+| identity, mode 0 | `transfer_strength = 0` returns the original **bit for bit** in **1,080,000/1,080,000** cases (12 scales × 9 `color_strength` × 10,000 pixels), worst absolute deviation `0` |
+| alpha | taken from the original in all 1,080,000 |
+| mode 0 vs the **shipping** decode | **1,080,000/1,080,000** identical bits, with the network actively changing the image (6 scales × 6 `transfer_strength` × 5 `color_strength` × 6,000 pixels) |
+| NaN firewall | a broken source passes through untouched, alpha included, in **both** modes |
+| FP16 range | mode 1 never emits a non-finite or out-of-range value, including their `neural_y == 0` cliff |
+| their cliff | reproduced, not smoothed: an exactly-zero network answer forces `lerp(original, 0, ts)` |
+| headroom term ≡ additive residual | worst relative difference `4.55e-07` over 150,222 else-branch samples |
+| their asymmetric branch | fires 49,778 / 200,000 times on FP16 data — real, not an edge case |
+| mode 1 at `transfer_strength = 0` | exact at `paper_white_scale` 1.0 / 2.0 / 0.5; **7165**, **4342**, **7138** of 20,000 non-exact at 1.5 / 2.2 / 0.75, worst `1.08e-07` relative. Mode 0: **0/20,000 at every one** |
+| divergence | 4.7 % of a channel at `color_strength = 0`; 84 % at `color_strength = 1` |
+
+CI runs the same replay under **both** MSVC and mingw, and separately compiles the codec's HLSL —
+extracted from the string literals in `src/hdr_codec.hpp` exactly as `full_source()` assembles it —
+with **`fxc /T cs_5_0 /O3 /Ges /Gis`**, the compiler and the flags the add-on itself uses at load. A
+typo in that HLSL has no compile-time symptom in the C++ build and no crash at runtime: the codec
+just latches **off** and the user silently gets the darkened frame back. That gate is the only thing
+in the tree that would notice.
+
+##### The exact A/B to run on hardware
+
+All ini-only, no rebuild; or flip **HDR Graft** in the overlay, which is live.
+
+| # | config | expectation |
+|---|---|---|
+| 1 | `hdr_graft=0 transfer_strength=0` | pixel-identical to `copy_back=0` and to the add-on unloaded. **The gate.** Run it first; if it fails, nothing below means anything. |
+| 2 | `hdr_graft=0 transfer_strength=1 color_strength=1` | today's image. The control. |
+| 3 | `hdr_graft=1 transfer_strength=1 color_strength=1` | **the comparison.** Same brightness as 2 everywhere; look only at *saturated bright* things — neon signage, wet-street reflections, the bar interiors. Mode 1 washes them toward white; mode 0 keeps their colour. If you cannot see a difference here, you are not looking at a clipped highlight. |
+| 4 | `hdr_graft=1 transfer_strength=0` | should be visually identical to 1. It is *not* bit-identical (see above); if it looks different, something other than the round trip is wrong. |
+| 5 | 2 and 3 with `color_strength=0` | the two should look **the same as each other**. This is the control that proves the difference in 2-vs-3 is chroma and nothing else. |
+| 6 | 2 and 3 at `paper_white_scale=4.0` | moves the soft-clip knee up. Both modes should regain gain on bright things; the *chroma* difference should shrink, because fewer pixels are clipped. This is the test that distinguishes "the graft is wrong" from "the knee is wrong". |
+
+##### The neural target's resolution — settled, and it matters for DLSS-SR
+
+The reference add-on's decode does not `Load` the network's answer; it *bilinearly resamples* a
+`ProxySize` region up to `Size`, with this comment:
+
+> DLSSNR 310.8 writes the neural answer at its active network resolution even when the Output
+> resource is larger (the signed runtime reports success but leaves the remainder untouched).
+
+That is worth checking rather than assuming, because if true it would mean a *larger* output
+resource reads untouched texels.
+
+**It does not bite us, and it cannot.** Three separate facts:
+
+1. `((p + 0.5)·N)/N − 0.5` evaluates to exactly `p` in FP32 for every index of `N` ∈ {720, 900,
+   1080, 1234, 1440, 1600, 1920, 1999, 2160, 2560, 3440, 3840}: `floor(position) == p`, the
+   fractions are exactly `0`, and the bilinear collapses to a plain `Load`. **`SampleNeural` is an
+   exact identity whenever `ProxySize == Size`**, so porting it would buy four texture fetches per
+   pixel to compute the same number.
+2. `ProxySize == Size` here, structurally. Our proxy, our result and the network's target are all
+   created at the same colour extent, and `nr_ensure_output` additionally forces the neural target
+   to `r16g16b16a16_float`. We never upscale.
+3. **The signed runtime cannot upscale at all.** In `nvngx_dlssnr.dll` 310.8 the network resolution
+   is hard-wired to the requested resolution: `CreateFeature` reads `DLSSNR.ScalingRatio` and then
+   *unconditionally* stores `1.0f` over the result (`0x180018006`), with no `0xbad00000` guard —
+   unlike every neighbouring parameter read — and copies the network W/H verbatim from the
+   requested W/H into its own `"CreateFeature begin requested resolution %ux%u (network %ux%u)"`
+   log. `EvaluateFeature` repeats the same unconditional store at `0x18001a96a`.
+   `DLSSNR.Upscaling`, `DLSSNR.InputWidth` and `DLSSNR.OutputWidth` have **zero** occurrences in the
+   DLL. The evaluate also compares the Color rect against the Output rect for equality
+   (`0x1800189de`) and *skips* with `"Skip feature evaluate: Invalid Color/Output rect
+   configuration"` when they differ.
+
+So the reference add-on's "upscaling" is **its own codec resampling, not the runtime's**: it binds
+Color and Output *both* at network resolution — satisfying that equality check — inside larger
+display-resolution resources, the runtime legitimately writes only that top-left region, and
+`SampleNeural` then covers the display target. `SampleNeural` is deliberately **not** ported here,
+and the reason is recorded in `src/hdr_codec.hpp` so a future SR path knows where to find it.
+
+**For a DLSS-SR path (1080p → 4K) this is the whole answer, and it is not the hopeful one.**
+DLSS-NR will not upscale for you, and it will *reject* an evaluate whose Color and Output rects
+differ in size. Two shapes work:
+
+* **run NR at 4K, after the game's SR.** Color = Output = 4K, `ProxySize == Size`, `SampleNeural`
+  stays a no-op, no shader change — but you pay the denoise at 4K.
+* **run NR at 1080p and resample in the decode.** This is exactly what `SampleNeural` plus their
+  `SourceBase` / `SourceSize` / `ProxySize` / `Size` constant buffer exists for, and it also needs
+  their fourth texture: their `Original` (`t0`) is the *encode's* source, read through a subrect,
+  while `OutputOriginal` (`t3`) is the *decode's* display-resolution graft target. Ours collapses
+  the two — our decode's `InOriginal` **is** their `t3` — because we never subrect and never
+  rescale. An SR path has to split them.
+
+There is no third shape in which the runtime does the upscale.
 
 ### Gap 2 — ~~motion vector encoding is not converted~~ **FIXED** (`mvec_decode = 1`)
 

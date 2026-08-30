@@ -75,6 +75,34 @@
 //   save/restore and the copy-back end to end, and any plumbing error in any of them shows up as
 //   a frame that is NOT identical.
 //
+// TWO GRAFT-BACKS, ONE ENCODE  (cfg::hdr_graft, and everything above describes MODE 0)
+//   Every word above is about hdr_graft = 0, the default and the only mode with the bit-exact
+//   identity. hdr_graft = 1 selects the RENODX graft instead, reproduced from the plaintext HLSL
+//   embedded in renodx-reference.addon64 and living beside the decode below. The ENCODE is shared:
+//   same exact piecewise sRGB, same knee, same shoulder, so the network is shown the same proxy and
+//   returns the same answer either way. ONLY the graft-back differs.
+//
+//   IT IS A CHROMA EXPERIMENT, NOT A HIGHLIGHT FIX, AND THE ARITHMETIC SAYS SO. Their headroom
+//   term looks like it recovers luminance the soft clip discarded, which ours supposedly cannot.
+//   Luminance is linear, so it does not:
+//       theirs:  neural_y + max(0, original_y - proxy_y)  ==  Y(o) + Y(n) - Y(p)
+//       ours:    Y(original + (neural - proxy))           ==  Y(o) + Y(n) - Y(p)
+//   Measured over 200,000 pixels through real FP16 surfaces: worst relative difference 4.55e-07.
+//   The two modes deliver the SAME luminance gain at every source magnitude. What differs is
+//   CHROMA: theirs rebuilds the pixel from the network's answer and locks the hue to THAT, so
+//   where the proxy has clipped to white a saturated highlight is dragged toward the white point;
+//   ours scales RGB uniformly and cannot move the hue at all.
+//
+//   Neither mode recovers a highlight above ~3.5x paper white, for the same reason: the soft clip
+//   saturates the proxy to exactly 1.0 there (0.25*exp(-5.77*(v-0.75)) < 2^-25 for v > 3.51), so
+//   the network has nothing to signal and (neural - proxy) is zero. That is a KNEE problem, and
+//   paper_white_scale is the knob for it.
+//
+//   The identity property above is a MODE 0 GUARANTEE. Mode 1 normalises by s at both ends, so at
+//   transfer_strength = 0 it returns (o * s) / s - exact only when s is a power of two. That, and
+//   not aesthetics, is why 0 stays the default. tools/hdr_codec_selftest.cpp replays both claims
+//   over 1,080,000 cases each and is run in CI on both toolchains.
+//
 // WHY THE DECODE RE-READS THE PROXY FROM THE TEXTURE INSTEAD OF RECOMPUTING IT
 //   The identity above depends only on InProxy and InNeural holding the same BITS - not on
 //   SrgbDecode being the exact inverse of SrgbEncode. If the decode recomputed p analytically from
@@ -111,6 +139,7 @@
 
 #include <d3dcompiler.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -293,7 +322,12 @@ cbuffer NrDecodeArgs : register(b0)
 	float g_proxyScale;
 	float g_transferStrength;
 	float g_colorStrength;
-	float g_decodePad0;
+	// Which GRAFT-BACK to use. 0 = the additive scene-linear residual this codec has always
+	// shipped (the DEFAULT, and the only one whose identity is bit-exact); anything else = the
+	// reference add-on's UpgradeToneMap, reproduced below. It occupies what used to be
+	// g_decodePad0, so the root-constant COUNT and the root signature are unchanged - this is a
+	// tier-0 live knob, not a pipeline rebuild.
+	uint  g_hdrGraft;
 	float g_decodePad1;
 	float g_decodePad2;
 };
@@ -308,6 +342,140 @@ static const float kNrMinChromaLuminance = 0.001f;
 float nrBt709Luminance(float3 linearColor)
 {
 	return dot(linearColor, float3(0.2126f, 0.7152f, 0.0722f));
+}
+
+// =============================================================================================
+// MODE 1: the reference add-on's graft-back, reproduced.
+//
+// PROVENANCE. Every line below was read as CONTIGUOUS PLAINTEXT HLSL out of
+// renodx-reference.addon64 - file offset 0x41590..0x426bd, .rdata RVA 0x42f90..0x440bd, the one
+// blob a RIP-relative lea at .text RVA 0xc047 points at. The full recovery - both entry points,
+// the constant buffer and their own comments - is committed as renodx-codec-shaders.hlsl at the
+// root of this tree; the binary itself is not, because *.addon64 is gitignored. Constants are
+// transcribed at the
+// precision the binary carries them, the asymmetric branch is kept as written, and nothing here
+// is "simplified": the point of this mode is to be THEIR maths, not a tidier version of it.
+//
+// WHAT IS DELIBERATELY DIFFERENT FROM THEIRS, AND WHY:
+//   * Their SampleNeural() is NOT ported. It bilinearly resamples a ProxySize region up to Size,
+//     and it exists because their codec runs the network at render resolution inside a larger
+//     display-resolution resource. Our proxy, our neural target and our original are all created
+//     at the same out_w x out_h extent (stray_dlssnr.cpp: nr_ensure_output / the proxy_desc), so
+//     ProxySize == Size, ((p + 0.5) * N) / N - 0.5 is exactly p in FP32, the bilinear weights are
+//     exactly zero and the whole function collapses to the plain Load we already do. Porting it
+//     would add four texture fetches per pixel to compute the same number.
+//   * Their Luminance() weights are 0.212639/0.715169/0.072192 and ours are 0.2126/0.7152/0.0722.
+//     Mode 1 uses THEIRS (below); mode 0 keeps ours. Sharing one set would change mode 0's output
+//     and it would stop being bit-identical to the shipping build, which is not negotiable.
+//   * Their decode has no NaN firewall, no output clamp, and its alpha comes from the graft
+//     target. Ours keeps all three in BOTH modes - see the write at the bottom of main().
+//
+// A CLIFF THAT IS THEIRS AND IS KEPT: ratio = neural_y > 0 ? new_y / neural_y : 0. The limit as
+// neural_y -> 0+ is a finite colour of luminance new_y, but AT exactly zero it snaps to black and
+// HueOkLab(0, neural) returns black, so an exact-zero network output forces lerp(original, 0, ts).
+// Reproduced rather than smoothed, because a divergence here would be OUR bug in THEIR maths.
+// =============================================================================================
+
+float nrRdxLuminance(float3 color)
+{
+	return dot(color, float3(0.212639f, 0.715169f, 0.072192f));
+}
+
+float3 nrRdxCbrtSigned(float3 value)
+{
+	return sign(value) * pow(abs(value), 1.0f / 3.0f);
+}
+
+float3 nrRdxToOkLab(float3 color)
+{
+	const float3x3 rgb_to_lms = {
+		0.4122214708f, 0.5363325363f, 0.0514459929f,
+		0.2119034982f, 0.6806995451f, 0.1073969566f,
+		0.0883024619f, 0.2817188376f, 0.6299787005f
+	};
+	const float3x3 lms_to_lab = {
+		0.2104542553f, 0.7936177850f, -0.0040720468f,
+		1.9779984951f, -2.4285922050f, 0.4505937099f,
+		0.0259040371f, 0.7827717662f, -0.8086757660f
+	};
+	return mul(lms_to_lab, nrRdxCbrtSigned(mul(rgb_to_lms, color)));
+}
+
+float3 nrRdxFromOkLab(float3 lab)
+{
+	const float3x3 lab_to_lms = {
+		1.0f, 0.3963377774f, 0.2158037573f,
+		1.0f, -0.1055613458f, -0.0638541728f,
+		1.0f, -0.0894841775f, -1.2914855480f
+	};
+	const float3x3 lms_to_rgb = {
+		4.0767416621f, -3.3077115913f, 0.2309699292f,
+		-1.2684380046f, 2.6097574011f, -0.3413193965f,
+		-0.0041960863f, -0.7034186147f, 1.7076147010f
+	};
+	float3 lms = mul(lab_to_lms, lab);
+	return mul(lms_to_rgb, lms * lms * lms);
+}
+
+// BT.709 -> AP1, clamp the NEGATIVES away, back to BT.709. Note it clamps only the low side:
+// nothing here bounds the high side, which is why our own clamp(result, 0, 65504) at the write
+// is kept in this mode too.
+float3 nrRdxClampAp1(float3 color)
+{
+	const float3x3 bt709_to_ap1 = {
+		0.613097f, 0.339523f, 0.047379f,
+		0.070194f, 0.916354f, 0.013452f,
+		0.020616f, 0.109570f, 0.869815f
+	};
+	const float3x3 ap1_to_bt709 = {
+		1.705051f, -0.621792f, -0.083259f,
+		-0.130256f, 1.140805f, -0.010548f,
+		-0.024003f, -0.128969f, 1.152972f
+	};
+	return mul(ap1_to_bt709, max(0.0f, mul(bt709_to_ap1, color)));
+}
+
+// Give 'incorrect' the HUE of 'correct' while keeping its own chroma MAGNITUDE. Their
+// formulation rebuilds the pixel from the network's answer, which can drift hue; this is the
+// correction for that. Ours scales RGB uniformly and cannot drift, which is why mode 0 has no
+// equivalent.
+float3 nrRdxHueOkLab(float3 incorrect, float3 correct)
+{
+	float3 incorrect_lab = nrRdxToOkLab(incorrect);
+	const float3 correct_lab = nrRdxToOkLab(correct);
+	const float incorrect_chroma = length(incorrect_lab.yz);
+	const float correct_chroma = length(correct_lab.yz);
+	incorrect_lab.yz = correct_lab.yz
+		* (correct_chroma == 0.0f ? 1.0f : incorrect_chroma / correct_chroma);
+	return nrRdxClampAp1(nrRdxFromOkLab(incorrect_lab));
+}
+
+// The graft itself. All three arguments are DISPLAY-REFERRED - that is the space the proxy and
+// the network's answer live in, and it is why the caller multiplies the original by s first.
+float3 nrRdxUpgradeToneMap(float3 original, float3 proxy, float3 neural, float transferStrength)
+{
+	const float original_y = nrRdxLuminance(original);
+	const float proxy_y    = nrRdxLuminance(proxy);
+	const float neural_y   = nrRdxLuminance(neural);
+	float ratio;
+	if (original_y < proxy_y)
+	{
+		// The proxy came out BRIGHTER than the original. Only reachable through FP16 rounding
+		// around the knee, and it fires on a real fraction of pixels - it is not a rare edge, and
+		// the asymmetry with the else branch is deliberate on their side. Kept verbatim.
+		ratio = original_y / proxy_y;
+	}
+	else
+	{
+		// THE HEADROOM TERM. max(0, original_y - proxy_y) is the luminance the soft clip threw
+		// away, added back on top of what the network returned. Luminance is linear, so this is
+		// algebraically Y(original + (neural - proxy)) - i.e. exactly mode 0's residual. The two
+		// modes agree on luminance and differ only in how they spend it across the channels.
+		const float new_y = neural_y + max(0.0f, original_y - proxy_y);
+		ratio = neural_y > 0.0f ? new_y / neural_y : 0.0f;
+	}
+	const float3 scaled = nrRdxHueOkLab(neural * ratio, neural);
+	return lerp(original, scaled, transferStrength);
 }
 
 [numthreads(16, 16, 1)]
@@ -357,25 +525,82 @@ void main(uint3 tid : SV_DispatchThreadID)
 
 	const float3 transferred = max(original + neuralDelta, 0.0f);
 
-	// Chroma safety valve. Both luminances are finite: the source came out of an FP16 or
-	// R11G11B10 surface (<= 65504 per channel) and the delta is bounded by 1/scale <= 1e6, so
-	// neither dot() can overflow to infinity.
-	const float originalLuminance    = nrBt709Luminance(original);
-	const float transferredLuminance = nrBt709Luminance(transferred);
+	float3 result;
 
-	// Note: scale is clamped to [1e-6, 1e6] by nrProxyScale, so chromaFloor lands in [1e-9, 1e3]
-	// and can never be zero.
-	const float chromaFloor  = kNrMinChromaLuminance / scale;
-	const float chromaWeight = saturate(originalLuminance / chromaFloor);
-	// Note: the guard is still needed even though chromaWeight is zero when it trips - 0/0 is a
-	// NaN and lerp() would propagate it through the zero weight.
-	const float luminanceRatio = originalLuminance > 0.0f
-		? transferredLuminance / originalLuminance
-		: 1.0f;
-	const float3 luminanceOnly = lerp(transferred, original * luminanceRatio, chromaWeight);
+	// EVERYTHING ABOVE THIS BRANCH IS SHARED, AND EVERYTHING INSIDE MODE 0 IS UNTOUCHED. The
+	// branch is on a root constant, placed after `transferred` and before the chroma valve, so
+	// mode 0's expression tree is character-for-character what it has always been and its output
+	// is bit-identical to the shipping build. tools/hdr_codec_selftest.cpp replays that over
+	// 1,080,000 cases rather than asserting it.
+	if (g_hdrGraft == 0u)
+	{
+		// ---- MODE 0: the additive scene-linear residual (default) ----------------------------
+		// Chroma safety valve. Both luminances are finite: the source came out of an FP16 or
+		// R11G11B10 surface (<= 65504 per channel) and the delta is bounded by 1/scale <= 1e6, so
+		// neither dot() can overflow to infinity.
+		const float originalLuminance    = nrBt709Luminance(original);
+		const float transferredLuminance = nrBt709Luminance(transferred);
 
-	const float3 graded = lerp(luminanceOnly, transferred, g_colorStrength);
-	const float3 result = lerp(original, graded, g_transferStrength);
+		// Note: scale is clamped to [1e-6, 1e6] by nrProxyScale, so chromaFloor lands in
+		// [1e-9, 1e3] and can never be zero.
+		const float chromaFloor  = kNrMinChromaLuminance / scale;
+		const float chromaWeight = saturate(originalLuminance / chromaFloor);
+		// Note: the guard is still needed even though chromaWeight is zero when it trips - 0/0 is
+		// a NaN and lerp() would propagate it through the zero weight.
+		const float luminanceRatio = originalLuminance > 0.0f
+			? transferredLuminance / originalLuminance
+			: 1.0f;
+		const float3 luminanceOnly = lerp(transferred, original * luminanceRatio, chromaWeight);
+
+		const float3 graded = lerp(luminanceOnly, transferred, g_colorStrength);
+		result = lerp(original, graded, g_transferStrength);
+	}
+	else
+	{
+		// ---- MODE 1: the reference add-on's UpgradeToneMap ------------------------------------
+		// Their whole decode works in DISPLAY-REFERRED space and normalises at the ends:
+		// `original / PaperWhiteScale` in, `result * PaperWhiteScale` out. Our s IS
+		// 1 / max(paper_white_scale, 0.01), so `original * scale` is their division and
+		// `/ scale` is their multiplication.
+		//
+		// THIS ROUND TRIP IS WHY MODE 1 IS NOT AN EXACT BYPASS AT transfer_strength = 0. At ts=0
+		// their UpgradeToneMap returns `original` exactly, ratio is exactly 1, and the colour
+		// lerp is a no-op - but (o * s) / s only returns o exactly when s is a power of two.
+		// Mode 0 has no such round trip and is exact at every scale. Reproduced rather than
+		// "fixed", because removing it would make this a different transfer from theirs; the
+		// residual is ~1e-7 relative and is measured in tools/hdr_codec_selftest.cpp.
+		const float3 originalDisplay = original * scale;
+
+		const float3 upgraded = nrRdxUpgradeToneMap(originalDisplay, proxy, neural, g_transferStrength);
+
+		// Their luminance-only path, which is the same construction as ours: rescale the ORIGINAL
+		// to the upgraded luminance, then lerp toward the full-colour answer. Because their
+		// upgraded luminance equals our transferred luminance, mode 1 at color_strength = 0 and
+		// mode 0 at color_strength = 0 are very nearly the same image - the two modes only
+		// genuinely diverge at color_strength = 1. Say so in the UI; do not pretend they are
+		// three independent looks.
+		const float originalY = nrRdxLuminance(originalDisplay);
+		const float upgradedY = nrRdxLuminance(upgraded);
+		const float ratioY    = originalY == 0.0f ? 1.0f : upgradedY / originalY;
+		const float3 luminanceOnlyRdx = originalDisplay * ratioY;
+
+		const float3 gradedDisplay = lerp(luminanceOnlyRdx, upgraded, g_colorStrength);
+
+		// scale is clamped to [1e-6, 1e6], so this cannot be a division by zero.
+		const float3 sceneLinear = gradedDisplay / scale;
+
+		// OUR FIREWALL, IN THEIR PATH. The OkLab round trip has a pow() and two divisions their
+		// version leaves unguarded; a NaN reaching the frame survives every downstream pass and
+		// poisons the exposure histogram and the bloom chain. Same pass-through-and-return as the
+		// two guards above, so a broken pixel is left exactly as the game drew it.
+		if (nrAnyNotFinite(sceneLinear))
+		{
+			OutResult[threadId] = source;
+			return;
+		}
+
+		result = sceneLinear;
+	}
 
 	OutResult[threadId] = float4(
 		clamp(result, 0.0f, kNrMaxHalf),
@@ -406,11 +631,29 @@ struct decode_args
 	float    proxy_scale = 1.0f;
 	float    transfer_strength = 1.0f;
 	float    color_strength = 1.0f;
-	uint32_t pad0 = 0;
+	// cfg::hdr_graft. 0 = the additive residual (default, bit-exact identity), 1 = the reference
+	// add-on's UpgradeToneMap. This REPLACES what was pad0, so the constant COUNT is unchanged and
+	// the root signature, the pipeline layout and the PSO are all untouched - which is what makes
+	// this knob live at tier 0 instead of a feature recreate.
+	uint32_t graft_mode = 0;
 	uint32_t pad1 = 0;
 	uint32_t pad2 = 0;
 };
 static_assert(sizeof(decode_args) == 32, "decode_args must be exactly 8 root constants");
+
+// SetComputeRoot32BitConstants writes this block LINEARLY into b0, so every field's byte offset
+// here has to equal the offset HLSL's own packing rules give the matching cbuffer member. That is
+// not automatic - a scalar may not straddle a 16-byte boundary, so inserting or reordering a field
+// silently slides everything after it and the shader reads the WRONG NUMBER with no diagnostic
+// anywhere. g_hdrGraft in particular sits at byte 20 (the 6th dword) only because it replaced a
+// pad word rather than being appended; if it ever moves, the graft selector starts reading a
+// paper-white scale and mode 0 stops being reachable.
+static_assert(offsetof(decode_args, width)             ==  0, "g_imageSize.x");
+static_assert(offsetof(decode_args, height)            ==  4, "g_imageSize.y");
+static_assert(offsetof(decode_args, proxy_scale)       ==  8, "g_proxyScale");
+static_assert(offsetof(decode_args, transfer_strength) == 12, "g_transferStrength");
+static_assert(offsetof(decode_args, color_strength)    == 16, "g_colorStrength");
+static_assert(offsetof(decode_args, graft_mode)        == 20, "g_hdrGraft");
 
 static constexpr uint32_t kEncodeConstantCount = 4;
 static constexpr uint32_t kDecodeConstantCount = 8;

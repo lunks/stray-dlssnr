@@ -142,6 +142,49 @@ struct config
 	// cast.
 	float    color_strength = 1.0f;
 
+	// ---- which GRAFT-BACK the decode uses --------------------------------------------------
+	// The ENCODE is the same either way: same exact piecewise sRGB, same soft-clip knee 0.75 and
+	// shoulder 5.770780, so the network is shown the same proxy and returns the same answer. Only
+	// the way that answer is carried back onto the untouched HDR original differs.
+	//
+	//   0  ADDITIVE (ours, the DEFAULT, and the only mode whose identity is bit-exact)
+	//        transferred = original + (neural - proxy) / s
+	//      A scene-linear residual. Exactly +0.0 when the network asked for nothing, which is what
+	//      makes transfer_strength=0 an EXACT no-op at every paper_white_scale. RGB is scaled
+	//      uniformly, so the original's hue cannot drift.
+	//
+	//   1  RENODX UpgradeToneMap, reproduced from the reference add-on's own embedded HLSL
+	//      (renodx-reference.addon64, .rdata RVA 0x42f90..0x440bd, contiguous plaintext).
+	//        original_y < proxy_y : ratio = original_y / proxy_y
+	//        else                 : ratio = (neural_y + max(0, original_y - proxy_y)) / neural_y
+	//        result = lerp(original, HueOkLab(neural * ratio, neural), transfer_strength)
+	//      It REBUILDS the pixel from the network's answer and then locks the hue to the NEURAL's
+	//      hue in OkLab, with an AP1 gamut clamp.
+	//
+	// WHAT ACTUALLY DIFFERS, MEASURED, NOT ASSUMED (tools/hdr_codec_selftest.cpp).
+	// Luminance is linear, so their "headroom term" max(0, original_y - proxy_y) is ALGEBRAICALLY
+	// our additive residual:
+	//     neural_y + max(0, original_y - proxy_y)  ==  Y(original + (neural - proxy))
+	// The two modes therefore deliver the SAME luminance gain at every source magnitude. The whole
+	// difference is CHROMA: where the soft clip has crushed the proxy to white the network's answer
+	// is neutral, so mode 1 drags a clipped highlight toward the white point while mode 0 leaves
+	// its chromaticity alone. Mode 1 is a colour experiment, NOT a highlight-recovery fix - neither
+	// mode can recover a highlight above ~3.5x paper white, because the soft clip saturates the
+	// proxy to exactly 1.0 there and the network has no way to signal a change. That is what
+	// paper_white_scale is for.
+	//
+	// Mode 1 is also NOT an exact bypass at transfer_strength=0: it works in display-referred space
+	// throughout, so the result is (original * s) / s, which is exact only when s is a power of two
+	// (i.e. paper_white_scale 1.0, 2.0, 0.5, ...). Mode 0 is exact at every value. That is why 0 is
+	// the default.
+	//
+	// LIVE: this is a shader constant in the decode's root-constant block, snapshotted with the
+	// rest of the pass. No feature recreate, no pipeline rebuild - flip it in the overlay and the
+	// very next frame uses the other graft.
+	//
+	// A value other than 0 or 1 is treated as 1 by the shader (`g_hdrGraft == 0u ? ours : theirs`).
+	uint32_t hdr_graft = 0;
+
 	// ---- temporal feedback ----------------------------------------------------------------
 	// Break the loop documented in README gap 5.
 	//
@@ -383,6 +426,7 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "transfer_strength")        c.transfer_strength = parse_float(v, c.transfer_strength);
 		else if (key == "color_strength" || key == "colour_strength")
 		                                            c.color_strength = parse_float(v, c.color_strength);
+		else if (key == "hdr_graft")                c.hdr_graft = static_cast<uint32_t>(parse_u64(v, c.hdr_graft));
 		else if (key == "history_restore")          c.history_restore = parse_bool(v, c.history_restore);
 		else if (key == "restore_graphics_root")    c.restore_graphics_root = parse_bool(v, c.restore_graphics_root);
 		else if (key == "populate_parameters")      c.populate_parameters = parse_bool(v, c.populate_parameters);

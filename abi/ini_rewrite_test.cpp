@@ -115,7 +115,7 @@ static const char *const kFixture =
     "style = 0\r\n"
     "use_auto_mask = 1\r\n"
     "\r\n"
-    "; ui_correction is deliberately ABSENT, so the append path is exercised too.\r\n"
+    "; ui_correction and hdr_graft are deliberately ABSENT, so the append path is exercised too.\r\n"
     "totally_unknown_key = 42\r\n";
 
 int main()
@@ -150,6 +150,10 @@ int main()
     l.style.store(2u, std::memory_order_relaxed);
     l.mvec_scale_x.store(1.5f, std::memory_order_relaxed);
     l.ui_correction.store(1u, std::memory_order_relaxed);
+    // The graft selector. Absent from the fixture, so this exercises the append path AND proves
+    // the newest owned key is actually owned - a key the writer forgets is a setting that silently
+    // reverts to its default on the next launch while the panel still shows the user's choice.
+    l.hdr_graft.store(1u, std::memory_order_relaxed);
 
     check(overlay_ui::dirty(), "dirty() reports the pending edits");
 
@@ -188,6 +192,7 @@ int main()
     check(out.find("color_strength = ") == std::string::npos,
           "no duplicate American-spelling key was appended alongside it");
     check(has_line(out, "ui_correction = 1"), "the absent owned key was appended");
+    check(has_line(out, "hdr_graft = 1"), "hdr_graft was appended");
 
     check(out.find("\r\n") != std::string::npos, "CRLF line endings survived on the lines we rewrote");
 
@@ -203,6 +208,7 @@ int main()
         check(back.style == 2u,                       "reparse: style");
         check(back.mvec_scale_x == 1.5f,              "reparse: mvec_scale_x");
         check(back.ui_correction == 1u,               "reparse: ui_correction");
+        check(back.hdr_graft == 1u,                   "reparse: hdr_graft");
         // The pins must be exactly what the fixture said, not what the overlay's defaults are.
         check(back.shader_hash == 0x1708ec956099e259ull, "reparse: shader_hash is untouched");
         check(back.srv_velocity == 2u,                   "reparse: srv_velocity is untouched");
@@ -226,6 +232,7 @@ int main()
         check(back.transfer_strength == 0.0f,     "reparse: transfer_strength = 0 (the exact-bypass value)");
         check(back.intensity == 1.25f,            "reparse: intensity survived into the new file");
         check(back.style == 2u,                   "reparse: style survived into the new file");
+        check(back.hdr_graft == 1u,               "reparse: hdr_graft survived into the new file");
     }
 
     // ---------------------------------------------------------------- case C: unwritable target

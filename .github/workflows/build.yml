@@ -61,6 +61,54 @@ jobs:
              /Fe:remix_nvngx.dll
           if errorlevel 1 exit /b 1
 
+      # -----------------------------------------------------------------------------------------
+      # THE CODEC'S SHADERS MUST ACTUALLY COMPILE.
+      #
+      # A FEATURE THAT COMPILES IS NOT A FEATURE THAT RUNS. src/hdr_codec.hpp carries its two
+      # compute shaders as C++ STRING LITERALS and hands them to D3DCompile at load; the C++ build
+      # above cannot see inside them at all. A typo in that HLSL is invisible here, and its runtime
+      # symptom is not a crash but a SILENT DEGRADATION: build_blob logs the error blob, create()
+      # returns false, and the codec latches OFF - so the user, who plays on this path every day,
+      # silently loses the whole HDR transfer and gets the darkened frame back.
+      #
+      # fxc is the exact compiler the add-on calls (d3dcompiler_47's D3DCompile, cs_5_0), and the
+      # flags below are the same three build_blob passes: /O3 = OPTIMIZATION_LEVEL3,
+      # /Ges = ENABLE_STRICTNESS, /Gis = IEEE_STRICTNESS. The sources are extracted from the header
+      # exactly the way full_source() assembles them - prelude, newline, entry point - so what is
+      # compiled here is byte-for-byte what ships.
+      # -----------------------------------------------------------------------------------------
+      - name: The HDR codec's HLSL must compile with fxc (cs_5_0), the way it will at runtime
+        shell: pwsh
+        run: |
+          $src = Get-Content -Raw src/hdr_codec.hpp
+          $m = [regex]::Matches($src, '(?s)R"HLSL\((.*?)\)HLSL"')
+          if ($m.Count -ne 3) {
+            throw "expected exactly 3 R`"HLSL(...)HLSL`" literals in src/hdr_codec.hpp (prelude, encode, decode); found $($m.Count). This gate has stopped testing what it thinks it is testing."
+          }
+          $prelude = $m[0].Groups[1].Value
+          # full_source() is prelude + "`n" + entry. Reproduce that exactly.
+          Set-Content -NoNewline -Path encode_full.hlsl -Value ($prelude + "`n" + $m[1].Groups[1].Value)
+          Set-Content -NoNewline -Path decode_full.hlsl -Value ($prelude + "`n" + $m[2].Groups[1].Value)
+
+          $fxcPath = $null
+          $found = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" -ErrorAction SilentlyContinue |
+                   Sort-Object FullName | Select-Object -Last 1
+          if ($found) { $fxcPath = $found.FullName }
+          if (-not $fxcPath) {
+            $cmd = Get-Command fxc.exe -ErrorAction SilentlyContinue
+            if ($cmd) { $fxcPath = $cmd.Source }
+          }
+          if (-not $fxcPath) { throw "fxc.exe was not found. This gate is the only thing that compiles the codec's HLSL; do not skip it." }
+          Write-Host "fxc: $fxcPath"
+
+          foreach ($e in @('encode','decode')) {
+            & $fxcPath /nologo /T cs_5_0 /E main /O3 /Ges /Gis /Fo "$e.dxbc" "${e}_full.hlsl" 2>&1 | Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) { throw "fxc FAILED on the $e shader. At runtime this is a silent latch-off of the whole HDR codec." }
+            $sz = (Get-Item "$e.dxbc").Length
+            Write-Host "  OK  $e -> $sz bytes of cs_5_0 DXBC"
+            if ($sz -lt 256) { throw "the $e blob is implausibly small ($sz bytes)" }
+          }
+
       # ReShade identifies an add-on by three exported data symbols. If they are missing the
       # add-on either does not appear or appears unnamed, which is indistinguishable from the
       # DisabledAddons failure mode and has cost this project real debugging time.
@@ -386,6 +434,33 @@ jobs:
       # set, that a missing file is created, and that an unwritable target reports failure instead
       # of claiming success.
       # -----------------------------------------------------------------------------------------
+      # -----------------------------------------------------------------------------------------
+      # THE HDR CODEC'S DECODE, REPLAYED NUMERICALLY, ON BOTH TOOLCHAINS.
+      #
+      # hdr_graft put a BRANCH inside a shader the user plays on every day, and mode 0 is that
+      # user's default. "Mode 0 is unchanged" is not an argument about where a brace went: the test
+      # carries the SHIPPING decode and the CURRENT decode as two separate transcriptions and
+      # compares 1,080,000 outputs bit for bit, and it separately proves the identity property
+      # (transfer_strength = 0 is an exact no-op) still holds over another 1,080,000 cases.
+      # It also pins the NaN firewall and the alpha carry-through in BOTH modes - the two things
+      # that fixed real bugs here and are not allowed to regress into the new path.
+      # -----------------------------------------------------------------------------------------
+      - name: HDR codec decode replay, both graft modes (MSVC)
+        shell: cmd
+        run: |
+          cl /nologo /std:c++17 /EHsc /O2 /MT /W3 tools\hdr_codec_selftest.cpp /Fe:hdr_selftest_msvc.exe
+          if errorlevel 1 exit /b 1
+          hdr_selftest_msvc.exe
+          if errorlevel 1 exit /b 1
+
+      - name: HDR codec decode replay, both graft modes (mingw-w64)
+        shell: bash
+        run: |
+          export PATH="/c/mingw64/bin:$PATH"
+          g++ -std=gnu++17 -O2 -Wall -Wextra -static -static-libgcc -static-libstdc++ \
+              tools/hdr_codec_selftest.cpp -o hdr_selftest_mingw.exe
+          ./hdr_selftest_mingw.exe
+
       - name: ini writer round-trip (MSVC)
         shell: cmd
         run: |

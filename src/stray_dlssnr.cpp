@@ -3379,6 +3379,12 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 		: (g_cfg.transfer_strength > 1.0f ? 1.0f : g_cfg.transfer_strength);
 	const float color_strength    = (g_cfg.color_strength < 0.0f) ? 0.0f
 		: (g_cfg.color_strength > 1.0f ? 1.0f : g_cfg.color_strength);
+	// Which graft-back the decode uses. 0 = our additive scene-linear residual (default, and the
+	// only mode whose transfer_strength=0 identity is bit-exact), 1 = the reference add-on's
+	// UpgradeToneMap. Anything else is passed through as-is and the shader treats it as 1; the
+	// overlay shows an out-of-range value rather than silently clamping it, exactly as it does for
+	// DLSSNR.Style. This is a root constant, so changing it costs nothing but the next dispatch.
+	const uint32_t graft_mode = g_cfg.hdr_graft;
 
 	// Resources this pass moves OUT of their resting state inside the fenced window below. They
 	// are put back unconditionally after the fence, so an escape cannot leave D3D12's view of a
@@ -3776,6 +3782,20 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 				     "(SrgbDecode(neural) - SrgbDecode(proxy)) / s, with alpha taken from the "
 				     "ORIGINAL and never from the network.",
 				     (unsigned long long)st->proxy_tex.handle, proxy_scale, g_cfg.paper_white_scale);
+				LOGI("DLSS-NR: GRAFT-BACK MODE hdr_graft=%u - %s. The ENCODE is the same either "
+				     "way, so the network sees the same proxy and returns the same answer; only "
+				     "the way that answer is carried back differs, and the difference is CHROMA, "
+				     "not luminance (their headroom term max(0, oY - pY) is algebraically our "
+				     "additive residual). This is a root constant: flip it in the overlay and the "
+				     "next frame uses the other graft, with no feature recreate.",
+				     (unsigned)graft_mode,
+				     graft_mode == 0u
+				         ? "ADDITIVE residual (ours). Scales RGB uniformly, so hue cannot drift, "
+				           "and transfer_strength=0 is a BIT-EXACT no-op at every scale"
+				         : "renodx UpgradeToneMap. Rebuilds the pixel from the network's answer, "
+				           "hue-locked in OkLab with an AP1 negative clamp - a clipped highlight "
+				           "is pulled toward the white point. transfer_strength=0 is exact here "
+				           "only when paper_white_scale is a power of two");
 				LOGI("DLSS-NR: IDENTITY IS EXACT, algebraically. If the network returns its input "
 				     "unchanged, InProxy (%s) and InNeural (%s) hold identical bit patterns, so "
 				     "SrgbDecode(x) - SrgbDecode(x) is exactly +0.0, the residual is +0.0, "
@@ -3848,7 +3868,11 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 		// does not re-clamp them.
 		da.transfer_strength = transfer_strength;
 		da.color_strength    = color_strength;
-		da.pad0 = da.pad1 = da.pad2 = 0;
+		// The ONLY thing that selects the renodx graft. It reaches the shader here and nowhere
+		// else: no pipeline is rebuilt, no feature is recreated, and there is no second code path
+		// that could be left uncalled - if this dispatch runs at all, the mode is in effect.
+		da.graft_mode        = graft_mode;
+		da.pad1 = da.pad2 = 0;
 		cmd->push_constants(shader_stage::compute, st->codec.decode_layout, hdr_codec::kParamConstants,
 		                    0, hdr_codec::kDecodeConstantCount, &da);
 
@@ -4284,9 +4308,11 @@ static bool nr_lazy_ngx_init(device *dev)
 	LOGI("  behaviour       copy_back=%d depth_inverted=%d restore_graphics_root=%d",
 	     (int)g_cfg.copy_back, (int)g_cfg.depth_inverted, (int)g_cfg.restore_graphics_root);
 	LOGI("  hdr codec       hdr_codec=%d paper_white_scale=%.4f (UNCALIBRATED) "
-	     "transfer_strength=%.3f color_strength=%.3f",
+	     "transfer_strength=%.3f color_strength=%.3f hdr_graft=%u (%s)",
 	     (int)(g_cfg.hdr_codec && !st->codec_failed), g_cfg.paper_white_scale,
-	     g_cfg.transfer_strength, g_cfg.color_strength);
+	     g_cfg.transfer_strength, g_cfg.color_strength, (unsigned)g_cfg.hdr_graft,
+	     g_cfg.hdr_graft == 0u ? "additive residual - ours, bit-exact identity"
+	                           : "renodx UpgradeToneMap - OkLab hue lock, AP1 clamp");
 	LOGI("  mvec decode     mvec_decode=%d mvec_reconstruct=%d mvec_dilate=%d clip_row=%s "
 	     "transpose=%d scale=%s/%s",
 	     (int)(g_cfg.mvec_decode && !st->mvec_failed), (int)g_cfg.mvec_reconstruct,
