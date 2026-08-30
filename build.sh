@@ -111,8 +111,14 @@ if command -v "$OBJDUMP" >/dev/null 2>&1; then
 		-fno-optimize-sibling-calls trampoline/remix_nvngx.cpp -o "$TMPOBJ"
 
 	fail=0
+	# Slot A (DLSS-NR) and slot B (DLSS-SR). Both sets must be real calls: the caller gate is a
+	# property of the module the call is ISSUED from, and a tail jump in either set hands the
+	# snippet the ReShade add-on's return address instead of this module's.
 	for fn in Init_Ext Shutdown1 CreateFeature ReleaseFeature EvaluateFeature \
-	          PopulateParameters_Impl AllocateParameters DestroyParameters GetFeatureRequirements; do
+	          PopulateParameters_Impl AllocateParameters DestroyParameters GetFeatureRequirements \
+	          B_Init_Ext B_Shutdown1 B_CreateFeature B_ReleaseFeature B_EvaluateFeature \
+	          B_PopulateParameters_Impl B_AllocateParameters B_DestroyParameters \
+	          B_GetFeatureRequirements; do
 		body="$("$OBJDUMP" -d "$TMPOBJ" \
 			| awk -v f="NVSDK_NGX_D3D12_${fn}>:" '$0 ~ f {grab=1; next} grab && /^$/ {exit} grab {print}')"
 		if [ -z "$body" ]; then

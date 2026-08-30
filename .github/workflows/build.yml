@@ -2,7 +2,7 @@ name: build
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, dlss-sr ]
     tags: [ 'v*' ]
   pull_request:
   workflow_dispatch:
@@ -84,9 +84,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "trampoline object build failed" }
 
           $dis = (dumpbin /disasm /nologo remix_check.obj) -join "`n"
+          # Slot A (DLSS-NR) and slot B (DLSS-SR). Both sets, same invariant.
           $fns = @('Init_Ext','Shutdown1','CreateFeature','ReleaseFeature','EvaluateFeature',
                    'PopulateParameters_Impl','AllocateParameters','DestroyParameters',
-                   'GetFeatureRequirements')
+                   'GetFeatureRequirements',
+                   'B_Init_Ext','B_Shutdown1','B_CreateFeature','B_ReleaseFeature',
+                   'B_EvaluateFeature','B_PopulateParameters_Impl','B_AllocateParameters',
+                   'B_DestroyParameters','B_GetFeatureRequirements')
           $fail = @()
           foreach ($fn in $fns) {
             $name = "NVSDK_NGX_D3D12_$fn"
