@@ -53,6 +53,13 @@
 #include "ngx_interop.hpp"
 #include "d3d12_state.hpp"
 #include "hdr_codec.hpp"
+#include "mvec_decode.hpp"
+// VENDORED VERBATIM from ../stray-sr-design/ue4_jitter.hpp - see README §8. It is copied rather
+// than reached for with -I because build.sh must keep working for a tree shipped WITHOUT the
+// sibling design directory, and because an edit outside src/ would change the shipped binary with
+// no diff inside it. Only the View-uniform-buffer discovery, its validation and read_view_cb are
+// used here; the jitter half is DLSS-SR's and is untouched.
+#include "ue4_jitter.hpp"
 
 #include <d3d12.h>
 
@@ -590,6 +597,29 @@ static void log_shader_detail_locked(const shader_record &rec)
 		info.found_velocity_constant ? "YES" : "no", info.velocity_constant_pattern,
 		(int)info.loops_balanced_nonzero, info.confidence,
 		rec.passed_all_gates ? "TAA-CANDIDATE" : (census_ok ? "rejected" : "rejected(census)"));
+
+	// DLSS-NR ADDITION. The DECODE BIAS, measured rather than assumed. mvec_decode.hpp's whole
+	// constant set rests on STRAY's velocity decode being stock UE 4.27, and Gate B only ever
+	// checked the SCALE. This line is what makes that a measurement. It gates nothing.
+	if (info.found_velocity_constant)
+	{
+		if (info.found_velocity_bias)
+			LOGI("     velocity decode: scale 4.00801611f (0x408041AB) AND bias "
+			     "(32767/65535)*InvDiv = 2.00397754f (%s form, 0x%08X) both present. This game's "
+			     "DecodeVelocityFromTexture is STOCK UE 4.27, so mvec_decode's constants are "
+			     "MEASURED, not inferred.",
+			     info.velocity_bias_form == 1 ? "negated/mad" : "positive",
+			     info.velocity_bias_form == 1 ? kVelocityDecodeNegBiasBits
+			                                  : kVelocityDecodeBiasBits);
+		else
+			LOGW("     velocity decode: the scale 4.00801611f is present but the folded decode "
+			     "BIAS immediate (0x4000412B / 0xC000412B, = (32767/65535)*InvDiv) is NOT. Gate B "
+			     "does not care - it never did - but mvec_decode assumes a STOCK "
+			     "DecodeVelocityFromTexture, and this is the one thing that would say otherwise. "
+			     "It may simply mean a different compiler folded the mad differently. If "
+			     "mvec_decode=1 produces motion that is coherent but wrong by a CONSTANT OFFSET, "
+			     "re-derive the bias from this shader's own bytecode before trusting it.");
+	}
 
 	if (rec.passed_all_gates && info.found_shader_info)
 	{
@@ -1454,6 +1484,76 @@ struct nr_state
 	bool logged_hist_odd_reg     = false;
 	bool logged_hist_double_arm  = false;
 	bool logged_hist_tex_fail    = false;
+	bool logged_mvec_active      = false;
+	bool logged_mvec_off         = false;
+	bool logged_mvec_tex_fail    = false;
+	bool logged_mvec_no_viewcb   = false;
+	bool logged_mvec_clip_bad    = false;
+	bool logged_mvec_clip_row    = false;
+	bool logged_mvec_decode_only = false;
+	bool logged_mvec_pinned_row  = false;
+
+	// ---- the motion-vector decode (mvec_decode.hpp) -------------------------------------------
+	// Our own DLSSNR.MVec: absolute pixels on the COLOUR grid, y-down. r16g16_float, at the colour
+	// extent, and NOT the velocity extent - the whole point is that the guide now lives on the
+	// same grid as the colour, which is what lets MVecScaleX/Y be forced to exactly 1.0.
+	//
+	// No SRV is ever created on it: NGX consumes it as a raw ID3D12Resource*, exactly like
+	// out_tex. shader_resource is nonetheless in its usage set for the same reason it is on
+	// out_tex - on D3D12 that flag adds nothing to D3D12_RESOURCE_DESC::Flags for a colour texture.
+	resource      mvec_tex = { 0 };
+	resource_view mvec_uav = { 0 };
+
+	mvec_decode::pipelines mvec;
+	bool mvec_ok         = false;   // mvec_tex + its UAV exist at (out_w, out_h)
+	// Latched for the WHOLE RUN, exactly like codec_failed: the DXBC could not be produced, or the
+	// root signature / PSO could not be created. A resolution change cannot undo that.
+	bool mvec_failed     = false;
+	// Latched per (out_w, out_h) only, exactly like codec_tex_failed.
+	bool mvec_tex_failed = false;
+	// NGX REJECTED THE DECODED GUIDE. Binding our r16g16_float texture instead of the game's
+	// r16g16b16a16_unorm one changes both the resource AND the DXGI format handed to the snippet,
+	// and D3D12 acceptance of a 2-channel guide has NOT been measured on this hardware - the code
+	// already anticipates exactly this class of rejection for the typeless depth resource
+	// (FAIL_UnsupportedInputFormat). Without a rung for it, a persistent EvaluateFeature failure
+	// left `evaluated` false every frame, so the copy-back never ran and the user got stock TAA -
+	// no denoise at all - for the whole session, recoverable only by editing the ini and
+	// restarting. This latch is the missing rung: it drops the guide back to exactly the
+	// pre-decode binding, which the guide-reset latch then covers with one Reset frame.
+	// Run-latched, like mvec_failed: a resolution change cannot make a rejected format acceptable.
+	bool mvec_eval_rejected = false;
+	uint32_t mvec_eval_fail_streak = 0;
+
+	// ---- the View uniform buffer, for ClipToPrevClip -----------------------------------------
+	// Discovered ONCE per resolution by ue4_jitter.hpp's content signature over a CPU copy of the
+	// game's own View CB, and cross-checked against the probe's INDEPENDENT DXBC-derived row.
+	ue4jitter::layout view_layout;
+	bool     view_layout_ok     = false;
+	// Per-resolution latch. Discovery reads 5232 bytes out of an upload pool; retrying it on every
+	// frame after it has failed would be a per-frame Map on the hot path.
+	bool     view_layout_failed = false;
+	uint32_t view_discover_tries = 0;
+	// The LAST GOOD ClipToPrevClip, four raw CB rows, row-major, no transpose. Kept across a
+	// failed per-frame read rather than dropped: flipping the whole binding on one bad Map would
+	// change the guide under NGX's temporal history mid-run, which is worse than a one-frame-stale
+	// reprojection.
+	float    clip_to_prev[16] = {};
+	bool     clip_ok = false;
+	uint32_t clip_fail_streak = 0;
+	// From the View CB when ViewSizeAndInvSize validated, otherwise the TAA output extent.
+	float    view_size[2] = { 0.0f, 0.0f };
+	bool     view_size_measured = false;
+	// The resource ACTUALLY bound as DLSSNR.MVec last frame. The guide-reset latch keys on this as
+	// well as on the extent: the fallback ladder can swap the bound resource at a CONSTANT extent,
+	// which the old guide_w/guide_h comparison cannot see, leaving NGX's history accumulated
+	// against a different grid.
+	uint64_t mvec_bound_res = 0;
+
+	// Census, read from on_present WITHOUT this mutex - same reason as hist_restored.
+	std::atomic<uint64_t> mvec_frames{ 0 };     // frames the decode pass actually ran
+	std::atomic<uint64_t> mvec_cb_reuse{ 0 };   // frames that reused the last good matrix
+	// 0 = raw passthrough (today's behaviour), 1 = decode only, 2 = decode + reconstruction.
+	std::atomic<uint32_t> census_mvec_mode{ 0 };
 
 	// ---- the HDR colour codec (hdr_codec.hpp) ------------------------------------------------
 	// The display-referred proxy the network is actually shown, and what is bound as DLSSNR.Color
@@ -1600,11 +1700,13 @@ static void nr_release_feature_and_output(device *dev, nr_state &st, const char 
 		if (st.proxy_uav.handle  != 0) { dev->destroy_resource_view(st.proxy_uav);  st.proxy_uav  = { 0 }; }
 		if (st.orig_srv.handle   != 0) { dev->destroy_resource_view(st.orig_srv);   st.orig_srv   = { 0 }; }
 		if (st.result_uav.handle != 0) { dev->destroy_resource_view(st.result_uav); st.result_uav = { 0 }; }
+		if (st.mvec_uav.handle   != 0) { dev->destroy_resource_view(st.mvec_uav);   st.mvec_uav   = { 0 }; }
 
 		if (st.out_tex.handle    != 0) { dev->destroy_resource(st.out_tex);    st.out_tex    = { 0 }; }
 		if (st.proxy_tex.handle  != 0) { dev->destroy_resource(st.proxy_tex);  st.proxy_tex  = { 0 }; }
 		if (st.orig_tex.handle   != 0) { dev->destroy_resource(st.orig_tex);   st.orig_tex   = { 0 }; }
 		if (st.result_tex.handle != 0) { dev->destroy_resource(st.result_tex); st.result_tex = { 0 }; }
+		if (st.mvec_tex.handle   != 0) { dev->destroy_resource(st.mvec_tex);   st.mvec_tex   = { 0 }; }
 	}
 
 	// The pristine copy is gone, so nothing may be restored from it. Dropping this is what makes a
@@ -1619,6 +1721,25 @@ static void nr_release_feature_and_output(device *dev, nr_state &st, const char 
 	// resolution change cannot undo.
 	st.codec_tex_failed = false;
 	st.orig_failed = false;
+
+	// The mvec pass's per-resolution state. mvec_failed is NOT cleared, for exactly the same
+	// reason codec_failed is not: it records that the SHADER could not be built, which a
+	// resolution change cannot undo. The View-CB layout is per-resolution because discovery
+	// validates against the render extent, and the cached matrix belongs to that layout.
+	st.mvec_ok = false;
+	st.mvec_tex_failed = false;
+	st.mvec_eval_fail_streak = 0;
+	st.view_layout = ue4jitter::layout{};
+	st.view_layout_ok = false;
+	st.view_layout_failed = false;
+	st.view_discover_tries = 0;
+	st.clip_ok = false;
+	st.clip_fail_streak = 0;
+	st.view_size[0] = st.view_size[1] = 0.0f;
+	st.view_size_measured = false;
+	// The guide is about to be a different resource; the reset latch must not compare against a
+	// handle from the old resolution, whose address UE's pool can hand back for something else.
+	st.mvec_bound_res = 0;
 
 	st.out_w = st.out_h = 0;
 	st.out_fmt = format::unknown;
@@ -1653,6 +1774,50 @@ static void nr_ensure_aux(device *dev, nr_state &st)
 	const bool want_codec = g_cfg.hdr_codec && st.codec.ok && !st.codec_failed;
 	// The pristine copy is needed by the codec (as `original`) AND by the feedback fix.
 	const bool want_orig  = want_codec || (g_cfg.history_restore && g_cfg.copy_back);
+
+	// ---- the DECODED MOTION-VECTOR TARGET -----------------------------------------------------
+	//
+	// FIRST, deliberately: everything below this point has early `return`s (the codec's at the
+	// "want_codec" test and at !orig_ok), and a block placed after them would be silently skipped
+	// whenever the codec is off - which is exactly the configuration in which the motion-vector
+	// decode still has to work.
+	//
+	// A failure here is NOT fatal and is NOT an error for the pass: DLSSNR.MVec falls back to the
+	// game's raw encoded velocity with the derived grid scale, i.e. bit-for-bit what the add-on
+	// did before this feature existed.
+	if (g_cfg.mvec_decode && st.mvec.ok && !st.mvec_failed && !st.mvec_ok && !st.mvec_tex_failed)
+	{
+		const resource_desc d(w, h, 1, 1, format::r16g16_float, 1, memory_heap::default_,
+			resource_usage::unordered_access | resource_usage::shader_resource);
+		const resource_view_desc v(resource_view_type::texture_2d, format::r16g16_float, 0, 1, 0, 1);
+
+		resource t = { 0 };
+		// EXACTLY resource_usage::unordered_access on the view: create_resource_view switches on
+		// the whole value (see the note beside the codec's views below).
+		if (!dev->create_resource(d, nullptr, resource_usage::unordered_access, &t) || t.handle == 0 ||
+		    !dev->create_resource_view(t, resource_usage::unordered_access, v, &st.mvec_uav))
+		{
+			if (t.handle != 0) { dev->destroy_resource(t); }
+			if (st.mvec_uav.handle != 0) { dev->destroy_resource_view(st.mvec_uav); st.mvec_uav = { 0 }; }
+			st.mvec_tex_failed = true;
+			if (!st.logged_mvec_tex_fail)
+			{
+				st.logged_mvec_tex_fail = true;
+				LOGE("DLSS-NR: could not create the %ux%u r16g16_float motion-vector target. The "
+				     "decode is OFF for this resolution and DLSSNR.MVec falls back to the GAME'S "
+				     "RAW ENCODED velocity buffer with the derived grid scale - i.e. EXACTLY the "
+				     "pre-decode behaviour, README gap 2. Nothing else changes.", w, h);
+			}
+		}
+		else
+		{
+			st.mvec_tex = t;
+			st.mvec_ok  = true;
+			LOGI("DLSS-NR: motion-vector target ready, %ux%u r16g16_float (UAV, "
+			     "ID3D12Resource=0x%llx). It rests in UNORDERED_ACCESS and is handed to NGX in "
+			     "SHADER_RESOURCE_NON_PIXEL.", w, h, (unsigned long long)t.handle);
+		}
+	}
 
 	// ---- the pre-denoise original -----------------------------------------------------------
 	if (want_orig && !st.orig_ok && !st.orig_failed)
@@ -2108,6 +2273,350 @@ static bool nr_pick_output_uav(device *dev, nr_state &st,
 }
 
 // --------------------------------------------------------------------------------------------
+// THE VIEW UNIFORM BUFFER -> View.ClipToPrevClip.
+//
+// This is the input the SPARSE half of the motion-vector decode needs, and getting it wrong is
+// silent: a wrong row reprojects the whole static world through an unrelated matrix and produces
+// confident, coherent, completely incorrect motion. So it is read the careful way.
+//
+// WHY A CPU READBACK AND NOT A ROOT CBV
+//   Binding the game's own b1 straight to our shader is one line cheaper and it is the wrong
+//   trade here. It cannot run a content signature, so the ClipToPrevClip row would be TRUSTED
+//   rather than validated; a root CBV carries no size, so a bad row index reads unrelated live
+//   data; and the documented worst case - landing on $Globals at b0, which accumulates a
+//   persistent shadow array and therefore carries STALE BYTES from earlier passes - produces
+//   plausible numbers from the wrong frame with no diagnostic at all
+//   (ue4_jitter.hpp:1149-1152). A 64-byte read per frame buys, instead:
+//     * a 26-constraint content signature that finds the ViewToClip / ViewToClipNoAA pair and
+//       derives the anchor from it (ue4_jitter.hpp), and
+//     * anchor + 94 cross-checked against this project's OWN, completely independent,
+//       DXBC-instruction-analysis row (shader_detect.hpp FindShaderInfo). Two derivations from
+//       two different kinds of evidence, and they must AGREE.
+//   Both give 122 for STRAY.
+//
+// WHICH ROOT PARAMETER. Structurally, never by index - the probe observed the View CB at root
+// parameter 3 AND at 4. On D3D12 every CBV is a ROOT DESCRIPTOR, which ReShade reports as
+// pipeline_layout_param_type::push_descriptors carrying a single inline descriptor_range whose
+// dx_register_index is D3D12_ROOT_DESCRIPTOR::ShaderRegister. So the View UB is the parameter
+// whose single range is (constant_buffer, space 0, register == the bN slot the shader's own
+// dcl_constant_buffer census named as its LARGEST cbuffer). Using the DXBC-derived slot rather
+// than a hardcoded b1 is what keeps this honest if a permutation ever numbers it differently;
+// b1 is only the fallback.
+//
+// pool_map_cache is DELIBERATELY NOT USED. It caches a raw ID3D12Resource*, which obliges the
+// caller to register addon_event::destroy_resource and call forget() there or a
+// destroyed-and-reallocated pool at the same address is a use-after-free
+// (ue4_jitter.hpp:1164-1169). This add-on registers no such event. read_view_cb caches nothing,
+// so that entire hazard class simply does not exist, for one Map/Unmap per frame - which under
+// vkd3d is a pointer hand-back with no vkMapMemory and no refcount.
+//
+// [ASSUMED] ue4_jitter.hpp's D3D12 layer has never run on hardware. Every return value it gives
+// is treated as untrusted here: a false anywhere only ever walks down the fallback ladder.
+// --------------------------------------------------------------------------------------------
+static bool nr_find_view_cb(probe::device_shadow &sh, const probe::pipe_bindings &b,
+                            int32_t want_register, buffer_range &out)
+{
+	std::shared_lock<std::shared_mutex> lock(sh.mutex);
+	const auto it = sh.layouts.find(b.layout.handle);
+	if (it == sh.layouts.end())
+		return false;
+
+	const std::vector<probe::layout_param> &params = it->second;
+	for (size_t p = 0; p < params.size() && p < b.root_cbvs.size(); ++p)
+	{
+		const probe::layout_param &lp = params[p];
+		// A root CBV: not a bindable table, exactly one inline range, of constant_buffer type.
+		if (lp.is_table || lp.ranges.size() != 1)
+			continue;
+		if (lp.ranges[0].type != descriptor_type::constant_buffer)
+			continue;
+		if (lp.ranges[0].dx_register_space != 0)
+			continue;
+		if (static_cast<int32_t>(lp.ranges[0].dx_register_index) != want_register)
+			continue;
+		if (!b.root_cbvs[p].valid || b.root_cbvs[p].range.buffer.handle == 0)
+			continue;
+
+		out = b.root_cbvs[p].range;
+		return true;
+	}
+	return false;
+}
+
+// Reads four consecutive float4 CB rows into m[16], row-major, NOT transposed. m[4*r + c] is
+// FMatrix::M[r][c] - which is what the shader's mvMulClipToPrevClip consumes, and what UE's
+// mul(v, M) means for a row-major-packed matrix (/Zpr, D3DShaderCompiler.cpp:947-949).
+static bool nr_read_clip_rows(ID3D12Resource *pool, uint64_t cb_offset, uint32_t row, float m[16])
+{
+	const uint64_t byte_off = cb_offset + static_cast<uint64_t>(row) * ue4jitter::kBytesPerRow;
+	return ue4jitter::read_view_cb(pool, byte_off, 4u * ue4jitter::kBytesPerRow, m);
+}
+
+// Returns true when st.clip_to_prev holds a matrix worth reprojecting through. Every false path
+// has already logged its reason exactly once and leaves the caller on the fallback ladder.
+static bool nr_update_clip_to_prev_clip(device *dev, probe::device_shadow &sh, const probe::cmd_shadow &cs,
+                                        nr_state &st, const shader_record &shader,
+                                        uint32_t taa_w, uint32_t taa_h)
+{
+	// LATCHED FOR THIS RESOLUTION, AND THE LATCH IS PERMANENT - so it must land on the documented
+	// ladder rung (raw), not on the last good matrix. Returning st.clip_ok here meant that a latch
+	// which fired AFTER a good frame re-enabled full mode on the very next frame and reprojected
+	// the whole static world through a FROZEN matrix for the rest of the run - confident, coherent
+	// and completely wrong, which is exactly what this feature must never ship, and invisible
+	// because the once-only message said the reconstruction was off while it was still running.
+	// The bounded last-good-matrix behaviour lives ONLY on the transient per-frame read failure
+	// below, which does not set this latch until it has failed 30 frames running.
+	if (st.view_layout_failed)
+		return false;
+
+	// The bN slot of the shader's largest declared constant buffer IS the View uniform buffer
+	// (FindLargestCBufferDeclaration). Fall back to b1 only when the census did not resolve it.
+	const int32_t want_reg = (shader.info.global_buffer_register_index >= 0)
+		? shader.info.global_buffer_register_index : 1;
+
+	buffer_range br = {};
+	if (!nr_find_view_cb(sh, cs.cmp, want_reg, br))
+	{
+		st.view_layout_failed = true;
+		st.clip_ok = false;   // permanent latch: drop to raw, never freeze the last matrix
+		if (!st.logged_mvec_no_viewcb)
+		{
+			st.logged_mvec_no_viewcb = true;
+			LOGW("DLSS-NR: no root CBV at b%d was captured for this dispatch, so View.ClipToPrevClip "
+			     "cannot be read and the CAMERA-MOTION RECONSTRUCTION is off. With "
+			     "mvec_reconstruct=1 the whole motion-vector decode falls back to today's raw "
+			     "encoded velocity rather than hand DLSS zero motion for every static pixel; with "
+			     "mvec_reconstruct=0 the decode still runs and invalid texels stay zero, which is "
+			     "what you asked for. This message is printed once.", want_reg);
+		}
+		return false;
+	}
+
+	auto *const pool = reinterpret_cast<ID3D12Resource *>(br.buffer.handle);
+
+	// buffer_range.size is hard-coded to UINT64_MAX by ReShade and carries NO information
+	// (d3d12_command_list.cpp:645-647). The real bound comes from the resource itself - and it is
+	// UE's 8 MiB fast-constant upload POOL, not the constant buffer, so `offset` is where the View
+	// CB starts inside it and nothing outside [offset, offset + block) may be read.
+	const resource_desc pd = probe::abi_get_resource_desc(dev, br.buffer);
+	if (pd.type != resource_type::buffer || pd.buffer.size == 0 || br.offset >= pd.buffer.size)
+	{
+		st.view_layout_failed = true;
+		st.clip_ok = false;   // permanent latch: drop to raw, never freeze the last matrix
+		if (!st.logged_mvec_no_viewcb)
+		{
+			st.logged_mvec_no_viewcb = true;
+			LOGW("DLSS-NR: the b%d root CBV does not resolve to a readable buffer (type=%d "
+			     "size=%llu offset=%llu), so View.ClipToPrevClip cannot be read and the camera-motion "
+			     "reconstruction is off. This message is printed once.",
+			     want_reg, (int)pd.type, (unsigned long long)pd.buffer.size,
+			     (unsigned long long)br.offset);
+		}
+		return false;
+	}
+
+	const uint64_t avail = pd.buffer.size - br.offset;
+
+	// ---------------------------------------------------------------- discovery, once per resolution
+	if (!st.view_layout_ok)
+	{
+		// Bounded so a wedged discovery cannot Map the pool once per frame forever.
+		if (++st.view_discover_tries > 8)
+		{
+			st.view_layout_failed = true;
+			st.clip_ok = false;   // permanent latch: drop to raw, never freeze the last matrix
+			return false;
+		}
+
+		const uint32_t want_bytes = (avail < ue4jitter::kViewCbConstantBytes)
+			? static_cast<uint32_t>(avail) : ue4jitter::kViewCbConstantBytes;
+
+		std::vector<uint8_t> cb(want_bytes);
+		if (!ue4jitter::read_view_cb(pool, br.offset, want_bytes, cb.data()))
+			return false;   // transient; retried up to the bound above
+
+		ue4jitter::config c;
+		c.expected_render_width      = taa_w;
+		c.expected_render_height     = taa_h;
+		c.expected_is_texture_extent = true;
+		// The probe's INDEPENDENT answer, from instruction analysis of this very shader. Supplying
+		// it arms check::clip_row_agrees.
+		c.dxbc_clip_to_prev_clip_row = shader.info.clip_to_prev_clip_start_index;
+		// We want the ANCHOR, not the jitter. discover() sets row_clip_to_prev_clip unconditionally
+		// from the anchor and never clears it, so the weakest tier still yields the row - while
+		// checks_passed still reports every stronger predicate for the log. DLSS-NR takes no
+		// jitter parameter, so the jitter-specific gates are not ours to enforce.
+		c.require_params        = false;
+		c.allow_projection_only = true;
+
+		ue4jitter::layout lay;
+		ue4jitter::result res;
+		const bool ok = ue4jitter::discover(cb.data(), cb.size(), c, lay, res);
+
+		char desc[640];
+		ue4jitter::describe(res, desc, sizeof(desc));
+
+		if (!ok || !lay.valid || lay.row_clip_to_prev_clip < 0)
+		{
+			st.view_layout_failed = true;
+			st.clip_ok = false;   // permanent latch: drop to raw, never freeze the last matrix
+			if (!st.logged_mvec_clip_bad)
+			{
+				st.logged_mvec_clip_bad = true;
+				LOGW("DLSS-NR: View uniform buffer discovery FAILED, so View.ClipToPrevClip cannot "
+				     "be located and the camera-motion reconstruction is off. %s "
+				     "(checks_run=0x%04x checks_passed=0x%04x, %u bytes read at offset %llu of an "
+				     "%llu-byte upload pool). See the fallback note in the once-only message that "
+				     "follows. This message is printed once.",
+				     desc, res.checks_run, res.checks_passed, want_bytes,
+				     (unsigned long long)br.offset, (unsigned long long)pd.buffer.size);
+			}
+			return false;
+		}
+
+		// CALLER-SIDE POLICY, and it is deliberately STRICTER than the header's.
+		// ue4_jitter.hpp records clip_row_agrees but does not treat a disagreement as fatal,
+		// because for JITTER the clip row is incidental. Here the clip row IS the payload, so a
+		// disagreement between the content signature and the DXBC instruction analysis means one
+		// of them is describing a buffer or a shader we have misidentified - and reprojecting the
+		// world through the wrong four rows is exactly the silent failure this feature must not
+		// ship.
+		if (shader.info.clip_to_prev_clip_start_index >= 0 &&
+		    (res.checks_passed & ue4jitter::check::clip_row_agrees) == 0)
+		{
+			st.view_layout_failed = true;
+			st.clip_ok = false;   // permanent latch: drop to raw, never freeze the last matrix
+			if (!st.logged_mvec_clip_row)
+			{
+				st.logged_mvec_clip_row = true;
+				LOGE("DLSS-NR: the two independent derivations of the View.ClipToPrevClip row "
+				     "DISAGREE - the View constant buffer's own content signature says row %d "
+				     "(projection anchor %d + 94) and this game's TAA bytecode says row %d. One of "
+				     "them is describing something we have misidentified, and reprojecting the "
+				     "static world through the wrong four rows would produce confident, coherent, "
+				     "COMPLETELY WRONG motion. The camera-motion reconstruction is therefore "
+				     "REFUSED. Set mvec_clip_row=<row> to override this deliberately, or "
+				     "mvec_decode=0 for today's behaviour. This message is printed once.",
+				     lay.row_clip_to_prev_clip, lay.row_view_to_clip,
+				     shader.info.clip_to_prev_clip_start_index);
+			}
+			return false;
+		}
+
+		st.view_layout    = lay;
+		st.view_layout_ok = true;
+
+		// ViewSizeAndInvSize, when it validated. Otherwise the TAA output extent, which is what
+		// discovery was told to expect and what every measured extent in STRAY equals.
+		st.view_size_measured = (res.checks_passed & ue4jitter::check::view_size_row) != 0;
+		st.view_size[0] = static_cast<float>(res.render_width  != 0 ? res.render_width  : taa_w);
+		st.view_size[1] = static_cast<float>(res.render_height != 0 ? res.render_height : taa_h);
+
+		LOGI("DLSS-NR: View uniform buffer LOCATED. b%d, root CBV -> ID3D12Resource=0x%llx + "
+		     "offset %llu in an %llu-byte upload pool. %s (checks_run=0x%04x checks_passed=0x%04x). "
+		     "ViewToClip anchor row %d; ClipToPrevClip row %d (anchor + 94); the probe's "
+		     "INDEPENDENT DXBC-derived row is %d - %s. View rect %.0fx%.0f (%s).",
+		     want_reg, (unsigned long long)br.buffer.handle, (unsigned long long)br.offset,
+		     (unsigned long long)pd.buffer.size, desc, res.checks_run, res.checks_passed,
+		     lay.row_view_to_clip, lay.row_clip_to_prev_clip,
+		     shader.info.clip_to_prev_clip_start_index,
+		     shader.info.clip_to_prev_clip_start_index < 0
+		        ? "NOT AVAILABLE, so the cross-check could not run"
+		        : "THEY AGREE",
+		     st.view_size[0], st.view_size[1],
+		     st.view_size_measured ? "read from ViewSizeAndInvSize and validated"
+		                           : "ASSUMED equal to the TAA output extent - ViewSizeAndInvSize "
+		                             "did not validate");
+	}
+
+	// ---------------------------------------------------------------- the per-frame 64-byte read
+	int32_t row = st.view_layout.row_clip_to_prev_clip;
+	if (g_cfg.mvec_clip_row != 0)
+	{
+		row = static_cast<int32_t>(g_cfg.mvec_clip_row);
+		if (!st.logged_mvec_pinned_row)
+		{
+			st.logged_mvec_pinned_row = true;
+			LOGW("DLSS-NR: mvec_clip_row=%u is PINNED in the ini, so the discovered row %d is being "
+			     "OVERRIDDEN and the content signature that produced it is bypassed. This is the "
+			     "same posture as shader_hash=0: deterministic, overridable, and unvalidated. Set "
+			     "mvec_clip_row=0 to go back to the two-way-cross-checked row.",
+			     g_cfg.mvec_clip_row, st.view_layout.row_clip_to_prev_clip);
+		}
+	}
+	if (row < 0 || static_cast<uint64_t>(row + 4) * ue4jitter::kBytesPerRow > avail)
+	{
+		st.view_layout_failed = true;
+		st.clip_ok = false;   // permanent latch: drop to raw, never freeze the last matrix
+		return false;
+	}
+
+	float m[16];
+	if (!nr_read_clip_rows(pool, br.offset, static_cast<uint32_t>(row), m))
+	{
+		// KEEP THE LAST GOOD MATRIX. A one-frame-stale reprojection is a small, bounded error;
+		// swapping the bound guide resource mid-run because one Map failed would change the grid
+		// under NGX's temporal history, which is not.
+		st.mvec_cb_reuse.fetch_add(1, std::memory_order_relaxed);
+		if (++st.clip_fail_streak >= 30)
+		{
+			st.view_layout_failed = true;
+			st.clip_ok = false;
+			if (!st.logged_mvec_clip_bad)
+			{
+				st.logged_mvec_clip_bad = true;
+				LOGE("DLSS-NR: 30 consecutive failures reading View.ClipToPrevClip out of the "
+				     "upload pool. The camera-motion reconstruction is off for this resolution and "
+				     "the motion-vector guide falls back as described in the once-only message "
+				     "above. This message is printed once.");
+			}
+		}
+		return st.clip_ok;
+	}
+
+	if (g_cfg.mvec_clip_transpose)
+	{
+		float t[16];
+		for (int r = 0; r < 4; ++r)
+			for (int c = 0; c < 4; ++c)
+				t[4 * r + c] = m[4 * c + r];
+		std::memcpy(m, t, sizeof(m));
+	}
+
+	if (!mvec_decode::clip_plausible(m, st.view_size[0], st.view_size[1]))
+	{
+		st.mvec_cb_reuse.fetch_add(1, std::memory_order_relaxed);
+		if (++st.clip_fail_streak >= 30)
+		{
+			st.view_layout_failed = true;
+			st.clip_ok = false;
+			if (!st.logged_mvec_clip_bad)
+			{
+				st.logged_mvec_clip_bad = true;
+				LOGE("DLSS-NR: the four rows read as View.ClipToPrevClip failed the plausibility "
+				     "check 30 frames running (non-finite, all-zero, or throwing the frame centre "
+				     "off to infinity). The camera-motion reconstruction is off for this "
+				     "resolution. If mvec_clip_transpose or mvec_clip_row was set, clear it. This "
+				     "message is printed once.");
+			}
+		}
+		return st.clip_ok;
+	}
+
+	// ONE counter covers BOTH failure modes - the 64-byte read and the plausibility test - so it
+	// may only be cleared once a matrix has been fully ACCEPTED. Clearing it on a merely SUCCESSFUL
+	// READ (which is every frame: a 64-byte Map of an UPLOAD-heap pool essentially always works)
+	// made the plausibility path's `++streak >= 30` evaluate 1 >= 30 forever. The give-up latch was
+	// unreachable, and with it the one LOGE that names mvec_clip_transpose / mvec_clip_row as the
+	// cause - so a mispinned row failed silently, every frame, for the whole run.
+	st.clip_fail_streak = 0;
+
+	std::memcpy(st.clip_to_prev, m, sizeof(st.clip_to_prev));
+	st.clip_ok = true;
+	return true;
+}
+
+// --------------------------------------------------------------------------------------------
 // The pass.
 //
 // OWNERSHIP OF THE DISPATCH IS REPORTED THROUGH 'issued', NOT THROUGH A RETURN VALUE.
@@ -2214,6 +2723,18 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	nr_view_info depth, velocity, colour;
 	uint32_t n_colour = 0, n_depth = 0, n_velocity = 0;
 
+	// DLSS-NR ADDITION - the GAME's OWN descriptors for velocity and depth, kept alongside the
+	// resolved descriptions so the motion-vector decode can read exactly what the game's TAA
+	// reads, through the game's own view formats (the depth SRV is r32_float_x8_uint over an
+	// r32_g8_typeless resource, and .x is DeviceZ - TAAStandalone.usf:1315 reads .r).
+	//
+	// These are CONSUMED INSIDE THIS EVENT and never stored, which is what keeps the standing
+	// "NOTHING HERE EVER CREATES A VIEW ON A RESOURCE THE GAME OWNS" rule intact: that rule is
+	// about caching a descriptor across frames, and about creating one per frame and leaking a
+	// pool slot. This does neither.
+	resource_view mvec_vel_view   = { 0 };
+	resource_view mvec_depth_view = { 0 };
+
 	// EVERY colour-class SRV bound at this dispatch, not just the configured one. The measured TAA
 	// pass binds colour at t5 AND history at t6 (both r16g16b16a16_float, both 1920x1080), and the
 	// output UAV must not be a resource the pass itself READS - so the alias exclusion has to see
@@ -2248,8 +2769,8 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 		if (bc == buffer_class::depth)    n_depth++;
 		if (bc == buffer_class::velocity) n_velocity++;
 
-		if (r.dx_register_index == g_cfg.srv_depth    && bc == buffer_class::depth)    depth    = vi;
-		if (r.dx_register_index == g_cfg.srv_velocity && bc == buffer_class::velocity) velocity = vi;
+		if (r.dx_register_index == g_cfg.srv_depth    && bc == buffer_class::depth)    { depth    = vi; mvec_depth_view = r.view; }
+		if (r.dx_register_index == g_cfg.srv_velocity && bc == buffer_class::velocity) { velocity = vi; mvec_vel_view   = r.view; }
 		if (r.dx_register_index == g_cfg.srv_colour   && bc == buffer_class::colour)   colour   = vi;
 	}
 
@@ -2419,22 +2940,142 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 		     "R32_FLOAT texture is required - see README \"Known gaps\".", probe::format_name(depth.fmt));
 	}
 
-	// Now that the real velocity format is known, restate gap 2 against the measured resource.
-	// A normalised-integer velocity buffer is the case where the encoding is definitely wrong for
-	// NGX; a float one at least *might* already be in pixels.
+	// ---------------------------------------------------------------- THE MOTION-VECTOR DECODE
+	//
+	// CPU-SIDE DECISION ONLY. Everything here can fail loudly and take a rung on the fallback
+	// ladder with no GPU consequence: nothing has been issued yet, and "FROM HERE WE OWN THE
+	// DISPATCH" is still below. The dispatch itself is the first stage inside the fenced window.
+	//
+	// THE LADDER. Every rung lands on TODAY'S BEHAVIOUR - the game's raw encoded velocity bound as
+	// DLSSNR.MVec with the derived grid scale - except the one the user explicitly asked for:
+	//   mvec_decode=0                     -> raw            (bit-for-bit today, gap-2 warning and all)
+	//   DXBC/PSO could not be built       -> raw            (mvec_failed, run-latched)
+	//   mvec_tex could not be allocated   -> raw            (mvec_tex_failed, per-resolution)
+	//   no View CB / discovery failed /
+	//     the two clip rows disagree      -> raw            when mvec_reconstruct=1
+	//                                     -> decode only    when mvec_reconstruct=0 (asked for)
+	//   EvaluateFeature fails 8 frames
+	//     running with OUR guide bound     -> raw, RUN-LATCHED (mvec_eval_rejected). The one rung
+	//                                        that would otherwise land on NO DENOISE AT ALL.
+	//   mvec_reconstruct=0                -> decode only, invalid texels EXACTLY zero
+	//
+	// STALENESS IS BOUNDED EVERYWHERE. The "keep the last good matrix" behaviour belongs ONLY to
+	// the two TRANSIENT per-frame paths inside nr_update_clip_to_prev_clip - the 64-byte read and
+	// the plausibility test - and both give up after 30 CONSECUTIVE failures. A PERMANENT latch
+	// (view_layout_failed) clears clip_ok with it, so it lands on raw instead of reprojecting the
+	// static world through a frozen matrix forever: that failure is coherent and camera-INDEPENDENT,
+	// i.e. strictly worse than mvec_decode=0, and the census would still call the run healthy.
+	//
+	// The velocity-SRV-missing rung needs nothing: the class quorum above already refuses the whole
+	// pass in that case.
+	//
+	// WHY A MISSING ClipToPrevClip FALLS BACK TO *RAW* AND NOT TO DECODE-ONLY. Decode-only hands
+	// DLSS zero motion for the entire static world, which is the failure this feature exists to
+	// prevent and is strictly worse than a uniformly-wrong guide. Today's raw guide is at least
+	// wrong everywhere rather than confidently wrong in one region.
+	enum class mvec_mode { raw = 0, decode_only = 1, full = 2 };
+	mvec_mode run_mvec = mvec_mode::raw;
+
+	if (g_cfg.mvec_decode && st->mvec.ok && !st->mvec_failed && !st->mvec_eval_rejected && st->mvec_ok)
+	{
+		const bool clip = nr_update_clip_to_prev_clip(dev, *sh, *cs, *st, shader, taa_out.w, taa_out.h);
+
+		if (!g_cfg.mvec_reconstruct)
+		{
+			run_mvec = mvec_mode::decode_only;
+			if (!st->logged_mvec_decode_only)
+			{
+				st->logged_mvec_decode_only = true;
+				LOGW("DLSS-NR: mvec_reconstruct=0. The velocity texture is decoded correctly, but "
+				     "every INVALID texel - which under r.BasePassOutputsVelocity=1 is still the "
+				     "whole static world, the sky, translucency and every movable that did not "
+				     "move - is written as EXACTLY ZERO. That is a bring-up A/B for isolating the "
+				     "decode from the camera reconstruction, and it is WORSE than mvec_decode=0 "
+				     "for actual play. This message is printed once.");
+			}
+		}
+		else if (clip && st->clip_ok)
+		{
+			run_mvec = mvec_mode::full;
+		}
+		// else: raw. nr_update_clip_to_prev_clip already logged exactly why, once.
+	}
+
+	st->census_mvec_mode.store(static_cast<uint32_t>(run_mvec), std::memory_order_relaxed);
+
+	if (g_cfg.mvec_decode && run_mvec == mvec_mode::raw && !st->logged_mvec_off)
+	{
+		st->logged_mvec_off = true;
+		LOGW("DLSS-NR: mvec_decode=1 but the decode pass is NOT running (%s). DLSSNR.MVec falls "
+		     "back to the game's raw encoded velocity buffer with the derived grid scale, which is "
+		     "EXACTLY the pre-decode behaviour - README gap 2 stands unmitigated for this run. "
+		     "Everything else is unaffected. This message is printed once.",
+		     st->mvec_failed          ? "its shader could not be compiled or its pipeline created"
+		     : st->mvec_eval_rejected ? "NGX REJECTED the decoded guide, so the binding was "
+		                                "REVERTED to the game's raw velocity - see the error above"
+		     : !st->mvec_ok           ? "its r16g16_float target could not be allocated"
+		                              : "View.ClipToPrevClip could not be located or validated, and "
+		                                "reconstructing camera motion is the half that matters most");
+	}
+
+	// GAP 2, restated against the MEASURED resource - and now it says whether it is MITIGATED.
+	// Leaving the old unconditional "the motion guide is meaningless" line firing while the guide
+	// is in fact being decoded would be exactly as bad as the reverse.
 	if (!st->logged_mvec_format &&
 	    (velocity.fmt == format::r16g16b16a16_unorm || velocity.fmt == format::r16g16_unorm ||
 	     velocity.fmt == format::r8g8b8a8_unorm     || velocity.fmt == format::r16g16b16a16_snorm))
 	{
 		st->logged_mvec_format = true;
-		LOGW("DLSS-NR: DLSSNR.MVec is bound to a NORMALISED-INTEGER buffer (%s). Values in it are "
-		     "in [0,1] (or [-1,1]) and carry UE4's encoding scale and bias, not absolute pixels, "
-		     "which is what the snippet expects. MVecScale %.4f/%.4f corrects the GRID only. The "
-		     "denoise will run and report success while the motion guide is meaningless - see "
-		     "README \"Known gaps\", gap 2.",
-		     probe::format_name(velocity.fmt),
-		     (velocity.w != 0 ? static_cast<float>(taa_out.w) / static_cast<float>(velocity.w) : 1.0f),
-		     (velocity.h != 0 ? static_cast<float>(taa_out.h) / static_cast<float>(velocity.h) : 1.0f));
+		if (run_mvec == mvec_mode::full)
+		{
+			LOGI("DLSS-NR: GAP 2 ADDRESSED. The game's velocity buffer is a NORMALISED-INTEGER "
+			     "resource (%s) carrying UE4's encoding scale AND bias, and it is SPARSE - but it "
+			     "is no longer what DLSSNR.MVec points at. A compute pass decodes it, reconstructs "
+			     "camera motion from depth through View.ClipToPrevClip wherever the texel is "
+			     "invalid, and writes absolute colour-grid pixels into our own r16g16_float "
+			     "texture. MVecScaleX/Y are FORCED to 1.0 so the old grid ratio (%.4f/%.4f) cannot "
+			     "double-apply. Set mvec_decode=0 to A/B against the old behaviour.",
+			     probe::format_name(velocity.fmt),
+			     (velocity.w != 0 ? static_cast<float>(taa_out.w) / static_cast<float>(velocity.w) : 1.0f),
+			     (velocity.h != 0 ? static_cast<float>(taa_out.h) / static_cast<float>(velocity.h) : 1.0f));
+		}
+		else if (run_mvec == mvec_mode::decode_only)
+		{
+			LOGW("DLSS-NR: GAP 2 PARTLY ADDRESSED - mvec_reconstruct=0. The encoding is decoded "
+			     "correctly out of the %s buffer, but the SPARSITY is not handled: every texel UE "
+			     "did not write becomes zero motion, which is most of the frame. Set "
+			     "mvec_reconstruct=1.", probe::format_name(velocity.fmt));
+		}
+		else
+		{
+			LOGW("DLSS-NR: KNOWN GAP 2 - DLSSNR.MVec is bound to a NORMALISED-INTEGER buffer (%s). "
+			     "Values in it are in [0,1] (or [-1,1]) and carry UE4's encoding scale and bias, "
+			     "not absolute pixels, which is what the snippet expects. MVecScale %.4f/%.4f "
+			     "corrects the GRID only. The denoise will run and report success while the motion "
+			     "guide is meaningless - see README \"Known gaps\", gap 2. Set mvec_decode=1 (and "
+			     "read the message above saying why the decode is not running).",
+			     probe::format_name(velocity.fmt),
+			     (velocity.w != 0 ? static_cast<float>(taa_out.w) / static_cast<float>(velocity.w) : 1.0f),
+			     (velocity.h != 0 ? static_cast<float>(taa_out.h) / static_cast<float>(velocity.h) : 1.0f));
+		}
+	}
+
+	// The game's own SRV handles for velocity and depth, kept from the resolve loop above. These
+	// are pushed straight back to our own compute shader: NOTHING IS CREATED, so the standing
+	// "never create a view on a game resource" rule holds, and no barrier is needed because both
+	// are bound as SRVs to the compute shader that is about to run.
+	if (run_mvec != mvec_mode::raw && (mvec_vel_view.handle == 0 || mvec_depth_view.handle == 0))
+	{
+		run_mvec = mvec_mode::raw;
+		st->census_mvec_mode.store(0, std::memory_order_relaxed);
+		if (!st->logged_mvec_off)
+		{
+			st->logged_mvec_off = true;
+			LOGW("DLSS-NR: the game's own velocity/depth SRV handles were not recovered for this "
+			     "dispatch, so the motion-vector decode has nothing to read. DLSSNR.MVec falls "
+			     "back to the raw encoded velocity, i.e. today's behaviour. This message is "
+			     "printed once.");
+		}
 	}
 
 	// ---------------------------------------------------------------- BREAK THE TEMPORAL FEEDBACK
@@ -2625,7 +3266,10 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	// Resources this pass moves OUT of their resting state inside the fenced window below. They
 	// are put back unconditionally after the fence, so an escape cannot leave D3D12's view of a
 	// resource disagreeing with ours and poison the next frame's barriers.
-	bool orig_in_srv = false, proxy_in_srv = false, out_in_srv = false;
+	bool orig_in_srv = false, proxy_in_srv = false, out_in_srv = false, mvec_in_srv = false;
+	// True once mvec_tex actually holds THIS frame's decoded guide. Only then may it be bound as
+	// DLSSNR.MVec; the intent to run the pass is not enough, because a throw could land between.
+	bool mvec_used = false;
 	// True once orig_tex actually holds THIS frame's pre-denoise TAA output. The feedback fix may
 	// only arm on that, never on the intent to take the copy.
 	bool orig_saved = false;
@@ -2662,7 +3306,73 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	// which is a corrupt command list no matter what on_dispatch returns.
 	try
 	{
-	// ---- stage 1 of 3: the PRE-DENOISE ORIGINAL ------------------------------------------------
+	// ---- stage 0 of 4: THE MOTION-VECTOR DECODE ------------------------------------------------
+	//
+	// FIRST, and it MUST be after the game's Dispatch above rather than before it. capture_state
+	// was taken far earlier and restore_state runs far later, so a compute dispatch of ours issued
+	// before the game's would execute the game's TAA against OUR root signature, PSO and heaps.
+	// That is a device removal, not an artefact. The pre-dispatch region is deliberately limited to
+	// copies and barriers for exactly this reason.
+	//
+	// The game's velocity and depth are read through THEIR OWN descriptors, and are NOT
+	// transitioned: they are bound as SRVs to the compute shader that just executed, so they
+	// already include NON_PIXEL_SHADER_RESOURCE, and this dispatch is a second READER of the same
+	// state at the same point in the list. The same rule the barrier above states.
+	if (run_mvec != mvec_mode::raw)
+	{
+		// THE CACHE SYNC, for the same reason as the encode's below. This is now the FIRST
+		// push_descriptors of the frame, so it takes over that duty; the encode's own sync stays,
+		// and is idempotent (count == 0 force-issues).
+		cmd->bind_descriptor_tables(shader_stage::all_compute, st->mvec.layout, 0, 0, nullptr);
+		cmd->bind_pipeline(pipeline_stage::all_compute, st->mvec.pso);
+
+		// t0 velocity, t1 depth - one contiguous table, in declaration order.
+		const resource_view mvec_srvs[2] = { mvec_vel_view, mvec_depth_view };
+		descriptor_table_update mv_srv = {};
+		mv_srv.binding = 0; mv_srv.array_offset = 0; mv_srv.count = 2;
+		mv_srv.type = descriptor_type::shader_resource_view;
+		mv_srv.descriptors = mvec_srvs;
+		cmd->push_descriptors(shader_stage::compute, st->mvec.layout, mvec_decode::kParamSrvTable, mv_srv);
+
+		descriptor_table_update mv_uav = {};
+		mv_uav.binding = 0; mv_uav.array_offset = 0; mv_uav.count = 1;
+		mv_uav.type = descriptor_type::unordered_access_view;
+		mv_uav.descriptors = &st->mvec_uav;
+		cmd->push_descriptors(shader_stage::compute, st->mvec.layout, mvec_decode::kParamUavTable, mv_uav);
+
+		mvec_decode::mvec_args ma;
+		ma.out_w   = st->out_w;    ma.out_h   = st->out_h;
+		ma.vel_w   = velocity.w;   ma.vel_h   = velocity.h;
+		ma.depth_w = depth.w;      ma.depth_h = depth.h;
+		// [ASSUMED] ViewRectMin == (0,0). ue4_jitter.hpp defines no constant for that row and
+		// validates nothing there, so reading an unvalidated row and USING it would be strictly
+		// worse than assuming the value every measured extent in STRAY is consistent with: colour,
+		// depth and velocity are all 1920x1080 and the render fills the view. A non-zero
+		// ViewRectMin would show up as a uniform smear that does not vary with camera motion.
+		ma.view_min_x = 0.0f; ma.view_min_y = 0.0f;
+		ma.view_size_x = (st->view_size[0] > 0.0f) ? st->view_size[0] : static_cast<float>(st->out_w);
+		ma.view_size_y = (st->view_size[1] > 0.0f) ? st->view_size[1] : static_cast<float>(st->out_h);
+		ma.inv_view_x  = (ma.view_size_x != 0.0f) ? 1.0f / ma.view_size_x : 0.0f;
+		ma.inv_view_y  = (ma.view_size_y != 0.0f) ? 1.0f / ma.view_size_y : 0.0f;
+		ma.flags = (run_mvec == mvec_mode::full ? mvec_decode::kFlagReconstruct : 0u)
+		         | (g_cfg.mvec_dilate           ? mvec_decode::kFlagDilate      : 0u);
+		ma.pad0 = ma.pad1 = ma.pad2 = 0;
+		std::memcpy(ma.clip, st->clip_to_prev, sizeof(ma.clip));
+
+		cmd->push_constants(shader_stage::compute, st->mvec.layout, mvec_decode::kParamConstants,
+		                    0, mvec_decode::kMvecConstantCount, &ma);
+
+		cmd->dispatch(hdr_codec::group_count(st->out_w), hdr_codec::group_count(st->out_h), 1);
+
+		// The write-completion barrier AND the state NGX reads a guide in, in one transition -
+		// the same shape as the proxy's below.
+		cmd->barrier(st->mvec_tex, resource_usage::unordered_access, resource_usage::shader_resource_non_pixel);
+		mvec_in_srv = true;
+		mvec_used   = true;
+		st->mvec_frames.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	// ---- stage 1 of 4: the PRE-DENOISE ORIGINAL ------------------------------------------------
 	// Taken before anything of ours writes anywhere. This is O_N: the decode's `original`, and the
 	// pristine image the next frame's history restore puts back. taa_out is momentarily returned to
 	// COPY_SOURCE and then to the SRV state NGX wants, which costs two extra transitions and leaves
@@ -2752,33 +3462,69 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 		auto *const colour_res  = reinterpret_cast<ID3D12Resource *>(
 			codec_encoded ? st->proxy_tex.handle : taa_out.res.handle);
 		auto *const depth_res   = reinterpret_cast<ID3D12Resource *>(depth.res.handle);
-		auto *const mvec_res    = reinterpret_cast<ID3D12Resource *>(velocity.res.handle);
+		// THE MOTION GUIDE. When the decode pass ran this frame it is OUR r16g16_float texture on
+		// the COLOUR grid, already in absolute pixels; otherwise it is the game's raw encoded
+		// velocity on the velocity grid, exactly as before this feature existed. mvec_used - not
+		// run_mvec - is the condition: the intent to run the pass is not enough, because a throw
+		// could have landed between the decision and the dispatch.
+		auto *const mvec_res    = reinterpret_cast<ID3D12Resource *>(
+			mvec_used ? st->mvec_tex.handle : velocity.res.handle);
+		const uint32_t mvec_w   = mvec_used ? st->out_w : velocity.w;
+		const uint32_t mvec_h   = mvec_used ? st->out_h : velocity.h;
 		auto *const output_res  = reinterpret_cast<ID3D12Resource *>(st->out_tex.handle);
 
 		nr_set_resource(p, s_colour, colour_res, taa_out.w, taa_out.h);
 		nr_set_resource(p, s_depth,  depth_res,  depth.w,   depth.h);
-		nr_set_resource(p, s_mvec,   mvec_res,   velocity.w, velocity.h);
+		nr_set_resource(p, s_mvec,   mvec_res,   mvec_w,    mvec_h);
 		nr_set_resource(p, s_output, output_res, st->out_w, st->out_h);
 		// Written EVERY frame even though this add-on never binds one - see nr_clear_resource.
 		nr_clear_resource(p, s_mask);
 
 		// The guide grid moved under a history accumulated against the old one. Nothing else
 		// notices, so force one reset frame.
-		if (st->guide_w != velocity.w || st->guide_h != velocity.h)
+		//
+		// THE RESOURCE IS PART OF THE KEY, not just the extent. The fallback ladder can swap
+		// DLSSNR.MVec between our decoded texture and the game's raw velocity mid-run, and in
+		// STRAY both are 1920x1080 - so an extent-only test would see NO change while the guide's
+		// UNITS changed from absolute pixels to encoded unorm. That is precisely the case that
+		// needs a reset, and it is the one an extent-only latch cannot see.
+		const uint64_t mvec_res_key = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mvec_res));
+		if (st->guide_w != mvec_w || st->guide_h != mvec_h || st->mvec_bound_res != mvec_res_key)
 		{
 			if (st->guide_w != 0 || st->guide_h != 0)
 				st->need_reset = true;   // a first frame is initialisation, not a reset
-			st->guide_w = velocity.w;
-			st->guide_h = velocity.h;
+			st->guide_w = mvec_w;
+			st->guide_h = mvec_h;
+			st->mvec_bound_res = mvec_res_key;
 		}
 
-		// The motion vectors live on the guide grid; the snippet works on the colour grid. This
-		// is the ratio between the two. It CANNOT correct UE4's velocity ENCODING - see the
-		// README - only the grid.
-		const float scale_x = (g_cfg.mvec_scale_x != 0.0f) ? g_cfg.mvec_scale_x
+		// MVecScaleX/Y.
+		//
+		// WITH THE DECODE PASS ON THE DERIVED GRID RATIO MUST NOT SURVIVE. The pass emits
+		// ABSOLUTE PIXELS ON THE COLOUR GRID, so the grid correction has already been applied
+		// inside the shader (it is the 0.5*ViewSize factor in the output contract) and letting
+		// the old ratio through would DOUBLE-APPLY it. It is FORCED to exactly 1.0 rather than
+		// left to coincide: in STRAY the ratio happens to be 1.0 today because colour and
+		// velocity are both 1920x1080, so a stale ratio would be invisible here and would come
+		// back as a silent 2x error the moment either grid moved.
+		//
+		// Without the pass this is the old behaviour untouched: the ratio between the guide grid
+		// and the colour grid, which CANNOT correct UE4's velocity ENCODING - only the grid.
+		//
+		// mvec_scale_x/y still override BOTH paths. With the decode on, a single one of them set
+		// to -1 tests a PER-AXIS sign error and nothing else. It does NOT settle the one [WEB]-only
+		// link in the chain - the DLSS DIRECTION convention (previous-minus-current, which is what
+		// the shader emits, versus current-minus-previous) - because getting that wrong negates
+		// BOTH axes at once, and neither single-axis flip produces the doubly-negated field. Both
+		// keys must be set to -1 TOGETHER for that test; if that is better than the shipped
+		// binding, the output contract in mvec_decode.hpp (mvec = backN * (-0.5W, +0.5H)) must be
+		// negated at source. README "Hardware A/B" spells out both rows.
+		const float derived_x = mvec_used ? 1.0f
 			: (velocity.w != 0 ? static_cast<float>(taa_out.w) / static_cast<float>(velocity.w) : 1.0f);
-		const float scale_y = (g_cfg.mvec_scale_y != 0.0f) ? g_cfg.mvec_scale_y
+		const float derived_y = mvec_used ? 1.0f
 			: (velocity.h != 0 ? static_cast<float>(taa_out.h) / static_cast<float>(velocity.h) : 1.0f);
+		const float scale_x = (g_cfg.mvec_scale_x != 0.0f) ? g_cfg.mvec_scale_x : derived_x;
+		const float scale_y = (g_cfg.mvec_scale_y != 0.0f) ? g_cfg.mvec_scale_y : derived_y;
 
 		ngx::set_u32(p, ngx::kParamEnabled,       1u);
 		ngx::set_u32(p, ngx::kParamReset,         st->need_reset ? 1u : 0u);
@@ -2806,10 +3552,39 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 				LOGE("DLSS-NR: the game's TAA still ran and the frame is unchanged; only the "
 				     "denoise was skipped. This message is printed once.");
 			}
+
+			// THE MISSING RUNG. Every other rung of the fallback ladder lands on today's
+			// behaviour; this one landed on NO DENOISE AT ALL, and it is reachable from the
+			// shipping default (mvec_decode=1). If the evaluate keeps failing while OUR decoded
+			// r16g16_float texture is the bound guide, the guide is the first thing to suspect -
+			// it is the only input this build changed - so give it back and let the run self-heal
+			// to the binding that was verified on this hardware. Eight frames, not one: a single
+			// failure during a device-state hiccup must not throw the feature away.
+			//
+			// If the evaluate still fails on the raw guide, nothing has been lost - it was already
+			// failing - and the log now says which binding it reverted to.
+			if (mvec_used && !st->mvec_eval_rejected && ++st->mvec_eval_fail_streak >= 8)
+			{
+				st->mvec_eval_rejected = true;
+				st->logged_mvec_off    = false;   // let the ladder say why, once, for this rung
+				st->logged_mvec_format = false;   // and re-state the GAP 2 verdict for the RAW guide
+				LOGE("DLSS-NR: EvaluateFeature has FAILED 8 frames running with our decoded "
+				     "r16g16_float motion guide bound as DLSSNR.MVec. That is the one input this "
+				     "build changed, and a rejected guide format is the documented failure mode "
+				     "for it, so the decode pass is being TURNED OFF FOR THIS RUN and DLSSNR.MVec "
+				     "REVERTED to the game's raw encoded velocity buffer with the derived grid "
+				     "scale - exactly the pre-decode binding. The guide-reset latch will issue one "
+				     "NGX Reset frame on the next dispatch because the bound resource changed. If "
+				     "the denoise comes back, the decoded guide is what NGX would not take: report "
+				     "it, and run with mvec_decode=0 meanwhile. If it does not come back, the "
+				     "motion guide was never the cause - look at the depth resource (README gap 3, "
+				     "FAIL_UnsupportedInputFormat on the typeless r32_g8 depth).");
+			}
 		}
 		else
 		{
 			evaluated = true;
+			st->mvec_eval_fail_streak = 0;   // consecutive, so any success clears it
 			st->need_reset = false;
 			st->evaluate_count++;
 
@@ -2818,12 +3593,19 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 			if (st->evaluate_count == 1 || st->evaluate_count == 100)
 			{
 				LOGI("DLSS-NR: evaluate #%llu OK. colour/output %ux%u, depth %ux%u (%s), "
-				     "mvec %ux%u (%s), MVecScale %.4f/%.4f, DepthInverted=%d, UseAutoMask=%d, "
+				     "mvec %ux%u (%s, %s), MVecScale %.4f/%.4f, DepthInverted=%d, UseAutoMask=%d, "
 				     "Intensity=%.3f LocalTone=%.3f LocalStructure=%.3f SkinStructure=%.3f "
 				     "Style=%u, copy_back=%d, hdr_codec=%d, history_restore=%d.",
 				     (unsigned long long)st->evaluate_count, taa_out.w, taa_out.h,
 				     depth.w, depth.h, probe::format_name(depth.fmt),
-				     velocity.w, velocity.h, probe::format_name(velocity.fmt),
+				     // THE RESOURCE ACTUALLY HANDED TO NGX, not the game's velocity buffer. In
+				     // STRAY both are 1920x1080, so the format and the tag are the only fields
+				     // that discriminate - and naming the raw buffer here directly contradicted
+				     // the "GAP 2 ADDRESSED" line and misdirected the hardware A/B.
+				     mvec_w, mvec_h,
+				     probe::format_name(mvec_used ? format::r16g16_float : velocity.fmt),
+				     mvec_used ? "decoded, absolute colour-grid pixels"
+				               : "the game's RAW encoded velocity",
 				     scale_x, scale_y, (int)g_cfg.depth_inverted, (int)g_cfg.use_auto_mask,
 				     g_cfg.intensity, g_cfg.local_tone_strength, g_cfg.local_structure_strength,
 				     g_cfg.skin_structure_strength, g_cfg.style, (int)g_cfg.copy_back,
@@ -2960,6 +3742,13 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 		cmd->barrier(st->proxy_tex, resource_usage::shader_resource_non_pixel, resource_usage::unordered_access);
 	if (orig_in_srv)
 		cmd->barrier(st->orig_tex, resource_usage::shader_resource_non_pixel, resource_usage::copy_source);
+	// mvec_tex rests in UNORDERED_ACCESS - that is the state it was created in and the StateBefore
+	// the next frame's decode dispatch will name. Without this it would stay in
+	// NON_PIXEL_SHADER_RESOURCE, and every subsequent frame's opening barrier would declare a
+	// StateBefore that D3D12 disagrees with: a validation error under the debug layer and a
+	// silently wrong transition under vkd3d. Exactly the hazard the comment above describes.
+	if (mvec_in_srv)
+		cmd->barrier(st->mvec_tex, resource_usage::shader_resource_non_pixel, resource_usage::unordered_access);
 
 	// 2c. THE LAST CACHE SYNC, and only when we actually used push_descriptors. It forces
 	//     SetDescriptorHeaps and SetComputeRootSignature onto the real list one more time, and -
@@ -2969,10 +3758,19 @@ static void nr_try_run(command_list *cmd, uint32_t gx, uint32_t gy, uint32_t gz,
 	//     while the raw list holds UE's, and the next push_descriptors on this command list -
 	//     ours next frame, or any other add-on's - would skip a SetDescriptorHeaps it needed.
 	//
-	//     If the codec never ran we never touched that cache, so there is nothing to re-sync and
-	//     issuing this would be pure risk.
+	//     If NEITHER the codec NOR the motion-vector decode ran we never touched that cache, so
+	//     there is nothing to re-sync and issuing this would be pure risk.
+	//
+	//     mvec_used is part of the condition because the decode pass calls push_descriptors too -
+	//     and it is the FIRST such call of the frame. A run with hdr_codec=0 and mvec_decode=1
+	//     dirties the cache and, keyed on codec_encoded alone, would never clean it: the cache
+	//     would end this window naming ReShade's transient heap while the raw list holds UE's, and
+	//     the next push_descriptors on this list would skip a SetDescriptorHeaps it needed. Either
+	//     layout serves - the call exists for its side effect on the cache, not for the binding.
 	if (codec_encoded)
 		cmd->bind_descriptor_tables(shader_stage::all_compute, st->codec.decode_layout, 0, 0, nullptr);
+	else if (mvec_used)
+		cmd->bind_descriptor_tables(shader_stage::all_compute, st->mvec.layout, 0, 0, nullptr);
 
 	// 3. Put the command list back the way NGX found it. Unconditional: CreateFeature clobbers
 	//    state too, so this has to run even when the evaluate itself was skipped - or threw.
@@ -3257,6 +4055,51 @@ static bool nr_lazy_ngx_init(device *dev)
 		     "out-of-distribution for a display-referred network - README gap 1.");
 	}
 
+	// ---- the motion-vector decode --------------------------------------------------------------
+	// Built HERE for exactly the same reasons as the codec above: render thread, once, never on a
+	// recording thread. This is rung L1/L2 of the fallback ladder - a failure latches mvec_failed
+	// for the run and DLSSNR.MVec stays on the game's raw encoded velocity, which is bit-for-bit
+	// the behaviour before this feature existed (README gap 2). mvec_failed is deliberately never
+	// cleared, the same rule as codec_failed.
+	if (g_cfg.mvec_decode)
+	{
+		static std::vector<uint8_t> s_mvec_dxbc;   // process-wide: the source never changes
+		static bool                 s_mvec_tried = false;
+		if (!s_mvec_tried)
+		{
+			s_mvec_tried = true;
+			mvec_decode::build(dir, s_mvec_dxbc, [](int lvl, const char *msg) {
+				logf(lvl == mvec_decode::log_error ? reshade::log::level::error
+				   : lvl == mvec_decode::log_warn  ? reshade::log::level::warning
+				                                   : reshade::log::level::info, "%s", msg);
+			});
+		}
+
+		if (s_mvec_dxbc.empty() ||
+		    !mvec_decode::create(dev, s_mvec_dxbc, st->mvec, [](int lvl, const char *msg) {
+				logf(lvl == mvec_decode::log_error ? reshade::log::level::error
+				   : lvl == mvec_decode::log_warn  ? reshade::log::level::warning
+				                                   : reshade::log::level::info, "%s", msg);
+			}))
+		{
+			st->mvec_failed = true;
+			LOGW("DLSS-NR: the motion-vector decode is OFF for this run (see the error above). "
+			     "DLSSNR.MVec falls back to the game's RAW ENCODED velocity with the derived grid "
+			     "scale - README gap 2 stands unmitigated. Nothing else changes. Set "
+			     "mvec_decode=0 to silence this.");
+		}
+		else
+		{
+			LOGI("DLSS-NR: motion-vector decode pipeline created (cs_5_0 DXBC, "
+			     "[numthreads(16,16,1)]). UE 4.27 velocity decode + camera-motion reconstruction "
+			     "from depth through View.ClipToPrevClip, writing absolute colour-grid pixels.");
+		}
+	}
+	else
+	{
+		st->mvec_failed = true;   // not a failure, but the same "do not use it" state
+	}
+
 	if (g_cfg.populate_parameters && g_snippet.populate_params != nullptr)
 	{
 		const ngx::Result pr = g_snippet.populate_params(st->params);
@@ -3281,6 +4124,14 @@ static bool nr_lazy_ngx_init(device *dev)
 	     "transfer_strength=%.3f color_strength=%.3f",
 	     (int)(g_cfg.hdr_codec && !st->codec_failed), g_cfg.paper_white_scale,
 	     g_cfg.transfer_strength, g_cfg.color_strength);
+	LOGI("  mvec decode     mvec_decode=%d mvec_reconstruct=%d mvec_dilate=%d clip_row=%s "
+	     "transpose=%d scale=%s/%s",
+	     (int)(g_cfg.mvec_decode && !st->mvec_failed), (int)g_cfg.mvec_reconstruct,
+	     (int)g_cfg.mvec_dilate,
+	     g_cfg.mvec_clip_row != 0 ? "PINNED in the ini" : "discovered + cross-checked",
+	     (int)g_cfg.mvec_clip_transpose,
+	     g_cfg.mvec_scale_x != 0.0f ? "OVERRIDDEN" : "auto",
+	     g_cfg.mvec_scale_y != 0.0f ? "OVERRIDDEN" : "auto");
 	LOGI("  feedback fix    history_restore=%d (%s)", (int)g_cfg.history_restore,
 	     !g_cfg.history_restore
 	        ? "OFF: the denoised image is left in the TAA output, which UE 4.27 extracts as next "
@@ -3312,12 +4163,31 @@ static bool nr_lazy_ngx_init(device *dev)
 		     "deployment wraps the evaluate in an encode/decode pair (soft clip -> exact piecewise "
 		     "sRGB -> network -> additive residual back onto the untouched HDR original); this run "
 		     "is NOT doing that. See README \"Known gaps\", gap 1.");
-	LOGW("DLSS-NR: KNOWN GAP - MOTION VECTOR ENCODING IS NOT CONVERTED. The snippet expects "
-	     "absolute pixels on the colour grid, y-down. UE4 writes screen-space velocity packed "
-	     "into the texture with a scale AND A BIAS, so a unorm velocity buffer is not in those "
-	     "units at all. DLSSNR.MVecScaleX/Y can rescale a grid but cannot remove a bias, so it "
-	     "cannot fix this. Symptom: ghosting or smearing that does not track camera motion. The "
-	     "fix is a decode compute pass into an R16G16_FLOAT buffer - see README \"Known gaps\".");
+	// GAP 2 is now fixed when the decode pass is armed, and only then. The message says which.
+	// This is an ARM-TIME statement: it can report that the pipeline exists, but not that the pass
+	// actually ran - locating View.ClipToPrevClip needs a real dispatch. The per-dispatch line
+	// (\"GAP 2 ADDRESSED\" / \"KNOWN GAP 2\") is the one that reports the outcome, and it is
+	// printed once from nr_try_run.
+	if (g_cfg.mvec_decode && !st->mvec_failed && st->mvec.ok)
+		LOGI("DLSS-NR: GAP 2 ADDRESSED - the motion-vector decode is ARMED. DLSSNR.MVec will be "
+		     "OUR r16g16_float texture on the colour grid, not the game's encoded velocity: a "
+		     "compute pass applies UE 4.27's DecodeVelocityFromTexture (scale 4.00801611f AND the "
+		     "bias 32767/65535, which MVecScaleX/Y alone can never remove) and, wherever the "
+		     "velocity texel is the cleared sentinel - the static world, the sky, translucency and "
+		     "every movable that did not move - reconstructs camera motion by reprojecting depth "
+		     "through View.ClipToPrevClip. MVecScaleX/Y are FORCED to 1.0 so the grid correction "
+		     "cannot double-apply. Confirmation that it actually ran, or the reason it did not, "
+		     "follows on the first accepted dispatch.");
+	else
+		LOGW("DLSS-NR: KNOWN GAP - MOTION VECTOR ENCODING IS NOT CONVERTED (%s). The snippet "
+		     "expects absolute pixels on the colour grid, y-down. UE4 writes screen-space velocity "
+		     "packed into the texture with a scale AND A BIAS, so a unorm velocity buffer is not "
+		     "in those units at all. DLSSNR.MVecScaleX/Y can rescale a grid but cannot remove a "
+		     "bias, so it cannot fix this. Symptom: ghosting or smearing that does not track "
+		     "camera motion. The fix is the decode compute pass this build ships - see README "
+		     "\"Known gaps\", gap 2.",
+		     !g_cfg.mvec_decode ? "mvec_decode=0, so it is disabled by configuration"
+		                        : "its shader or pipeline could not be built - see above");
 	LOGI("==================================================================");
 	return true;
 }
@@ -3347,6 +4217,13 @@ static void nr_destroy_device(device *dev)
 		// here rather than in nr_release_feature_and_output. nr_release_feature_and_output has
 		// already idled the queue.
 		hdr_codec::destroy(dev, st->codec);
+		// Same lifetime, same rule, same place. mvec_decode::destroy guards a null device and zero
+		// handles and resets the struct, so it is correct to call unconditionally - including when
+		// mvec_decode=0 or the build failed and both handles are already 0. Without it the
+		// ID3D12RootSignature and ID3D12PipelineState created by mvec_decode::create were dropped
+		// by pd_destroy<nr_state> below with no Release, and each of them holds a reference on the
+		// ID3D12Device, so the device itself was never destroyed either.
+		mvec_decode::destroy(dev, st->mvec);
 
 		if (g_snippet.shutdown1 != nullptr && st->d3d12 != nullptr)
 		{
@@ -3389,6 +4266,22 @@ static void nr_service_pending_teardown(device *dev)
 	st->logged_eval_fail      = false;
 	st->logged_codec_off      = false;
 	st->logged_codec_tex_fail = false;
+	// The mvec pass's per-resolution state is cleared in nr_release_feature_and_output, so its
+	// one-shot diagnostics must be re-armed here for exactly the same reason the codec's are: a
+	// target that allocates at one extent and not at the next, or a View-CB discovery that
+	// validates at one render size and not at the next, would otherwise re-latch in SILENCE and
+	// leave the log's last word on the subject a stale "GAP 2 ADDRESSED" from the old resolution
+	// while the census printed mode=RAW with no reason anywhere.
+	st->logged_mvec_format      = false;
+	st->logged_mvec_active      = false;
+	st->logged_mvec_off         = false;
+	st->logged_mvec_tex_fail    = false;
+	st->logged_mvec_no_viewcb   = false;
+	st->logged_mvec_clip_bad    = false;
+	st->logged_mvec_clip_row    = false;
+	st->logged_mvec_decode_only = false;
+	// logged_mvec_pinned_row is deliberately NOT reset: it is a statement about the ini file, not
+	// about the resolution, and it has already been said once.
 	st->logged_hist_active    = false;
 	st->logged_hist_dropped   = false;
 	st->logged_hist_odd_reg   = false;
@@ -3478,6 +4371,9 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 		const uint64_t nr_hist_dropped = (nst != nullptr) ? nst->hist_dropped.load(std::memory_order_relaxed) : 0;
 		const bool     nr_codec_on     = (nst != nullptr) && nst->census_codec_on.load(std::memory_order_relaxed);
 		const bool     nr_orig_on      = (nst != nullptr) && nst->census_orig_on.load(std::memory_order_relaxed);
+		const uint64_t nr_mvec_frames  = (nst != nullptr) ? nst->mvec_frames.load(std::memory_order_relaxed) : 0;
+		const uint64_t nr_mvec_reuse   = (nst != nullptr) ? nst->mvec_cb_reuse.load(std::memory_order_relaxed) : 0;
+		const uint32_t nr_mvec_mode    = (nst != nullptr) ? nst->census_mvec_mode.load(std::memory_order_relaxed) : 0;
 
 		std::lock_guard<std::mutex> lock(g.mutex);
 		g.frame++;
@@ -3498,6 +4394,21 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
 			     (unsigned long long)nr_hist_applied, (unsigned long long)nr_hist_dropped,
 			     (int)g_cfg.history_restore, (int)g_cfg.copy_back,
 			     (int)nr_codec_on, nr_orig_on ? "allocated" : "MISSING");
+
+		// The motion-vector decode's own accounting. 'decoded' climbing at one per accepted
+		// dispatch with mode=full is the success signature. 'cb_reuse' climbing means the
+		// per-frame 64-byte read of View.ClipToPrevClip out of UE's upload pool is failing or
+		// returning implausible rows and the last good matrix is standing in - a one-frame-stale
+		// reprojection each time, and at 30 consecutive the reconstruction latches off.
+		if (nst != nullptr && (nr_mvec_frames != 0 || nr_mvec_reuse != 0 || g_cfg.mvec_decode))
+			LOGI("--- DLSS-NR mvec @ frame %llu: decoded=%llu cb_reuse=%llu mode=%s "
+			     "(mvec_decode=%d mvec_reconstruct=%d)",
+			     (unsigned long long)g.frame,
+			     (unsigned long long)nr_mvec_frames, (unsigned long long)nr_mvec_reuse,
+			     nr_mvec_mode == 2 ? "FULL (decode + camera reconstruction)"
+			   : nr_mvec_mode == 1 ? "DECODE ONLY (invalid texels are zero - bring-up A/B)"
+			                       : "RAW (the game's encoded velocity - pre-decode behaviour)",
+			     (int)g_cfg.mvec_decode, (int)g_cfg.mvec_reconstruct);
 
 		LOGI("--- probe census @ frame %llu: shaders=%llu (not_dxbc=%llu dxil=%llu) | "
 		     "census fail=%llu pass=%llu | vel_const fail=%llu pass=%llu | "

@@ -135,15 +135,78 @@ struct config
 	// knob to A/B on hardware.
 	bool     history_restore = true;
 
+	// ---- the motion-vector decode (README gap 2) -------------------------------------------
+	// UE4 writes screen-space velocity into the texture with a SCALE AND A BIAS, and only where
+	// it decided to; everywhere else the texel is EXACTLY ZERO and UE's own TAA reconstructs
+	// camera motion by reprojecting depth through View.ClipToPrevClip. With this on, one compute
+	// pass of ours turns that into a private r16g16_float buffer holding ABSOLUTE PIXELS ON THE
+	// COLOUR GRID, y-down, in the direction DLSS wants (add the vector to a pixel's current
+	// location and you get its previous location), and DLSSNR.MVecScaleX/Y are FORCED to 1.0
+	// because the grid correction must not double-apply.
+	//
+	// 0 restores the previous behaviour EXACTLY: the game's raw encoded velocity buffer is bound
+	// as DLSSNR.MVec with the derived grid ratio, and the gap-2 warning is printed unconditionally
+	// as it always was. That is the A/B.
+	//
+	// This defaults ON for the same reason hdr_codec and history_restore do, and because the guide
+	// it replaces is documented-meaningless rather than merely imperfect - there is no good
+	// baseline being protected. A reviewer who wants the first hardware launch to be a pure
+	// control should set this to 0 in the ini rather than change the default.
+	bool     mvec_decode = true;
+
+	// Reconstruct camera motion from depth + ClipToPrevClip wherever the velocity texel is invalid
+	// (raw .x == 0). THAT IS MOST OF THE FRAME. Static geometry never writes velocity even with
+	// r.BasePassOutputsVelocity=1 - that setting moves velocity output for MOVABLE primitives into
+	// the base pass, it does not make static ones write.
+	//
+	// 0 = decode only: valid texels are decoded, invalid ones are written as EXACTLY ZERO. That is
+	// strictly a bring-up A/B to isolate the two halves on hardware. Shipping it would hand DLSS
+	// zero motion for the entire static world, which is WORSE than mvec_decode=0.
+	bool     mvec_reconstruct = true;
+
+	// UE's own AA_CROSS nearest-depth dilation of the velocity lookup (TAAStandalone.usf:1939-1983).
+	// OFF by default: UE dilates for its own single-tap history, NVIDIA's DLSS plugin defaults to
+	// the NON-dilated branch, and DLSS does its own neighbourhood work - pre-dilated vectors smear
+	// object silhouettes. Here so it can be A/B'd independently of the encoding fix.
+	bool     mvec_dilate = false;
+
+	// ESCAPE HATCHES. Each one turns a SILENT failure into a 30-second experiment.
+
+	// Pin the float4 row of View.ClipToPrevClip. 0 = discover it and VALIDATE it, which is the
+	// recommended setting: the row is derived twice independently (a content signature over the
+	// View constant buffer, via ue4_jitter.hpp, and this project's own DXBC instruction analysis)
+	// and the two must AGREE or the reconstruction is refused. STRAY measured 122 both ways.
+	// A pinned row SKIPS the content signature entirely, so it is logged as loudly as shader_hash=0.
+	uint32_t mvec_clip_row = 0;
+
+	// Transpose ClipToPrevClip before handing it to the shader. The rows are passed UNtransposed
+	// because that is what FMatrix's memory layout and UE's own mul(v, M) say, and UE compiles with
+	// /Zpr. If motion is roughly right at screen centre and wrong at the edges - and worse under
+	// camera ROLL - this is the knob. A near-identity matrix cannot tell the two apart, which is
+	// why this exists rather than a self-test.
+	bool     mvec_clip_transpose = false;
+
 	// ---- NGX evaluate parameters ---------------------------------------------------------
 	// UE 4.27 renders with a REVERSED-Z depth buffer (near plane at 1.0), so this defaults to 1 -
 	// which is the opposite of the working Remix deployment, whose renderer writes post-divide
 	// NDC depth without inverting. If DLSS-NR ghosts or smears in exactly the wrong direction,
 	// this is the first thing to flip.
 	bool     depth_inverted = true;
-	// 0 == derive from the extents (colour grid / mvec grid), which is what the working
-	// deployment computes. A non-zero value overrides it. See the README's motion-vector
-	// caveat: the scale cannot correct UE4's velocity ENCODING, only its grid.
+	// 0 == derive it. With mvec_decode=0 that is the extent ratio (colour grid / mvec grid), which
+	// is what the working deployment computes and which can only ever correct the GRID, never
+	// UE4's velocity encoding. With mvec_decode=1 the derived value is FORCED to exactly 1.0,
+	// because the decode pass already emits absolute colour-grid pixels and applying the ratio on
+	// top would double-apply it.
+	//
+	// A non-zero value overrides either. NVIDIA documents MVecScaleX/Y as carrying SIGN, so with
+	// the decode on these are the SIGN A/B - no rebuild. TWO DIFFERENT TESTS LIVE HERE:
+	//   * ONE key at -1 tests a PER-AXIS sign error. X and Y are NOT symmetric (the decode negates
+	//     X and not Y), so both single-axis flips have to be tried.
+	//   * BOTH keys at -1 TOGETHER tests the DIRECTION CONVENTION - previous-minus-current versus
+	//     current-minus-previous - which is the one [WEB]-only link in the chain and which negates
+	//     both axes at once. No single-axis flip can reach that configuration, so no single-axis
+	//     result can confirm or refute it.
+	// See the README's A/B table.
 	float    mvec_scale_x = 0.0f;
 	float    mvec_scale_y = 0.0f;
 
@@ -290,6 +353,11 @@ inline void load(config &c, const std::wstring &directory, LogFn log)
 		else if (key == "restore_graphics_root")    c.restore_graphics_root = parse_bool(v, c.restore_graphics_root);
 		else if (key == "populate_parameters")      c.populate_parameters = parse_bool(v, c.populate_parameters);
 		else if (key == "require_trampoline")       c.require_trampoline = parse_bool(v, c.require_trampoline);
+		else if (key == "mvec_decode")              c.mvec_decode = parse_bool(v, c.mvec_decode);
+		else if (key == "mvec_reconstruct")         c.mvec_reconstruct = parse_bool(v, c.mvec_reconstruct);
+		else if (key == "mvec_dilate")              c.mvec_dilate = parse_bool(v, c.mvec_dilate);
+		else if (key == "mvec_clip_row")            c.mvec_clip_row = static_cast<uint32_t>(parse_u64(v, c.mvec_clip_row));
+		else if (key == "mvec_clip_transpose")      c.mvec_clip_transpose = parse_bool(v, c.mvec_clip_transpose);
 		else if (key == "depth_inverted")           c.depth_inverted = parse_bool(v, c.depth_inverted);
 		else if (key == "mvec_scale_x")             c.mvec_scale_x = parse_float(v, c.mvec_scale_x);
 		else if (key == "mvec_scale_y")             c.mvec_scale_y = parse_float(v, c.mvec_scale_y);
